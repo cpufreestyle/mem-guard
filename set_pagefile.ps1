@@ -27,19 +27,6 @@ if ($d.FreeSpace -lt ($MaximumMB * 1.05 * 1MB)) {
     exit 1
 }
 
-# 2. confirm
-Write-Host ''
-Write-Host 'This script will do the following:'
-Write-Host '  1) Turn OFF system-managed pagefile'
-Write-Host '  2) Remove existing pagefile settings (currently empty on this PC, safe)'
-Write-Host ('  3) Create a pagefile on ' + $TargetDrive + ' with initial ' + $InitialMB + 'MB / max ' + $MaximumMB + 'MB')
-Write-Host '  (Takes effect after reboot; current session is NOT affected)'
-$ans = Read-Host 'Confirm? (type y to continue, anything else to cancel)'
-if ($ans -ne 'y' -and $ans -ne 'Y') {
-    Write-Warn 'Cancelled.'
-    exit 0
-}
-
 # 3. disable automatic management
 Write-Info 'Disabling system-managed pagefile...'
 Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name AutomaticManagedPagefile -Value 0 -Type DWord
