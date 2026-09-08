@@ -42,8 +42,8 @@ Get-CimInstance Win32_PageFileSetting | ForEach-Object {
 Write-Info ('Creating pagefile on ' + $TargetDrive + ' (initial ' + $InitialMB + 'MB / max ' + $MaximumMB + 'MB)...')
 New-CimInstance -ClassName Win32_PageFileSetting -Property @{
     Name        = ($TargetDrive + '\pagefile.sys')
-    InitialSize = $InitialMB
-    MaximumSize = $MaximumMB
+    InitialSize = [uint64]$InitialMB
+    MaximumSize = [uint64]$MaximumMB
 } | Out-Null
 
 # 6. registry fallback
