@@ -167,6 +167,17 @@ def enable_privilege(name: str) -> bool:
     """启用指定特权，返回是否成功。"""
     advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
     advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.AdjustTokenPrivileges.argtypes = [
+        wintypes.HANDLE, wintypes.BOOL,
+        ctypes.POINTER(TOKEN_PRIVILEGES), wintypes.DWORD,
+        ctypes.POINTER(TOKEN_PRIVILEGES), ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
 
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(
