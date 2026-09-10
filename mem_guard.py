@@ -41,6 +41,8 @@ import pystray
 
 # ---------------------------------------------------------------- 路径与配置
 
+__version__ = "1.1.0"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "mem_guard.json")
 LOG_PATH = os.path.join(BASE_DIR, "mem_guard.log")
@@ -222,8 +224,8 @@ class TOKEN_PRIVILEGES(ctypes.Structure):
     _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
 
 
-def enable_privilege(name: str) -> bool:
-    """启用指定特权，返回是否成功。"""
+def _set_privilege(name: str, attributes: int) -> bool:
+    """设置指定特权的属性（0x2 启用 / 0 禁用），返回是否成功。"""
     advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
     advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
     advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
@@ -250,11 +252,58 @@ def enable_privilege(name: str) -> bool:
         tp = TOKEN_PRIVILEGES()
         tp.PrivilegeCount = 1
         tp.Privileges[0].Luid = luid
-        tp.Privileges[0].Attributes = 0x00000002  # SE_PRIVILEGE_ENABLED
+        tp.Privileges[0].Attributes = attributes
         ok = advapi32.AdjustTokenPrivileges(
             token, False, ctypes.byref(tp), ctypes.sizeof(tp), None, None
         )
         return bool(ok) and ctypes.get_last_error() == 0
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def enable_privilege(name: str) -> bool:
+    """启用指定特权。"""
+    return _set_privilege(name, 0x00000002)  # SE_PRIVILEGE_ENABLED
+
+
+def disable_privilege(name: str) -> bool:
+    """禁用指定特权（用于清理后恢复，避免高危特权常驻）。"""
+    return _set_privilege(name, 0x00000000)  # SE_PRIVILEGE_DISABLED
+
+
+def privilege_state(name: str) -> int | None:
+    """查询指定特权当前属性位（0=禁用, 2=启用）；查询失败返回 None。"""
+    TokenPrivileges = 3
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        return None
+    try:
+        size = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, TokenPrivileges, None, 0, ctypes.byref(size))
+        if size.value == 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(token, TokenPrivileges, buf, size.value, ctypes.byref(size)):
+            return None
+        count = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD)).contents.value
+        arr = ctypes.cast(ctypes.byref(buf, ctypes.sizeof(wintypes.DWORD)),
+                          ctypes.POINTER(LUID_AND_ATTRIBUTES * count)).contents
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            return None
+        for item in arr:
+            if item.Luid.LowPart == luid.LowPart and item.Luid.HighPart == luid.HighPart:
+                return int(item.Attributes)
+        return None
     finally:
         kernel32.CloseHandle(token)
 
@@ -323,54 +372,62 @@ CLEAN_PRIVILEGES = (
 
 
 def do_clean(reason: str = "手动") -> dict:
-    """执行一次完整清理，返回结果统计。"""
+    """执行一次完整清理，返回结果统计。清理后会恢复特权开关（敏感特权用完即关）。"""
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
 
+    # 记录特权初始状态；清理结束后把"原本未启用"的特权恢复为禁用
+    prior = {p: privilege_state(p) for p in CLEAN_PRIVILEGES}
     # 显式检查特权启用结果：失败时给出可读原因，避免只看到黑盒 0xC0000061
     failed_privs = [p for p in CLEAN_PRIVILEGES if not enable_privilege(p)]
 
-    before = get_mem()
-    detail = []
-    if failed_privs:
-        detail.append("特权启用失败:" + ",".join(failed_privs))
+    try:
+        before = get_mem()
+        detail = []
+        if failed_privs:
+            detail.append("特权启用失败:" + ",".join(failed_privs))
 
-    r_ws = _purge_list(MemoryEmptyWorkingSets)
-    detail.append(f"清空工作集:{'成功' if r_ws == 0 else f'失败(0x{r_ws & 0xffffffff:X})'}")
+        r_ws = _purge_list(MemoryEmptyWorkingSets)
+        detail.append(f"清空工作集:{'成功' if r_ws == 0 else f'失败(0x{r_ws & 0xffffffff:X})'}")
 
-    r_fm = _purge_list(MemoryFlushModifiedList)
-    detail.append(f"刷写修改页:{'成功' if r_fm == 0 else f'失败(0x{r_fm & 0xffffffff:X})'}")
+        r_fm = _purge_list(MemoryFlushModifiedList)
+        detail.append(f"刷写修改页:{'成功' if r_fm == 0 else f'失败(0x{r_fm & 0xffffffff:X})'}")
 
-    r_sb = _purge_list(MemoryPurgeStandbyList)
-    standby_ok = r_sb == 0
-    detail.append(f"清理Standby:{'成功' if standby_ok else f'失败(0x{r_sb & 0xffffffff:X})'}")
+        r_sb = _purge_list(MemoryPurgeStandbyList)
+        standby_ok = r_sb == 0
+        detail.append(f"清理Standby:{'成功' if standby_ok else f'失败(0x{r_sb & 0xffffffff:X})'}")
 
-    n = empty_process_working_sets()
-    detail.append(f"进程数:{n}")
+        n = empty_process_working_sets()
+        detail.append(f"进程数:{n}")
 
-    fc = clear_file_cache()
-    detail.append(f"文件缓存:{'成功' if fc else '失败'}")
+        fc = clear_file_cache()
+        detail.append(f"文件缓存:{'成功' if fc else '失败'}")
 
-    # 三个核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
-    if r_ws != 0 and r_fm != 0 and r_sb != 0:
-        why = "特权启用失败: " + ", ".join(failed_privs) if failed_privs else "特权未启用或权限不足"
-        log(f"{reason}清理失败 | {why} | {', '.join(detail)}")
-        return {"ok": False, "msg": f"清理失败（{why}）"}
+        # 三个核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
+        if r_ws != 0 and r_fm != 0 and r_sb != 0:
+            why = ("特权启用失败: " + ", ".join(failed_privs)) if failed_privs else "特权未启用或权限不足"
+            log(f"{reason}清理失败 | {why} | {', '.join(detail)}")
+            return {"ok": False, "msg": f"清理失败（{why}）"}
 
-    time.sleep(1.5)  # 等系统把页回收计入可用内存
-    after = get_mem()
+        time.sleep(1.5)  # 等系统把页回收计入可用内存
+        after = get_mem()
 
-    freed = after["avail_phys"] - before["avail_phys"]
-    result = {
-        "ok": True,
-        "freed": freed,
-        "before": before,
-        "after": after,
-        "detail": ", ".join(detail),
-    }
-    log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "
-        f"(释放 {gb(max(freed, 0))}) | 提交 {before['commit_pct']:.0f}% -> {after['commit_pct']:.0f}% | {result['detail']}")
-    return result
+        freed = after["avail_phys"] - before["avail_phys"]
+        result = {
+            "ok": True,
+            "freed": freed,
+            "before": before,
+            "after": after,
+            "detail": ", ".join(detail),
+        }
+        log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "
+            f"(释放 {gb(max(freed, 0))}) | 提交 {before['commit_pct']:.0f}% -> {after['commit_pct']:.0f}% | {result['detail']}")
+        return result
+    finally:
+        # 仅禁用"清理前处于禁用状态"的特权，避免高危特权（如 SeDebugPrivilege）常驻
+        for p, st in prior.items():
+            if st is not None and not (st & 0x2):
+                disable_privilege(p)
 
 
 def top_processes(n: int = 10) -> str:
@@ -733,9 +790,38 @@ def once() -> None:
     print(f"明细: {r['detail']}")
 
 
+def selftest() -> int:
+    """内置自检：验证关键功能可用，返回退出码（0=全部通过）。"""
+    print(f"MemGuard 自检 (v{__version__})")
+    results = []
+
+    def check(name, fn):
+        try:
+            results.append((name, True, fn()))
+        except Exception as e:
+            results.append((name, False, repr(e)))
+
+    check("get_mem", lambda: f"物理 {get_mem()['phys_pct']:.0f}% / 提交 {get_mem()['commit_pct']:.0f}%")
+    check("make_icon", lambda: f"{make_icon(50, 85).size}")
+    check("is_admin", is_admin)
+    check("privilege_state", lambda: privilege_state("SeDebugPrivilege"))
+    check("autostart_enabled", autostart_enabled)
+    check("top_processes", lambda: f"{len(top_processes(5).splitlines())} 行")
+
+    ok_all = all(ok for _, ok, _ in results)
+    for name, ok, val in results:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {val}")
+    single = acquire_single_instance()
+    print(f"  [INFO] single_instance: {'已持有锁' if single else '已有实例在运行'}")
+    print("结果：" + ("全部通过" if ok_all else "存在失败项"))
+    return 0 if ok_all else 1
+
+
 if __name__ == "__main__":
     if "--once" in sys.argv:
         once()
+    elif "--selftest" in sys.argv:
+        sys.exit(selftest())
     else:
         if not acquire_single_instance():
             log("检测到已有 MemGuard 实例在运行，本次启动已取消")
