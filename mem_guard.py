@@ -29,6 +29,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -79,8 +80,24 @@ def save_config(cfg: dict) -> None:
         pass
 
 
+LOG_MAX_BYTES = 1 * 1024 * 1024  # 日志超过 1MB 时轮转为 mem_guard.log.1
+
+
+def _rotate_log_if_needed() -> None:
+    """日志超过上限时归档为 mem_guard.log.1（只保留一个备份）。"""
+    try:
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+            bak = LOG_PATH + ".1"
+            if os.path.exists(bak):
+                os.remove(bak)
+            os.replace(LOG_PATH, bak)
+    except Exception:
+        pass
+
+
 def log(msg: str) -> None:
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    _rotate_log_if_needed()
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -409,6 +426,118 @@ def message_box(title: str, text: str) -> None:
     ).start()
 
 
+_top_window_open = False
+
+
+def show_top_window() -> None:
+    """弹出可刷新的内存占用 Top10 窗口；无 tkinter 时回退到 MessageBox。"""
+    global _top_window_open
+    if _top_window_open:
+        return
+    _top_window_open = True
+
+    def worker() -> None:
+        global _top_window_open
+        try:
+            import tkinter as tk
+        except Exception:
+            _top_window_open = False
+            st = get_mem()
+            message_box(
+                "内存占用 Top10",
+                f"物理内存 {st['phys_pct']:.0f}%   提交内存 {st['commit_pct']:.0f}%\n"
+                f"{'-' * 46}\n{top_processes(10)}",
+            )
+            return
+        try:
+            root = tk.Tk()
+            root.title("MemGuard - 内存占用 Top10")
+            root.geometry("600x440")
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            header = tk.Label(root, text="", justify="left", anchor="w", font=("Consolas", 10))
+            header.pack(fill="x", padx=10, pady=(10, 4))
+
+            body = tk.Text(root, font=("Consolas", 10), wrap="none",
+                           relief="flat", background="#f7f7f7")
+            body.pack(fill="both", expand=True, padx=10)
+
+            def refresh() -> None:
+                st = get_mem()
+                header.config(
+                    text=(f"物理内存 {st['phys_pct']:.0f}%   "
+                          f"({gb(st['used_phys'])} / {gb(st['total_phys'])})\n"
+                          f"提交内存 {st['commit_pct']:.0f}%   "
+                          f"(可用 {gb(st['avail_commit'])} / {gb(st['total_commit'])})")
+                )
+                body.delete("1.0", "end")
+                body.insert("1.0", top_processes(10))
+
+            tk.Button(root, text="刷新", width=12, command=refresh).pack(pady=8)
+            refresh()
+            root.mainloop()
+        finally:
+            _top_window_open = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ---------------------------------------------------------------- 开机自启（计划任务）
+
+AUTOSTART_TASK = "MemGuard"
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _run_silent(cmd: list) -> bool:
+    """静默运行外部命令（不弹控制台窗口），返回是否成功。"""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           creationflags=_CREATE_NO_WINDOW)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _pythonw_path():
+    import shutil
+    for cand in ("pythonw.exe", "python.exe"):
+        p = shutil.which(cand)
+        if p:
+            return p
+    return None
+
+
+def autostart_enabled() -> bool:
+    """查询计划任务 MemGuard 是否已注册。"""
+    return _run_silent(["schtasks", "/Query", "/TN", AUTOSTART_TASK])
+
+
+def install_autostart() -> bool:
+    """注册登录自启计划任务（最高权限，无 UAC 弹窗）。优先复用 install_autostart.ps1。"""
+    ps1 = os.path.join(BASE_DIR, "install_autostart.ps1")
+    if os.path.exists(ps1):
+        return _run_silent(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", ps1, "-Mode", "install"])
+    pyw = _pythonw_path()
+    if not pyw:
+        return False
+    tr = f'"{pyw}" "{os.path.join(BASE_DIR, "mem_guard.py")}"'
+    return _run_silent(["schtasks", "/Create", "/TN", AUTOSTART_TASK, "/TR", tr,
+                        "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"])
+
+
+def remove_autostart() -> bool:
+    """删除开机自启计划任务。"""
+    ps1 = os.path.join(BASE_DIR, "install_autostart.ps1")
+    if os.path.exists(ps1):
+        return _run_silent(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", ps1, "-Mode", "uninstall"])
+    return _run_silent(["schtasks", "/Delete", "/TN", AUTOSTART_TASK, "/F"])
+
+
 # ---------------------------------------------------------------- 主程序
 
 class Guard:
@@ -431,14 +560,7 @@ class Guard:
         self.refresh()
 
     def on_top(self, icon=None, item=None) -> None:
-        st = get_mem()
-        message_box(
-            "内存占用 Top10",
-            f"物理内存 {st['phys_pct']:.0f}%   提交内存 {st['commit_pct']:.0f}%\n"
-            f"可用物理 {gb(st['avail_phys'])} / {gb(st['total_phys'])}\n"
-            f"可用提交 {gb(st['avail_commit'])} / {gb(st['total_commit'])}\n"
-            f"{'-' * 46}\n{top_processes(10)}",
-        )
+        show_top_window()
 
     def on_toggle_auto(self, icon, item) -> None:
         self.cfg["auto_clean"] = not self.cfg["auto_clean"]
@@ -456,12 +578,30 @@ class Guard:
         icon.stop()
 
     @staticmethod
-    def _preset(cfg, key, phys, commit):
+    def _preset(cfg, phys, commit):
         def setter(icon, item):
             cfg["phys_threshold"] = phys
             cfg["commit_threshold"] = commit
             save_config(cfg)
         return setter
+
+    @staticmethod
+    def _set_cooldown(cfg, minutes):
+        def setter(icon, item):
+            cfg["cooldown"] = minutes * 60
+            save_config(cfg)
+        return setter
+
+    def on_toggle_autostart(self, icon, item) -> None:
+        if autostart_enabled():
+            ok = remove_autostart()
+            log(f"取消开机自启 -> {'成功' if ok else '失败'}")
+            icon.notify("已取消开机自启" if ok else "取消失败", "MemGuard")
+        else:
+            ok = install_autostart()
+            log(f"设置开机自启 -> {'成功' if ok else '失败'}")
+            icon.notify("已设置开机自启（登录时自动启动）" if ok
+                        else "设置失败（需管理员权限）", "MemGuard")
 
     def build_menu(self) -> pystray.Menu:
         cfg = self.cfg
@@ -480,21 +620,31 @@ class Guard:
         def preset_menu():
             return pystray.Menu(
                 pystray.MenuItem(
-                    lambda i: f"{'●' if cfg['phys_threshold'] == 75 else '○'} 激进  物理75% / 提交85%",
-                    self._preset(cfg, "p", 75, 85), radio=True,
+                    "激进  物理75% / 提交85%",
+                    self._preset(cfg, 75, 85), radio=True,
                     checked=lambda i: cfg["phys_threshold"] == 75,
                 ),
                 pystray.MenuItem(
-                    lambda i: f"{'●' if cfg['phys_threshold'] == 85 else '○'} 标准  物理85% / 提交90%",
-                    self._preset(cfg, "p", 85, 90), radio=True,
+                    "标准  物理85% / 提交90%",
+                    self._preset(cfg, 85, 90), radio=True,
                     checked=lambda i: cfg["phys_threshold"] == 85,
                 ),
                 pystray.MenuItem(
-                    lambda i: f"{'●' if cfg['phys_threshold'] == 92 else '○'} 宽松  物理92% / 提交95%",
-                    self._preset(cfg, "p", 92, 95), radio=True,
+                    "宽松  物理92% / 提交95%",
+                    self._preset(cfg, 92, 95), radio=True,
                     checked=lambda i: cfg["phys_threshold"] == 92,
                 ),
             )
+
+        def cooldown_menu():
+            choices = [(1, "1 分钟"), (5, "5 分钟"), (10, "10 分钟"), (30, "30 分钟")]
+            return pystray.Menu(*[
+                pystray.MenuItem(
+                    label,
+                    self._set_cooldown(cfg, m), radio=True,
+                    checked=(lambda i, mm=m: cfg["cooldown"] == mm * 60),
+                ) for m, label in choices
+            ])
 
         return pystray.Menu(
             pystray.MenuItem(line_phys, None, enabled=False),
@@ -507,6 +657,9 @@ class Guard:
             pystray.MenuItem("自动清理", self.on_toggle_auto,
                              checked=lambda i: cfg["auto_clean"]),
             pystray.MenuItem("清理阈值", preset_menu()),
+            pystray.MenuItem("清理冷却", cooldown_menu()),
+            pystray.MenuItem("开机自启", self.on_toggle_autostart,
+                             checked=lambda i: autostart_enabled()),
             pystray.MenuItem(
                 lambda i: "权限：管理员（可清理）" if is_admin() else "⚠ 非管理员，无法清理",
                 None, enabled=False,
