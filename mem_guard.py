@@ -115,6 +115,33 @@ psapi = ctypes.WinDLL("psapi", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 
+# ---------------------------------------------------------------- Win32 类型声明（统一）
+# 统一声明所有用到的 Win32 函数的参数/返回类型。64 位 Python 下若不声明，
+# HANDLE 与结构体指针会被 ctypes 默认按 32 位 int 处理而截断，导致调用静默失败。
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+
+kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
+kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+
+kernel32.SetSystemFileCacheSize.argtypes = [ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD]
+kernel32.SetSystemFileCacheSize.restype = wintypes.BOOL
+
+kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+
+psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+psapi.EmptyWorkingSet.restype = wintypes.BOOL
+
+user32.MessageBoxW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+user32.MessageBoxW.restype = ctypes.c_int
+
+
 def get_mem() -> dict:
     """读取物理内存与提交内存状态。"""
     m = MEMORYSTATUSEX()
@@ -149,6 +176,21 @@ def is_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+# 命名互斥体句柄：需保持引用到进程退出，否则互斥体被回收会导致锁失效
+_instance_mutex = None
+
+
+def acquire_single_instance() -> bool:
+    """用命名互斥体实现单实例；若已有实例在运行则返回 False。"""
+    global _instance_mutex
+    ERROR_ALREADY_EXISTS = 183
+    _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\MemGuard_SingleInstance")
+    if not _instance_mutex:
+        # 创建失败（极少数情况）时不阻止启动
+        return True
+    return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
 
 
 class LUID(ctypes.Structure):
@@ -255,33 +297,48 @@ def clear_file_cache() -> bool:
     return bool(kernel32.SetSystemFileCacheSize(ctypes.c_size_t(-1), ctypes.c_size_t(-1), 0))
 
 
+CLEAN_PRIVILEGES = (
+    "SeDebugPrivilege",
+    "SeProfileSingleProcessPrivilege",
+    "SeIncreaseQuotaPrivilege",
+    "SeIncreaseBasePriorityPrivilege",
+)
+
+
 def do_clean(reason: str = "手动") -> dict:
     """执行一次完整清理，返回结果统计。"""
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
 
-    for priv in ("SeDebugPrivilege", "SeProfileSingleProcessPrivilege",
-                 "SeIncreaseQuotaPrivilege", "SeIncreaseBasePriorityPrivilege"):
-        enable_privilege(priv)
+    # 显式检查特权启用结果：失败时给出可读原因，避免只看到黑盒 0xC0000061
+    failed_privs = [p for p in CLEAN_PRIVILEGES if not enable_privilege(p)]
 
     before = get_mem()
     detail = []
+    if failed_privs:
+        detail.append("特权启用失败:" + ",".join(failed_privs))
 
-    r = _purge_list(MemoryEmptyWorkingSets)
-    detail.append(f"清空工作集:{'成功' if r == 0 else f'失败(0x{r & 0xffffffff:X})'}")
+    r_ws = _purge_list(MemoryEmptyWorkingSets)
+    detail.append(f"清空工作集:{'成功' if r_ws == 0 else f'失败(0x{r_ws & 0xffffffff:X})'}")
 
-    r = _purge_list(MemoryFlushModifiedList)
-    detail.append(f"刷写修改页:{'成功' if r == 0 else f'失败(0x{r & 0xffffffff:X})'}")
+    r_fm = _purge_list(MemoryFlushModifiedList)
+    detail.append(f"刷写修改页:{'成功' if r_fm == 0 else f'失败(0x{r_fm & 0xffffffff:X})'}")
 
-    r = _purge_list(MemoryPurgeStandbyList)
-    standby_ok = r == 0
-    detail.append(f"清理Standby:{'成功' if standby_ok else f'失败(0x{r & 0xffffffff:X})'}")
+    r_sb = _purge_list(MemoryPurgeStandbyList)
+    standby_ok = r_sb == 0
+    detail.append(f"清理Standby:{'成功' if standby_ok else f'失败(0x{r_sb & 0xffffffff:X})'}")
 
     n = empty_process_working_sets()
     detail.append(f"进程数:{n}")
 
     fc = clear_file_cache()
     detail.append(f"文件缓存:{'成功' if fc else '失败'}")
+
+    # 三个核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
+    if r_ws != 0 and r_fm != 0 and r_sb != 0:
+        why = "特权启用失败: " + ", ".join(failed_privs) if failed_privs else "特权未启用或权限不足"
+        log(f"{reason}清理失败 | {why} | {', '.join(detail)}")
+        return {"ok": False, "msg": f"清理失败（{why}）"}
 
     time.sleep(1.5)  # 等系统把页回收计入可用内存
     after = get_mem()
@@ -316,14 +373,16 @@ def top_processes(n: int = 10) -> str:
 
 # ---------------------------------------------------------------- 托盘图标
 
-def make_icon(pct: float) -> Image.Image:
+def make_icon(pct: float, threshold: float = 85.0) -> Image.Image:
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    if pct < 70:
+    # 颜色分档跟随可调的物理阈值：红=达到阈值，黄=阈值前 10% 区间，绿=更宽松
+    warn = max(threshold - 10.0, 1.0)
+    if pct < warn:
         color = (46, 160, 67, 255)     # 绿
-    elif pct < 85:
+    elif pct < threshold:
         color = (214, 158, 46, 255)    # 黄
     else:
         color = (207, 59, 54, 255)     # 红
@@ -468,7 +527,7 @@ class Guard:
                 self.refresh()
                 s = self.state
                 if self.icon:
-                    self.icon.icon = make_icon(s["phys_pct"])
+                    self.icon.icon = make_icon(s["phys_pct"], self.cfg["phys_threshold"])
                     self.icon.title = (
                         f"MemGuard  物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
                         f"可用物理 {gb(s['avail_phys'])}    可用提交 {gb(s['avail_commit'])}"
@@ -492,7 +551,7 @@ class Guard:
     def run(self) -> None:
         s = get_mem()
         self.icon = pystray.Icon(
-            "MemGuard", make_icon(s["phys_pct"]),
+            "MemGuard", make_icon(s["phys_pct"], self.cfg["phys_threshold"]),
             "MemGuard 启动中...", self.build_menu(),
         )
         log(f"MemGuard 启动 | 管理员={is_admin()} | 物理 {s['phys_pct']:.0f}% | 提交 {s['commit_pct']:.0f}%")
@@ -525,4 +584,9 @@ if __name__ == "__main__":
     if "--once" in sys.argv:
         once()
     else:
+        if not acquire_single_instance():
+            log("检测到已有 MemGuard 实例在运行，本次启动已取消")
+            user32.MessageBoxW(None, "MemGuard 已在运行（请查看系统托盘），本次不再重复启动。",
+                               "MemGuard", 0x40)  # MB_ICONINFORMATION
+            sys.exit(0)
         Guard().run()
