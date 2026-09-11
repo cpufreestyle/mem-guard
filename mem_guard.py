@@ -983,7 +983,7 @@ if __name__ == "__main__":
     else:
         if not acquire_single_instance():
             log("检测到已有 MemGuard 实例在运行，本次启动已取消")
-            user32.MessageBoxW(None, "MemGuard 已在运行（请查看系统托盘），本次不再重复启动。",
-                               "MemGuard", 0x40)  # MB_ICONINFORMATION
+            # 用守护线程弹提示，主线程立即退出，避免互斥体句柄被卡死的进程长期持有
+            message_box("MemGuard 已在运行（请查看系统托盘），本次不再重复启动。", "MemGuard")
             sys.exit(0)
         Guard().run()
