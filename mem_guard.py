@@ -16,6 +16,7 @@ Windows 报「内存不足 / 虚拟内存不足」时，真正耗尽的是 **提
      清空进程工作集 -> 刷写修改列表 -> 清理 standby list -> 清空系统文件缓存
    （原理与 ISLC / Mem Reduct 相同，调用 NtSetSystemInformation）
 4. 可查看内存占用 Top10、开关自动清理、调整阈值
+5. 配置热重载（改 json 无需重启）、内存趋势窗口、一键导出诊断；超阈值自动清理支持防抖
 
 清理功能需要 **管理员权限**（要 SeProfileSingleProcessPrivilege 等特权）。
 非管理员运行时程序仍可启动，但清理会失败并给出提示。
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import collections
 from datetime import datetime
 
 import psutil
@@ -41,7 +43,7 @@ import pystray
 
 # ---------------------------------------------------------------- 路径与配置
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "mem_guard.json")
@@ -53,6 +55,7 @@ DEFAULT_CONFIG = {
     "interval": 10,          # 检测间隔(秒)
     "cooldown": 300,         # 两次自动清理之间的冷却时间(秒)
     "auto_clean": True,      # 是否开启自动清理
+    "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
 }
 
 # 不对其做 EmptyWorkingSet 的进程，清空这些进程的工作集会导致系统不稳定或界面闪烁
@@ -430,7 +433,8 @@ def do_clean(reason: str = "手动") -> dict:
                 disable_privilege(p)
 
 
-def top_processes(n: int = 10) -> str:
+def top_processes_list(n: int = 10) -> list:
+    """返回物理内存占用最高的 n 个进程 [(name, rss_bytes, pid), ...]。"""
     rows = []
     for p in psutil.process_iter(["name", "memory_info"]):
         try:
@@ -440,8 +444,12 @@ def top_processes(n: int = 10) -> str:
         except Exception:
             continue
     rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[:n]
+
+
+def top_processes(n: int = 10) -> str:
     lines = [f"{i + 1:>2}. {name:<28} {rss / 1024 ** 3:>6.2f} GB   (PID {pid})"
-             for i, (name, rss, pid) in enumerate(rows[:n])]
+             for i, (name, rss, pid) in enumerate(top_processes_list(n))]
     return "\n".join(lines)
 
 
@@ -542,6 +550,77 @@ def show_top_window() -> None:
     threading.Thread(target=worker, daemon=True).start()
 
 
+_trend_window_open = False
+
+
+def show_trend_window(history_getter) -> None:
+    """弹出可刷新的内存趋势窗口（物理/提交两条曲线）。无 tkinter 时静默返回。"""
+    global _trend_window_open
+    if _trend_window_open:
+        return
+    _trend_window_open = True
+
+    def worker() -> None:
+        global _trend_window_open
+        try:
+            import tkinter as tk
+        except Exception:
+            _trend_window_open = False
+            return
+        try:
+            root = tk.Tk()
+            root.title("MemGuard - 内存趋势")
+            root.geometry("660x440")
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            canvas = tk.Canvas(root, bg="white")
+            canvas.pack(fill="both", expand=True)
+
+            def draw() -> None:
+                canvas.delete("all")
+                data = list(history_getter())
+                w = max(canvas.winfo_width(), 1)
+                h = max(canvas.winfo_height(), 1)
+                canvas.create_text(12, 8, anchor="nw",
+                                   text="蓝=物理 / 红=提交 (使用率 %)", fill="#333")
+                if len(data) < 2:
+                    canvas.create_text(w / 2, h / 2, anchor="center",
+                                       text="采样中...（稍候自动刷新）", fill="#999")
+                    return
+                n = len(data)
+                for lvl, col in ((85, "#cccccc"), (100, "#e0a0a0")):
+                    y = h - 10 - (h - 20) * (lvl / 100)
+                    canvas.create_line(10, y, w - 10, y, fill=col, dash=(4, 4))
+                for key, color in ((lambda p, c: p, "#2d6cdf"),
+                                   (lambda p, c: c, "#cf3b36")):
+                    coords = []
+                    for i, (_, ph, cm) in enumerate(data):
+                        x = 10 + (w - 20) * i / (n - 1)
+                        y = h - 10 - (h - 20) * (key(ph, cm) / 100)
+                        coords += [x, y]
+                    canvas.create_line(*coords, fill=color, width=2)
+
+            def tick() -> None:
+                try:
+                    if root.winfo_exists():
+                        draw()
+                        root.after(1000, tick)
+                except Exception:
+                    pass
+
+            tk.Button(root, text="刷新", width=12, command=draw).pack(pady=8)
+            draw()
+            root.after(1000, tick)
+            root.mainloop()
+        finally:
+            _trend_window_open = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 # ---------------------------------------------------------------- 开机自启（计划任务）
 
 AUTOSTART_TASK = "MemGuard"
@@ -595,6 +674,38 @@ def remove_autostart() -> bool:
     return _run_silent(["schtasks", "/Delete", "/TN", AUTOSTART_TASK, "/F"])
 
 
+# ---------------------------------------------------------------- 诊断导出
+
+def export_diagnostics() -> str:
+    """打包内存状态/进程/日志/配置为 zip，返回路径；失败返回 'ERR:...'。"""
+    import zipfile
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_path = os.path.join(BASE_DIR, f"diagnostics_{ts}.zip")
+        s = get_mem()
+        info = [
+            f"version={__version__}",
+            f"admin={is_admin()}",
+            f"物理 {s['phys_pct']:.1f}%  ({gb(s['used_phys'])} / {gb(s['total_phys'])})",
+            f"提交 {s['commit_pct']:.1f}%  (可用 {gb(s['avail_commit'])} / {gb(s['total_commit'])})",
+            f"autostart={autostart_enabled()}",
+        ]
+        for p in CLEAN_PRIVILEGES:
+            info.append(f"priv {p}={privilege_state(p)}")
+        info.append("--- 物理占用 Top20 ---")
+        for name, rss, pid in top_processes_list(20):
+            info.append(f"{name}  {rss / 1024 ** 3:.2f} GB  PID {pid}")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("diagnostics.txt", "\n".join(info))
+            if os.path.exists(CONFIG_PATH):
+                z.write(CONFIG_PATH, "mem_guard.json")
+            if os.path.exists(LOG_PATH):
+                z.write(LOG_PATH, "mem_guard.log")
+        return zip_path
+    except Exception as e:
+        return f"ERR:{e}"
+
+
 # ---------------------------------------------------------------- 主程序
 
 class Guard:
@@ -602,6 +713,9 @@ class Guard:
         self.cfg = load_config()
         self.state = get_mem()
         self.last_clean = 0.0
+        self.over_since = None       # 内存超阈值起始时刻（防抖用）
+        self.history = collections.deque(maxlen=120)  # 内存使用率采样历史
+        self._cfg_mtime = None       # 配置热重载：记录上次 mtime
         self.stop = threading.Event()
         self.icon: pystray.Icon | None = None
 
@@ -613,7 +727,13 @@ class Guard:
             icon.notify(r["msg"], "MemGuard")
             return
         freed = max(r["freed"], 0)
-        icon.notify(f"释放 {gb(freed)}\n可用物理 {gb(r['after']['avail_phys'])}", "MemGuard 清理完成")
+        top3 = top_processes_list(3)
+        top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
+        icon.notify(
+            f"释放 {gb(freed)}  可用物理 {gb(r['after']['avail_phys'])}\n"
+            f"当前占用 Top3:\n{top_txt}",
+            "MemGuard 清理完成",
+        )
         self.refresh()
 
     def on_top(self, icon=None, item=None) -> None:
@@ -659,6 +779,16 @@ class Guard:
             log(f"设置开机自启 -> {'成功' if ok else '失败'}")
             icon.notify("已设置开机自启（登录时自动启动）" if ok
                         else "设置失败（需管理员权限）", "MemGuard")
+
+    def on_trend(self, icon=None, item=None) -> None:
+        show_trend_window(lambda: list(self.history))
+
+    def on_export(self, icon=None, item=None) -> None:
+        path = export_diagnostics()
+        if path.startswith("ERR:"):
+            icon.notify("诊断导出失败：" + path, "MemGuard")
+        else:
+            icon.notify("诊断已导出：\n" + path, "MemGuard 诊断")
 
     def build_menu(self) -> pystray.Menu:
         cfg = self.cfg
@@ -710,6 +840,7 @@ class Guard:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("立即清理", self.on_clean_now),
             pystray.MenuItem("内存占用 Top10", self.on_top),
+            pystray.MenuItem("内存趋势", self.on_trend),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("自动清理", self.on_toggle_auto,
                              checked=lambda i: cfg["auto_clean"]),
@@ -723,6 +854,7 @@ class Guard:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("打开日志", self.on_open_log),
+            pystray.MenuItem("导出诊断", self.on_export),
             pystray.MenuItem("退出", self.on_quit),
         )
 
@@ -731,11 +863,26 @@ class Guard:
     def refresh(self) -> None:
         self.state = get_mem()
 
+    def maybe_reload_config(self) -> None:
+        """检查配置文件 mtime，变化则热重载（无需重启托盘）。"""
+        try:
+            mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else None
+            if mtime != self._cfg_mtime:
+                self._cfg_mtime = mtime
+                if mtime is not None:
+                    self.cfg = load_config()
+                    log("配置已热重载（来自 mem_guard.json）")
+        except Exception as e:
+            log(f"配置重载检查失败: {e}")
+
     def monitor(self) -> None:
+        self.maybe_reload_config()
         while not self.stop.is_set():
             try:
+                self.maybe_reload_config()
                 self.refresh()
                 s = self.state
+                self.history.append((time.time(), s["phys_pct"], s["commit_pct"]))
                 if self.icon:
                     self.icon.icon = make_icon(s["phys_pct"], self.cfg["phys_threshold"])
                     self.icon.title = (
@@ -745,15 +892,26 @@ class Guard:
                 now = time.time()
                 over = (s["phys_pct"] >= self.cfg["phys_threshold"]
                         or s["commit_pct"] >= self.cfg["commit_threshold"])
-                if over and self.cfg["auto_clean"] and now - self.last_clean > self.cfg["cooldown"]:
-                    self.last_clean = now
-                    r = do_clean("自动")
-                    if r["ok"] and self.icon:
-                        self.icon.notify(
-                            f"物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}% 超阈值\n"
-                            f"已释放 {gb(max(r['freed'], 0))}",
-                            "MemGuard 自动清理",
-                        )
+                if over:
+                    if self.over_since is None:
+                        self.over_since = now
+                    debounced = (now - self.over_since) >= self.cfg.get("debounce_sec", 0)
+                    due = (self.cfg["auto_clean"] and debounced
+                           and now - self.last_clean > self.cfg["cooldown"])
+                    if due:
+                        self.last_clean = now
+                        self.over_since = None
+                        r = do_clean("自动")
+                        if r["ok"] and self.icon:
+                            top3 = top_processes_list(3)
+                            top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
+                            self.icon.notify(
+                                f"物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}% 超阈值\n"
+                                f"已释放 {gb(max(r['freed'], 0))}\n当前占用 Top3:\n{top_txt}",
+                                "MemGuard 自动清理",
+                            )
+                else:
+                    self.over_since = None
             except Exception as e:
                 log(f"监控异常: {e}")
             self.stop.wait(self.cfg["interval"])
