@@ -43,7 +43,7 @@ import pystray
 
 # ---------------------------------------------------------------- 路径与配置
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "mem_guard.json")
@@ -162,6 +162,14 @@ psapi.EmptyWorkingSet.restype = wintypes.BOOL
 
 user32.MessageBoxW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
 user32.MessageBoxW.restype = ctypes.c_int
+
+kernel32.GetConsoleWindow.argtypes = []
+kernel32.GetConsoleWindow.restype = wintypes.HWND
+
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
+
+SW_HIDE = 0
 
 
 def get_mem() -> dict:
@@ -931,6 +939,21 @@ class Guard:
 
 # ---------------------------------------------------------------- 入口
 
+def _hide_console() -> None:
+    """隐藏随 python.exe 启动时附带的控制台窗口。
+
+    用 pythonw.exe 启动时本就没有控制台，此函数会静默跳过；
+    用 python.exe 启动（例如直接双击 .py 或未改造的旧快捷方式）时，
+    在这里把黑框隐藏，托盘程序全程不出现前台窗口。
+    """
+    try:
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32.ShowWindow(hwnd, SW_HIDE)
+    except Exception:
+        pass
+
+
 def once() -> None:
     """命令行模式：打印一次状态并执行清理，用于验证，不进托盘。"""
     s = get_mem()
@@ -981,9 +1004,16 @@ if __name__ == "__main__":
     elif "--selftest" in sys.argv:
         sys.exit(selftest())
     else:
+        # pythonw.exe 启动时没有标准输出流，兜底到空设备，避免任何 print 抛异常
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")
+        # 隐藏 python.exe 自带的控制台窗口，托盘程序不停留在前台
+        _hide_console()
         if not acquire_single_instance():
             log("检测到已有 MemGuard 实例在运行，本次启动已取消")
             # 用守护线程弹提示，主线程立即退出，避免互斥体句柄被卡死的进程长期持有
-            message_box("MemGuard 已在运行（请查看系统托盘），本次不再重复启动。", "MemGuard")
+            message_box("MemGuard", "MemGuard 已在运行（请查看系统托盘），本次不再重复启动。")
             sys.exit(0)
         Guard().run()

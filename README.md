@@ -22,6 +22,9 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - 日志自动轮转（超过 1MB 归档为 `mem_guard.log.1`）
 - 单实例运行（命名互斥体）
 - 清理所需特权**用完即关**（不常驻 `SeDebugPrivilege` 等高危特权）
+- **后台静默运行**：全程无控制台窗口（用 `pythonw.exe` 启动，程序内也会主动隐藏控制台）
+- 配置热重载（改 `mem_guard.json` 无需重启）、内存趋势窗口、一键导出诊断
+- 超阈值自动清理支持**防抖**（`debounce_sec`），避免内存边缘抖动误触发
 
 ## 环境要求
 
@@ -37,7 +40,10 @@ pip install -r requirements.txt
 python mem_guard.py
 ```
 
-或直接双击 `启动 MemGuard（管理员）.bat`（会自动请求管理员权限）。
+或直接双击 `启动 MemGuard（管理员）.bat`（会自动请求管理员权限，并以后台无窗口方式启动）。
+
+> 提示：托盘程序请用 `pythonw.exe` 启动（本 bat 已自动优先使用），这样不会出现控制台黑框；
+> 若用 `python.exe` 启动，程序也会在启动瞬间自动隐藏控制台窗口。
 
 命令行辅助模式：
 
@@ -63,6 +69,7 @@ python mem_guard.py --selftest   # 运行内置自检
 | `interval` | 检测间隔(秒) | 10 |
 | `cooldown` | 两次自动清理的冷却(秒) | 300 |
 | `auto_clean` | 是否开启自动清理 | true |
+| `debounce_sec` | 内存持续超阈值的宽限(秒)，0=立即触发 | 0 |
 
 ## 相关脚本
 
@@ -77,4 +84,4 @@ python mem_guard.py --selftest   # 运行内置自检
 
 ## 版本
 
-当前版本 `1.1.0`。
+当前版本 `1.2.1`。
