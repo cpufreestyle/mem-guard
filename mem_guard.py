@@ -665,7 +665,17 @@ def autostart_enabled() -> bool:
 
 
 def install_autostart() -> bool:
-    """注册登录自启计划任务（最高权限，无 UAC 弹窗）。优先复用 install_autostart.ps1。"""
+    """注册登录自启计划任务（最高权限，无 UAC 弹窗）。
+
+    打包成 exe 后直接把 exe 自身注册进去，不依赖 Python 与外部脚本；
+    源码运行时优先复用 install_autostart.ps1，否则退回 schtasks + pythonw。
+    """
+    if getattr(sys, "frozen", False):
+        # frozen 下 BASE_DIR 取自 exe 所在目录，无需设置任务的工作目录
+        exe = os.path.abspath(sys.executable)
+        return _run_silent(["schtasks", "/Create", "/TN", AUTOSTART_TASK,
+                            "/TR", f'"{exe}"', "/SC", "ONLOGON",
+                            "/RL", "HIGHEST", "/F"])
     ps1 = os.path.join(BASE_DIR, "install_autostart.ps1")
     if os.path.exists(ps1):
         return _run_silent(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",

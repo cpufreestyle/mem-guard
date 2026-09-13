@@ -63,12 +63,25 @@ pip install -r requirements.txt   # 含 pyinstaller
 .\build.ps1                       # 生成 dist\mem_guard.exe（GUI 子系统，无控制台黑框）
 ```
 
-构建产物 `dist\mem_guard.exe`：
-- 单文件，直接复制到任意 Windows 机器运行；
-- 以 `--noconsole` 方式编译，运行时不弹控制台窗口；
-- 日志与配置写在 exe 所在目录（而非临时目录）；
-- 清理需管理员权限：双击后右键「以管理员身份运行」，或仍用
-  `启动 MemGuard（管理员）.bat`（会自动提权）。
+构建选项：
+
+| 参数 | 产物 | 说明 |
+| --- | --- | --- |
+| 默认 | `dist\mem_guard.exe` | 单文件（约 30MB），便于跨机器拷贝分发 |
+| `-OneDir` | `dist\mem_guard\mem_guard.exe` | 目录版：启动更快、进程列表只有 1 个进程；分发需整目录拷贝 |
+| `-NoTk` | 体积再小约 10MB | 排除 tkinter/tcl-tk；代价：「内存趋势」窗口不可用，「Top10」回退为 MessageBox |
+
+若系统装有 [UPX](https://upx.github.io/)，脚本会自动启用压缩，体积可再缩减约一半。
+
+打包后的行为：
+- 无控制台窗口（`--noconsole`，GUI 子系统）；
+- 日志与配置写在 **exe 所在目录**（而非临时解压目录）；
+- 托盘「开机自启」直接把 **exe 自身**注册为计划任务（最高权限 / 登录触发 / 无 UAC 弹窗），
+  不依赖 Python；仅源码方式运行时才退回 `pythonw + mem_guard.py`；
+- 单文件版运行时会解压到临时目录，进程列表里会看到「引导器 + 程序」两个进程，属正常现象
+  （日志每次只写一行「MemGuard 启动」，即只有一个托盘实例）。
+
+清理需管理员权限：右键「以管理员身份运行」，或用 `启动 MemGuard（管理员）.bat`（自动提权）。
 
 ## 开机自启
 
