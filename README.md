@@ -52,6 +52,24 @@ python mem_guard.py --once       # 打印一次内存状态并执行一次清理
 python mem_guard.py --selftest   # 运行内置自检
 ```
 
+## 打包为独立 exe（免 Python、跨机器分发）
+
+本工具清理内存依赖 Windows 专有 API（`NtSetSystemInformation` / Win32），
+因此**可执行文件只能在 Windows 上运行**，无法编译成真正跨平台的版本。
+但可打包成单个 `.exe`，目标机器无需安装 Python 与依赖，拷过去即可后台运行：
+
+```powershell
+pip install -r requirements.txt   # 含 pyinstaller
+.\build.ps1                       # 生成 dist\mem_guard.exe（GUI 子系统，无控制台黑框）
+```
+
+构建产物 `dist\mem_guard.exe`：
+- 单文件，直接复制到任意 Windows 机器运行；
+- 以 `--noconsole` 方式编译，运行时不弹控制台窗口；
+- 日志与配置写在 exe 所在目录（而非临时目录）；
+- 清理需管理员权限：双击后右键「以管理员身份运行」，或仍用
+  `启动 MemGuard（管理员）.bat`（会自动提权）。
+
 ## 开机自启
 
 - 方式一：运行 `安装 MemGuard 开机自启（管理员）.bat`（注册登录时以最高权限启动的计划任务，无 UAC 弹窗）

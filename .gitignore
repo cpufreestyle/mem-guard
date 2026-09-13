@@ -1,6 +1,15 @@
 # 运行时日志
 mem_guard.log
 
+# 构建产物（PyInstaller）
+dist/
+build/
+*.spec
+
+# 程序图标（由脚本生成）
+mem_guard.ico
+
+
 # 旧草稿（与 启动页面文件配置 重复）
 配置页面文件*.bat
 

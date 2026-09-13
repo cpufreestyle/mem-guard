@@ -11,14 +11,17 @@ if errorlevel 1 (
 
 cd /d "%~dp0"
 
-rem 优先用 pythonw.exe 启动：它没有控制台窗口，托盘程序全程静默不占前台
-set "PYW="
-for /f "delims=" %%i in ('where pythonw.exe 2^>nul') do (
-    if not defined PYW set "PYW=%%i"
-)
-if defined PYW (
-    start "" "%PYW%" "%~dp0mem_guard.py"
+rem 优先用打包好的 exe（无控制台、免 Python）；没有则退回源码方式
+if exist "%~dp0mem_guard.exe" (
+    start "" "%~dp0mem_guard.exe"
 ) else (
-    rem 找不到 pythonw 时退回 python.exe（程序内部会隐藏控制台）
-    start "" /min python.exe "%~dp0mem_guard.py"
+    set "PYW="
+    for /f "delims=" %%i in ('where pythonw.exe 2^>nul') do (
+        if not defined PYW set "PYW=%%i"
+    )
+    if defined PYW (
+        start "" "%PYW%" "%~dp0mem_guard.py"
+    ) else (
+        start "" /min python.exe "%~dp0mem_guard.py"
+    )
 )

@@ -45,7 +45,12 @@ import pystray
 
 __version__ = "1.2.1"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 打包成 exe 时（PyInstaller --onefile），__file__ 指向临时解压目录，
+# 日志/配置应落在 exe 真正所在目录，故 frozen 时改用 sys.executable 的目录
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "mem_guard.json")
 LOG_PATH = os.path.join(BASE_DIR, "mem_guard.log")
 
