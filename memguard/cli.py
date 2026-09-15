@@ -18,6 +18,7 @@ from .config import (
     normalize_config,
 )
 from .clean import do_clean, top_processes
+from .advisor import analyze, format_advice
 from .tray import (
     Guard,
     _parse_version,
@@ -94,6 +95,10 @@ def selftest() -> int:
     check("_parse_version", lambda: (
         f"v1.10.2 > 1.9.9 -> {_parse_version('v1.10.2') > _parse_version('1.9.9')}, "
         f"同版本 -> {_parse_version('1.3.0') == _parse_version('v1.3.0')}"
+    ))
+    check("advisor", lambda: (
+        f"{len(analyze(normalize_config({})))} 条 / "
+        f"{len(format_advice(analyze(normalize_config({}))))} 字符"
     ))
 
     ok_all = all(ok for _, ok, _ in results)

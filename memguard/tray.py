@@ -31,6 +31,7 @@ from .config import (
     log,
     save_config,
 )
+from .advisor import analyze, format_advice
 from .clean import CLEAN_PRIVILEGES, do_clean, top_processes, top_processes_list
 from .winapi import get_mem, is_admin, privilege_state, user32
 
@@ -198,6 +199,57 @@ def show_trend_window(history_getter) -> None:
             root.mainloop()
         finally:
             _trend_window_open = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+_advice_window_open = False
+
+
+def show_advice_window(cfg: dict) -> None:
+    """弹出可刷新的优化建议窗口；无 tkinter 时回退到 MessageBox。"""
+    global _advice_window_open
+    if _advice_window_open:
+        return
+    _advice_window_open = True
+
+    def worker() -> None:
+        global _advice_window_open
+        try:
+            import tkinter as tk
+        except Exception:
+            _advice_window_open = False
+            message_box("MemGuard - 优化建议", format_advice(analyze(cfg)))
+            return
+        try:
+            root = tk.Tk()
+            root.title("MemGuard - 优化建议")
+            root.geometry("640x460")
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            body = tk.Text(root, font=("Consolas", 10), wrap="word",
+                           relief="flat", background="#f7f7f7")
+            body.pack(fill="both", expand=True, padx=10, pady=10)
+
+            def refresh() -> None:
+                items = analyze(cfg)
+                body.delete("1.0", "end")
+                if not items:
+                    body.insert("1.0", "未发现明显可优化项，当前配置与内存状态良好。")
+                    return
+                for it in items:
+                    label = {"warn": "注意", "tip": "建议", "info": "提示"}.get(it["level"], "·")
+                    body.insert("end", f"[{label}] {it['title']}\n")
+                    body.insert("end", "    " + it["text"] + "\n\n")
+
+            tk.Button(root, text="刷新", width=12, command=refresh).pack(pady=8)
+            refresh()
+            root.mainloop()
+        finally:
+            _advice_window_open = False
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -428,6 +480,9 @@ class Guard:
     def on_trend(self, icon=None, item=None) -> None:
         show_trend_window(lambda: list(self.history))
 
+    def on_advice(self, icon=None, item=None) -> None:
+        show_advice_window(self.cfg)
+
     def on_export(self, icon=None, item=None) -> None:
         path = export_diagnostics()
         if path.startswith("ERR:"):
@@ -537,6 +592,8 @@ class Guard:
             pystray.MenuItem("立即清理", self.on_clean_now),
             pystray.MenuItem("内存占用 Top10", self.on_top),
             pystray.MenuItem("内存趋势", self.on_trend),
+            pystray.MenuItem(lambda i: f"优化建议（{len(analyze(self.cfg))} 条）",
+                             self.on_advice),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("自动清理", self.on_toggle_auto,
                              checked=lambda i: cfg["auto_clean"]),
