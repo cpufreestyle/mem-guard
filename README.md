@@ -76,8 +76,12 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 | `-NoTk` | 体积再小约 10MB | 排除 tkinter/tcl-tk；代价：「内存趋势」窗口不可用，「Top10」回退为 MessageBox |
 
 体积优化（可选）：把 [UPX](https://upx.github.io/) 的 `upx.exe` 放到 `tools\upx-*\`（或加入 PATH），
-再用 `.\build.ps1 -Upx` 启用压缩即可（实测单文件版约 **30MB → 22MB**）。
+再用 `.\build.ps1 -Upx` 启用压缩即可。
 **默认不启用**：经 UPX 压缩的 exe 更容易被杀软启发式规则误报。
+
+脚本已默认排除 `numpy`/`pandas`/`matplotlib`/`scipy` 等本程序用不到的大模块
+（避免开发机装了它们时被连带打包），单文件版实测约 **18MB**；
+构建结束会自动对产物跑一次 `--selftest` 冒烟测试，失败即报错。
 
 ### 自动构建与发布（GitHub Actions）
 
@@ -135,4 +139,4 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 
 ## 版本
 
-当前版本 `1.3.1`。
+当前版本 `1.3.2`。

@@ -40,7 +40,15 @@ jobs:
       - name: 打包单文件 exe
         run: >
           python -m PyInstaller --noconsole --onefile --name mem_guard
-          --icon mem_guard.ico --hidden-import pystray._win32 --clean mem_guard.py
+          --icon mem_guard.ico --hidden-import pystray._win32 --clean
+          --exclude-module numpy --exclude-module pandas --exclude-module matplotlib
+          --exclude-module scipy --exclude-module pytest --exclude-module setuptools
+          mem_guard.py
+
+      - name: 冒烟测试产物
+        run: |
+          dist\mem_guard.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "产物自检退出码 $LASTEXITCODE" }
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4

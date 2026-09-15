@@ -29,6 +29,17 @@ $pyiArgs = @('--noconsole', '--name', 'mem_guard', '--icon', 'mem_guard.ico',
 if (-not $OneDir) { $pyiArgs += '--onefile' }
 if ($NoTk)        { $pyiArgs += @('--exclude-module', 'tkinter') }
 
+# 排除开发机上可能被连带打包、但本程序完全用不到的大模块
+# （例如本机装了 numpy 时 PyInstaller 会顺带打进 numpy.libs，体积多出约 10MB）
+$pyiArgs += @(
+    '--exclude-module', 'numpy',
+    '--exclude-module', 'pandas',
+    '--exclude-module', 'matplotlib',
+    '--exclude-module', 'scipy',
+    '--exclude-module', 'pytest',
+    '--exclude-module', 'setuptools'
+)
+
 # UPX 压缩：默认关闭（压缩后的 exe 更易被杀软启发式误报），需显式 -Upx 才启用
 if ($Upx) {
     $upxPath = $null
@@ -66,11 +77,27 @@ if ($code -ne 0) {
 Get-Content $logFile -Tail 2
 try { Remove-Item $logFile -Force -ErrorAction Stop } catch { }
 
+$exeRel = if ($OneDir) { 'dist\mem_guard\mem_guard.exe' } else { 'dist\mem_guard.exe' }
+$exePath = Join-Path $PSScriptRoot $exeRel
+if (-not (Test-Path $exePath)) {
+    throw ('未找到构建产物：' + $exeRel)
+}
+
+# 冒烟测试：运行产物自检（GUI 子系统没有控制台输出，只看退出码）
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& $exePath --selftest | Out-Null
+$smoke = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($smoke -ne 0) {
+    throw ('冒烟测试失败：产物自检退出码 ' + $smoke)
+}
+
 Write-Host ''
 if ($OneDir) {
-    Write-Host '构建完成（目录版，单进程 / 启动快）：dist\mem_guard\mem_guard.exe'
+    Write-Host ('构建完成（目录版，单进程 / 启动快；冒烟自检通过）：dist\mem_guard\mem_guard.exe')
     Write-Host '分发请整目录拷贝（压缩后解压即可用）。'
 } else {
-    Write-Host '构建完成（单文件）：dist\mem_guard.exe'
+    Write-Host ('构建完成（单文件 {0:N1} MB；冒烟自检通过）：dist\mem_guard.exe' -f ((Get-Item $exePath).Length / 1MB))
     Write-Host '注：单文件版运行时会解压到临时目录，进程列表里会看到"引导器 + 程序"两个进程，属正常现象。'
 }
