@@ -83,12 +83,19 @@ if (-not (Test-Path $exePath)) {
     throw ('未找到构建产物：' + $exeRel)
 }
 
-# 冒烟测试：运行产物自检（GUI 子系统没有控制台输出，只看退出码）
+# 冒烟测试：运行产物自检（GUI 子系统没有控制台，靠退出码判断；自检明细落盘便于排查）
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-& $exePath --selftest | Out-Null
-$smoke = $LASTEXITCODE
+$selftestLog = Join-Path $env:TEMP 'mem_guard_selftest.log'
+$env:MEMGUARD_SELFTEST_LOG = $selftestLog
+$proc = Start-Process -FilePath $exePath -ArgumentList '--selftest' -Wait -PassThru
+$smoke = $proc.ExitCode
+Remove-Item Env:\MEMGUARD_SELFTEST_LOG -ErrorAction SilentlyContinue
 $ErrorActionPreference = $prevEap
+if (Test-Path $selftestLog) {
+    Get-Content $selftestLog -Encoding UTF8 | Select-Object -Last 3
+    try { Remove-Item $selftestLog -Force -ErrorAction Stop } catch { }
+}
 if ($smoke -ne 0) {
     throw ('冒烟测试失败：产物自检退出码 ' + $smoke)
 }

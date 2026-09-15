@@ -48,7 +48,7 @@ import pystray
 
 # ---------------------------------------------------------------- 路径与配置
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -1273,6 +1273,13 @@ if __name__ == "__main__":
     if "--once" in sys.argv:
         once()
     elif "--selftest" in sys.argv:
+        # GUI 子系统（--noconsole）下没有 stdout，CI 冒烟测试需要把自检结果落盘才能看到明细
+        _log_path = os.environ.get("MEMGUARD_SELFTEST_LOG")
+        if _log_path and sys.stdout is None:
+            try:
+                sys.stdout = open(_log_path, "w", encoding="utf-8")
+            except Exception:
+                pass
         sys.exit(selftest())
     else:
         # pythonw.exe 启动时没有标准输出流，兜底到空设备，避免任何 print 抛异常

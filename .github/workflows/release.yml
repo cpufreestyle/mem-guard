@@ -47,8 +47,18 @@ jobs:
 
       - name: 冒烟测试产物
         run: |
-          dist\mem_guard.exe --selftest
-          if ($LASTEXITCODE -ne 0) { throw "产物自检退出码 $LASTEXITCODE" }
+          # GUI 子系统的 exe 没有控制台输出，且 $LASTEXITCODE 不可靠，
+          # 因此用 Start-Process -Wait -PassThru 取退出码，并让自检把明细写到文件
+          $env:MEMGUARD_SELFTEST_LOG = "$PWD\selftest.log"
+          $p = Start-Process -FilePath 'dist\mem_guard.exe' -ArgumentList '--selftest' -Wait -PassThru
+          if (Test-Path selftest.log) { Get-Content selftest.log }
+          Write-Host "冒烟退出码: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) {
+            $detail = if (Test-Path selftest.log) { (Get-Content selftest.log -Raw) } else { '(无自检日志)' }
+            $flat = (($detail -split "`r?`n" | Select-Object -First 15) -join ' | ')
+            Write-Host "::error title=产物冒烟测试失败::exit=$($p.ExitCode) $flat"
+            exit 1
+          }
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
