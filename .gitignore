@@ -5,9 +5,14 @@ mem_guard.log
 dist/
 build/
 *.spec
+build_log.txt
+pyi_log.txt
 
 # 程序图标（由脚本生成）
 mem_guard.ico
+
+# 本地下载的 UPX（体积压缩用，不入库）
+tools/
 
 
 # 旧草稿（与 启动页面文件配置 重复）

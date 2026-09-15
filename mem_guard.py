@@ -13,10 +13,15 @@ Windows 报「内存不足 / 虚拟内存不足」时，真正耗尽的是 **提
 1. 托盘图标实时显示物理内存使用率，颜色随压力变化（绿 -> 黄 -> 红）
 2. 鼠标悬停显示物理内存 + 提交内存详情
 3. 任一指标超阈值时自动清理并弹气泡提醒：
-     清空进程工作集 -> 刷写修改列表 -> 清理 standby list -> 清空系统文件缓存
+     保守档：清理 standby list -> 刷写修改列表 -> 清空系统文件缓存
+     激进档：在保守档基础上再额外清空各进程工作集
    （原理与 ISLC / Mem Reduct 相同，调用 NtSetSystemInformation）
 4. 可查看内存占用 Top10、开关自动清理、调整阈值
 5. 配置热重载（改 json 无需重启）、内存趋势窗口、一键导出诊断；超阈值自动清理支持防抖
+6. 清理分档：保守（只清缓存，最温和，默认）/ 激进（额外清空进程工作集）
+7. 进程白名单（user_blacklist）：跳过指定进程的工作集清空，避免浏览器/IDE 被清后卡顿
+8. 接近阈值预警：距阈值还差 warn_margin 个百分点时先弹气泡提醒，而不是等超了才清
+9. 配置校验：越界/脏配置会被自动钳制，不会让程序跑飞
 
 清理功能需要 **管理员权限**（要 SeProfileSingleProcessPrivilege 等特权）。
 非管理员运行时程序仍可启动，但清理会失败并给出提示。
@@ -43,7 +48,10 @@ import pystray
 
 # ---------------------------------------------------------------- 路径与配置
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
+
+# GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
+REPO_SLUG = "cpufreestyle/mem-guard"
 
 # 打包成 exe 时（PyInstaller --onefile），__file__ 指向临时解压目录，
 # 日志/配置应落在 exe 真正所在目录，故 frozen 时改用 sys.executable 的目录
@@ -61,7 +69,14 @@ DEFAULT_CONFIG = {
     "cooldown": 300,         # 两次自动清理之间的冷却时间(秒)
     "auto_clean": True,      # 是否开启自动清理
     "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
+    # conservative=仅清 standby list/修改页/文件缓存（温和，对前台几乎无影响，默认）
+    # aggressive  =额外清空各进程工作集（释放更多，但前台程序下次访问需重新读盘，可能卡顿）
+    "clean_level": "conservative",
+    "user_blacklist": [],    # 额外跳过清空工作集的进程名，如 ["chrome", "code.exe"]（不区分大小写）
+    "warn_margin": 15,       # 距阈值还差多少个百分点时先弹预警(0=关闭预警)
 }
+
+CLEAN_LEVELS = ("conservative", "aggressive")
 
 # 不对其做 EmptyWorkingSet 的进程，清空这些进程的工作集会导致系统不稳定或界面闪烁
 CLEAN_BLACKLIST = {
@@ -71,21 +86,72 @@ CLEAN_BLACKLIST = {
 }
 
 
-def load_config() -> dict:
+def _norm_proc_name(name: str) -> str:
+    """进程名归一化：小写并去掉 .exe 后缀，便于黑名单双向匹配。
+
+    注意 psutil 在 Windows 返回的名字带 .exe（如 csrss.exe），
+    而 CLEAN_BLACKLIST 里写的是裸名，必须归一化后才能匹配上。
+    """
+    n = (name or "").strip().lower()
+    return n[:-4] if n.endswith(".exe") else n
+
+
+def _blacklist_stems(items) -> set:
+    """把黑名单（进程名列表，可带可不带 .exe）统一为无后缀小写名集合。"""
+    out = set()
+    for it in items or ():
+        if isinstance(it, str):
+            s = _norm_proc_name(it)
+            if s:
+                out.add(s)
+    return out
+
+
+CLEAN_BLACKLIST_STEMS = _blacklist_stems(CLEAN_BLACKLIST)
+
+
+def _clamp_int(value, low: int, high: int, default: int) -> int:
+    """把配置值钳制到 [low, high]；非法值回落到默认值。"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, n))
+
+
+def normalize_config(raw) -> dict:
+    """校验并钳制配置：越界/脏值不会让程序跑飞，未知键原样保留。"""
     cfg = dict(DEFAULT_CONFIG)
+    if isinstance(raw, dict):
+        cfg.update(raw)
+    cfg["phys_threshold"] = _clamp_int(cfg.get("phys_threshold"), 50, 99, DEFAULT_CONFIG["phys_threshold"])
+    cfg["commit_threshold"] = _clamp_int(cfg.get("commit_threshold"), 50, 99, DEFAULT_CONFIG["commit_threshold"])
+    cfg["interval"] = _clamp_int(cfg.get("interval"), 2, 3600, DEFAULT_CONFIG["interval"])
+    cfg["cooldown"] = _clamp_int(cfg.get("cooldown"), 0, 86400, DEFAULT_CONFIG["cooldown"])
+    cfg["debounce_sec"] = _clamp_int(cfg.get("debounce_sec"), 0, 3600, DEFAULT_CONFIG["debounce_sec"])
+    cfg["warn_margin"] = _clamp_int(cfg.get("warn_margin"), 0, 50, DEFAULT_CONFIG["warn_margin"])
+    cfg["auto_clean"] = bool(cfg.get("auto_clean", True))
+    lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
+    cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
+    cfg["user_blacklist"] = sorted(_blacklist_stems(cfg.get("user_blacklist")))
+    return cfg
+
+
+def load_config() -> dict:
+    raw = {}
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg.update(json.load(f))
-    except Exception:
-        pass
-    return cfg
+                raw = json.load(f)
+    except Exception as e:
+        log(f"配置读取失败，改用默认配置: {e}")
+    return normalize_config(raw)
 
 
 def save_config(cfg: dict) -> None:
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(normalize_config(cfg), f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -344,19 +410,25 @@ def _purge_list(cmd: int) -> int:
     )
 
 
-def empty_process_working_sets() -> int:
-    """逐个进程清空工作集（把不活跃的物理页移到 standby list）。"""
+def empty_process_working_sets(extra_blacklist=()) -> tuple:
+    """逐个进程清空工作集（把不活跃的物理页移到 standby list）。
+
+    extra_blacklist 为用户附加白名单（进程名，可带可不带 .exe），命中者跳过，
+    避免清空浏览器/IDE 等工作集造成前台卡顿。返回 (已清理数, 白名单跳过数)。
+    """
     PROCESS_QUERY_INFORMATION = 0x0400
     PROCESS_SET_QUOTA = 0x0100
     psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
     psapi.EmptyWorkingSet.restype = wintypes.BOOL
     kernel32.OpenProcess.restype = wintypes.HANDLE
 
+    blocked = CLEAN_BLACKLIST_STEMS | _blacklist_stems(extra_blacklist)
     count = 0
+    skipped = 0
     for p in psutil.process_iter(["pid", "name"]):
         try:
-            name = (p.info.get("name") or "").lower()
-            if name in CLEAN_BLACKLIST or p.info["pid"] in (0, 4):
+            if _norm_proc_name(p.info.get("name")) in blocked or p.info["pid"] in (0, 4):
+                skipped += 1
                 continue
             h = kernel32.OpenProcess(
                 PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, p.info["pid"]
@@ -369,7 +441,7 @@ def empty_process_working_sets() -> int:
                     kernel32.CloseHandle(h)
         except Exception:
             continue
-    return count
+    return count, skipped
 
 
 def clear_file_cache() -> bool:
@@ -387,10 +459,21 @@ CLEAN_PRIVILEGES = (
 )
 
 
-def do_clean(reason: str = "手动") -> dict:
-    """执行一次完整清理，返回结果统计。清理后会恢复特权开关（敏感特权用完即关）。"""
+def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None) -> dict:
+    """执行一次清理，返回结果统计。清理后会恢复特权开关（敏感特权用完即关）。
+
+    level: "conservative"（默认，只清 standby/修改页/文件缓存）或
+    "aggressive"（在此基础上额外清空各进程工作集）；None 时读取配置里的 clean_level。
+    """
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
+
+    cfg = load_config()
+    lvl = str(level or cfg.get("clean_level") or "conservative").strip().lower()
+    if lvl not in CLEAN_LEVELS:
+        lvl = "conservative"
+    aggressive = lvl == "aggressive"
+    bl = cfg.get("user_blacklist") if user_blacklist is None else user_blacklist
 
     # 记录特权初始状态；清理结束后把"原本未启用"的特权恢复为禁用
     prior = {p: privilege_state(p) for p in CLEAN_PRIVILEGES}
@@ -399,28 +482,33 @@ def do_clean(reason: str = "手动") -> dict:
 
     try:
         before = get_mem()
-        detail = []
+        detail = [f"档位:{'激进' if aggressive else '保守'}"]
         if failed_privs:
             detail.append("特权启用失败:" + ",".join(failed_privs))
 
-        r_ws = _purge_list(MemoryEmptyWorkingSets)
-        detail.append(f"清空工作集:{'成功' if r_ws == 0 else f'失败(0x{r_ws & 0xffffffff:X})'}")
+        r_ws = 0
+        if aggressive:
+            r_ws = _purge_list(MemoryEmptyWorkingSets)
+            detail.append(f"清空工作集:{'成功' if r_ws == 0 else f'失败(0x{r_ws & 0xffffffff:X})'}")
 
         r_fm = _purge_list(MemoryFlushModifiedList)
         detail.append(f"刷写修改页:{'成功' if r_fm == 0 else f'失败(0x{r_fm & 0xffffffff:X})'}")
 
         r_sb = _purge_list(MemoryPurgeStandbyList)
-        standby_ok = r_sb == 0
-        detail.append(f"清理Standby:{'成功' if standby_ok else f'失败(0x{r_sb & 0xffffffff:X})'}")
+        detail.append(f"清理Standby:{'成功' if r_sb == 0 else f'失败(0x{r_sb & 0xffffffff:X})'}")
 
-        n = empty_process_working_sets()
-        detail.append(f"进程数:{n}")
+        if aggressive:
+            n, skipped = empty_process_working_sets(bl)
+            detail.append(f"进程工作集:{n} 个" + (f"（白名单跳过 {skipped}）" if skipped else ""))
+        else:
+            detail.append("进程工作集:已跳过(保守档)")
 
         fc = clear_file_cache()
         detail.append(f"文件缓存:{'成功' if fc else '失败'}")
 
-        # 三个核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
-        if r_ws != 0 and r_fm != 0 and r_sb != 0:
+        # 核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
+        core = [r_fm, r_sb] + ([r_ws] if aggressive else [])
+        if all(rc != 0 for rc in core):
             why = ("特权启用失败: " + ", ".join(failed_privs)) if failed_privs else "特权未启用或权限不足"
             log(f"{reason}清理失败 | {why} | {', '.join(detail)}")
             return {"ok": False, "msg": f"清理失败（{why}）"}
@@ -434,6 +522,7 @@ def do_clean(reason: str = "手动") -> dict:
             "freed": freed,
             "before": before,
             "after": after,
+            "level": lvl,
             "detail": ", ".join(detail),
         }
         log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "
@@ -729,6 +818,52 @@ def export_diagnostics() -> str:
         return f"ERR:{e}"
 
 
+# ---------------------------------------------------------------- 更新检查
+
+def _parse_version(v: str) -> tuple:
+    """把 'v1.3.0' / '1.3.0' 解析为可比较的整数元组（非数字后缀按 0 处理）。"""
+    nums = []
+    for part in str(v).strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        nums.append(int(digits) if digits else 0)
+    return tuple(nums) if nums else (0,)
+
+
+def fetch_latest_release(timeout: int = 8) -> dict:
+    """查询 GitHub 最新 Release。
+
+    返回 {"ok": True, "tag", "url", "newer"} 或 {"ok": False, "msg"}。
+    仅用标准库 urllib，PyInstaller 打包后无需额外依赖。
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"https://api.github.com/repos/{REPO_SLUG}/releases/latest"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"MemGuard/{__version__}",
+        "Accept": "application/vnd.github+json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"ok": False, "msg": "该仓库暂无 Release（或不可访问）"}
+        return {"ok": False, "msg": f"检查更新失败：HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "msg": f"检查更新失败：{e}"}
+
+    tag = str(data.get("tag_name") or "").strip()
+    if not tag:
+        return {"ok": False, "msg": "最新 Release 缺少版本号"}
+    return {
+        "ok": True,
+        "tag": tag,
+        "url": data.get("html_url") or f"https://github.com/{REPO_SLUG}/releases",
+        "newer": _parse_version(tag) > _parse_version(__version__),
+    }
+
+
 # ---------------------------------------------------------------- 主程序
 
 class Guard:
@@ -739,6 +874,7 @@ class Guard:
         self.over_since = None       # 内存超阈值起始时刻（防抖用）
         self.history = collections.deque(maxlen=120)  # 内存使用率采样历史
         self._cfg_mtime = None       # 配置热重载：记录上次 mtime
+        self._warned = False         # 是否已就本次接近阈值发过预警（避免反复弹）
         self.stop = threading.Event()
         self.icon: pystray.Icon | None = None
 
@@ -792,6 +928,14 @@ class Guard:
             save_config(cfg)
         return setter
 
+    @staticmethod
+    def _set_level(cfg, level):
+        def setter(icon, item):
+            cfg["clean_level"] = level
+            save_config(cfg)
+            log(f"清理档位 -> {'激进' if level == 'aggressive' else '保守'}")
+        return setter
+
     def on_toggle_autostart(self, icon, item) -> None:
         if autostart_enabled():
             ok = remove_autostart()
@@ -812,6 +956,43 @@ class Guard:
             icon.notify("诊断导出失败：" + path, "MemGuard")
         else:
             icon.notify("诊断已导出：\n" + path, "MemGuard 诊断")
+
+    def on_check_update(self, icon=None, item=None) -> None:
+        """后台线程查询 GitHub Release，避免联网阻塞托盘菜单。"""
+        def worker() -> None:
+            r = fetch_latest_release()
+            if not r.get("ok"):
+                log(r.get("msg", "检查更新失败"))
+                if self.icon:
+                    try:
+                        self.icon.notify(r.get("msg", "检查更新失败"), "MemGuard 更新")
+                    except Exception:
+                        pass
+                return
+            if r["newer"]:
+                log(f"发现新版本 {r['tag']}（当前 v{__version__}）")
+                if self.icon:
+                    try:
+                        self.icon.notify(
+                            f"发现新版本 {r['tag']}（当前 v{__version__}）\n正在打开下载页…",
+                            "MemGuard 更新",
+                        )
+                    except Exception:
+                        pass
+                try:
+                    import webbrowser
+                    webbrowser.open(r["url"])
+                except Exception:
+                    pass
+            else:
+                log(f"已是最新版本 v{__version__}")
+                if self.icon:
+                    try:
+                        self.icon.notify(f"已是最新版本（v{__version__}）", "MemGuard 更新")
+                    except Exception:
+                        pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def build_menu(self) -> pystray.Menu:
         cfg = self.cfg
@@ -856,6 +1037,20 @@ class Guard:
                 ) for m, label in choices
             ])
 
+        def level_menu():
+            return pystray.Menu(
+                pystray.MenuItem(
+                    "保守  只清缓存(最温和)",
+                    self._set_level(cfg, "conservative"), radio=True,
+                    checked=lambda i: cfg.get("clean_level") == "conservative",
+                ),
+                pystray.MenuItem(
+                    "激进  额外清空进程工作集",
+                    self._set_level(cfg, "aggressive"), radio=True,
+                    checked=lambda i: cfg.get("clean_level") == "aggressive",
+                ),
+            )
+
         return pystray.Menu(
             pystray.MenuItem(line_phys, None, enabled=False),
             pystray.MenuItem(line_commit, None, enabled=False),
@@ -868,6 +1063,7 @@ class Guard:
             pystray.MenuItem("自动清理", self.on_toggle_auto,
                              checked=lambda i: cfg["auto_clean"]),
             pystray.MenuItem("清理阈值", preset_menu()),
+            pystray.MenuItem("清理力度", level_menu()),
             pystray.MenuItem("清理冷却", cooldown_menu()),
             pystray.MenuItem("开机自启", self.on_toggle_autostart,
                              checked=lambda i: autostart_enabled()),
@@ -878,6 +1074,7 @@ class Guard:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("打开日志", self.on_open_log),
             pystray.MenuItem("导出诊断", self.on_export),
+            pystray.MenuItem(f"检查更新（v{__version__}）", self.on_check_update),
             pystray.MenuItem("退出", self.on_quit),
         )
 
@@ -907,14 +1104,35 @@ class Guard:
                 s = self.state
                 self.history.append((time.time(), s["phys_pct"], s["commit_pct"]))
                 if self.icon:
-                    self.icon.icon = make_icon(s["phys_pct"], self.cfg["phys_threshold"])
-                    self.icon.title = (
-                        f"MemGuard  物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
-                        f"可用物理 {gb(s['avail_phys'])}    可用提交 {gb(s['avail_commit'])}"
-                    )
+                    # 托盘重建/退出瞬间 icon 可能短暂失效，单独容错避免整轮监控被中断
+                    try:
+                        self.icon.icon = make_icon(s["phys_pct"], self.cfg["phys_threshold"])
+                        self.icon.title = (
+                            f"MemGuard  物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
+                            f"可用物理 {gb(s['avail_phys'])}    可用提交 {gb(s['avail_commit'])}"
+                        )
+                    except Exception:
+                        pass
                 now = time.time()
                 over = (s["phys_pct"] >= self.cfg["phys_threshold"]
                         or s["commit_pct"] >= self.cfg["commit_threshold"])
+                # -- 接近阈值预警：只提醒不清理，让人有提前手动干预的机会 --
+                margin = self.cfg.get("warn_margin", 0)
+                if margin and not over and s["phys_pct"] >= self.cfg["phys_threshold"] - margin:
+                    if not self._warned:
+                        self._warned = True
+                        log(f"预警 | 物理 {s['phys_pct']:.0f}% 接近阈值 {self.cfg['phys_threshold']}%")
+                        if self.icon:
+                            try:
+                                self.icon.notify(
+                                    f"物理内存 {s['phys_pct']:.0f}%，接近阈值 {self.cfg['phys_threshold']}%\n"
+                                    f"可右键托盘手动清理",
+                                    "MemGuard 内存预警",
+                                )
+                            except Exception:
+                                pass
+                else:
+                    self._warned = False
                 if over:
                     if self.over_since is None:
                         self.over_since = now
@@ -928,11 +1146,16 @@ class Guard:
                         if r["ok"] and self.icon:
                             top3 = top_processes_list(3)
                             top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
-                            self.icon.notify(
-                                f"物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}% 超阈值\n"
-                                f"已释放 {gb(max(r['freed'], 0))}\n当前占用 Top3:\n{top_txt}",
-                                "MemGuard 自动清理",
-                            )
+                            lvl_txt = "激进" if r.get("level") == "aggressive" else "保守"
+                            try:
+                                self.icon.notify(
+                                    f"物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}% 超阈值\n"
+                                    f"已释放 {gb(max(r['freed'], 0))}（{lvl_txt}档）\n"
+                                    f"当前占用 Top3:\n{top_txt}",
+                                    "MemGuard 自动清理",
+                                )
+                            except Exception:
+                                pass
                 else:
                     self.over_since = None
             except Exception as e:
@@ -941,15 +1164,29 @@ class Guard:
 
     def run(self) -> None:
         s = get_mem()
-        self.icon = pystray.Icon(
-            "MemGuard", make_icon(s["phys_pct"], self.cfg["phys_threshold"]),
-            "MemGuard 启动中...", self.build_menu(),
-        )
-        log(f"MemGuard 启动 | 管理员={is_admin()} | 物理 {s['phys_pct']:.0f}% | 提交 {s['commit_pct']:.0f}%")
+        log(f"MemGuard v{__version__} 启动 | 管理员={is_admin()} | 物理 {s['phys_pct']:.0f}% | "
+            f"提交 {s['commit_pct']:.0f}% | 档位={self.cfg.get('clean_level')}")
         if not is_admin():
             log("提示：非管理员运行，自动清理不会生效，请右键以管理员身份运行")
+        # 监控线程只启动一次；托盘图标在循环内可被重建，实现"托盘自愈"
         threading.Thread(target=self.monitor, daemon=True).start()
-        self.icon.run()
+
+        while not self.stop.is_set():
+            try:
+                self.icon = pystray.Icon(
+                    "MemGuard", make_icon(self.state["phys_pct"], self.cfg["phys_threshold"]),
+                    "MemGuard 运行中", self.build_menu(),
+                )
+                self.icon.run()
+            except Exception as e:
+                log(f"托盘异常退出: {e!r}")
+            if self.stop.is_set():
+                break
+            # 非用户退出而 icon.run() 意外返回/抛错（Explorer 重启、后端异常）时重建图标，
+            # 避免出现"程序还在跑、托盘图标却不见了"的假死状态
+            log("托盘未正常退出，1 秒后重建图标（自愈）")
+            time.sleep(1.0)
+        log("MemGuard 已退出")
 
 
 # ---------------------------------------------------------------- 入口
@@ -980,6 +1217,7 @@ def once() -> None:
     if not r["ok"]:
         print(r["msg"])
         return
+    print(f"清理档位: {'激进' if r.get('level') == 'aggressive' else '保守'}")
     print(f"清理前可用物理 {gb(r['before']['avail_phys'])}  提交 {r['before']['commit_pct']:.1f}%")
     print(f"清理后可用物理 {gb(r['after']['avail_phys'])}  提交 {r['after']['commit_pct']:.1f}%")
     print(f"释放 {gb(max(r['freed'], 0))}")
@@ -1003,6 +1241,16 @@ def selftest() -> int:
     check("privilege_state", lambda: privilege_state("SeDebugPrivilege"))
     check("autostart_enabled", autostart_enabled)
     check("top_processes", lambda: f"{len(top_processes(5).splitlines())} 行")
+    check("normalize_config", lambda: (
+        f"非法档位->{normalize_config({'clean_level': 'xx'})['clean_level']}, "
+        f"越界阈值->{normalize_config({'phys_threshold': 999})['phys_threshold']}, "
+        f"白名单->{normalize_config({'user_blacklist': ['Chrome.EXE', 'chrome']})['user_blacklist']}"
+    ))
+    check("blacklist匹配", lambda: f"csrss.exe->{_norm_proc_name('csrss.exe') in CLEAN_BLACKLIST_STEMS}")
+    check("_parse_version", lambda: (
+        f"v1.10.2 > 1.9.9 -> {_parse_version('v1.10.2') > _parse_version('1.9.9')}, "
+        f"同版本 -> {_parse_version('1.3.0') == _parse_version('v1.3.0')}"
+    ))
 
     ok_all = all(ok for _, ok, _ in results)
     for name, ok, val in results:
