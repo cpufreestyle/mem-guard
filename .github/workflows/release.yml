@@ -12,6 +12,10 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Windows runner 默认不是 UTF-8，脚本打印中文会 UnicodeEncodeError 并让自检退出码为 1
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - name: 检出代码
         uses: actions/checkout@v4

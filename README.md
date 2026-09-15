@@ -135,4 +135,4 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 
 ## 版本
 
-当前版本 `1.3.0`。
+当前版本 `1.3.1`。

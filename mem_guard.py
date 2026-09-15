@@ -48,7 +48,7 @@ import pystray
 
 # ---------------------------------------------------------------- 路径与配置
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -1262,6 +1262,14 @@ def selftest() -> int:
 
 
 if __name__ == "__main__":
+    # 控制台 / CI 的默认编码可能无法表示中文（如英文 Windows 的 cp1252），
+    # 统一把标准流切到 UTF-8 并容忍不可编码字符，避免打印时抛 UnicodeEncodeError。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is not None:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if "--once" in sys.argv:
         once()
     elif "--selftest" in sys.argv:
