@@ -1,176 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-托盘编排：右键菜单、开机自启（计划任务）、诊断导出、更新检查，以及主循环 Guard。
+托盘编排：右键菜单与主循环 Guard。
 
-界面细节（图标绘制、Top10 / 趋势 / 优化建议窗口）见 ui.py；
-自身不实现清理，只编排调用。依赖 config / winapi / clean / advisor / ui。
+界面细节见 ui.py；开机自启见 autostart.py；诊断导出见 diag.py；更新检查见 update.py。
+自身不实现清理，只编排调用。
 """
 from __future__ import annotations
 
 import collections
-import json
 import os
-import subprocess
-import sys
 import threading
 import time
-import zipfile
-from datetime import datetime
 
 import pystray
 
+from .advisor import analyze
+from .autostart import autostart_enabled, install_autostart, remove_autostart
+from .clean import do_clean, top_processes_list
 from .config import (
-    BASE_DIR,
     CONFIG_PATH,
     LOG_PATH,
-    REPO_SLUG,
     __version__,
     gb,
     load_config,
     log,
     save_config,
 )
-from .advisor import analyze
-from .clean import CLEAN_PRIVILEGES, do_clean, top_processes_list
-from .ui import (
-    make_icon,
-    message_box,
-    show_advice_window,
-    show_top_window,
-    show_trend_window,
-)
-from .winapi import get_mem, is_admin, privilege_state
-
-# ---------------------------------------------------------------- 开机自启（计划任务）
-
-AUTOSTART_TASK = "MemGuard"
-_CREATE_NO_WINDOW = 0x08000000
-
-def _run_silent(cmd: list) -> bool:
-    """静默运行外部命令（不弹控制台窗口），返回是否成功。"""
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           creationflags=_CREATE_NO_WINDOW)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-def _pythonw_path():
-    import shutil
-    for cand in ("pythonw.exe", "python.exe"):
-        p = shutil.which(cand)
-        if p:
-            return p
-    return None
-
-def autostart_enabled() -> bool:
-    """查询计划任务 MemGuard 是否已注册。"""
-    return _run_silent(["schtasks", "/Query", "/TN", AUTOSTART_TASK])
-
-def install_autostart() -> bool:
-    """注册登录自启计划任务（最高权限，无 UAC 弹窗）。
-
-    打包成 exe 后直接把 exe 自身注册进去，不依赖 Python 与外部脚本；
-    源码运行时优先复用 install_autostart.ps1，否则退回 schtasks + pythonw。
-    """
-    if getattr(sys, "frozen", False):
-        # frozen 下 BASE_DIR 取自 exe 所在目录，无需设置任务的工作目录
-        exe = os.path.abspath(sys.executable)
-        return _run_silent(["schtasks", "/Create", "/TN", AUTOSTART_TASK,
-                            "/TR", f'"{exe}"', "/SC", "ONLOGON",
-                            "/RL", "HIGHEST", "/F"])
-    ps1 = os.path.join(BASE_DIR, "install_autostart.ps1")
-    if os.path.exists(ps1):
-        return _run_silent(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                            "-File", ps1, "-Mode", "install"])
-    pyw = _pythonw_path()
-    if not pyw:
-        return False
-    tr = f'"{pyw}" "{os.path.join(BASE_DIR, "mem_guard.py")}"'
-    return _run_silent(["schtasks", "/Create", "/TN", AUTOSTART_TASK, "/TR", tr,
-                        "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"])
-
-def remove_autostart() -> bool:
-    """删除开机自启计划任务。"""
-    ps1 = os.path.join(BASE_DIR, "install_autostart.ps1")
-    if os.path.exists(ps1):
-        return _run_silent(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                            "-File", ps1, "-Mode", "uninstall"])
-    return _run_silent(["schtasks", "/Delete", "/TN", AUTOSTART_TASK, "/F"])
-
-# ---------------------------------------------------------------- 诊断导出
-
-def export_diagnostics() -> str:
-    """打包内存状态/进程/日志/配置为 zip，返回路径；失败返回 'ERR:...'。"""
-    try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_path = os.path.join(BASE_DIR, f"diagnostics_{ts}.zip")
-        s = get_mem()
-        info = [
-            f"version={__version__}",
-            f"admin={is_admin()}",
-            f"物理 {s['phys_pct']:.1f}%  ({gb(s['used_phys'])} / {gb(s['total_phys'])})",
-            f"提交 {s['commit_pct']:.1f}%  (可用 {gb(s['avail_commit'])} / {gb(s['total_commit'])})",
-            f"autostart={autostart_enabled()}",
-        ]
-        for p in CLEAN_PRIVILEGES:
-            info.append(f"priv {p}={privilege_state(p)}")
-        info.append("--- 物理占用 Top20 ---")
-        for name, rss, pid in top_processes_list(20):
-            info.append(f"{name}  {rss / 1024 ** 3:.2f} GB  PID {pid}")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("diagnostics.txt", "\n".join(info))
-            if os.path.exists(CONFIG_PATH):
-                z.write(CONFIG_PATH, "mem_guard.json")
-            if os.path.exists(LOG_PATH):
-                z.write(LOG_PATH, "mem_guard.log")
-        return zip_path
-    except Exception as e:
-        return f"ERR:{e}"
-
-# ---------------------------------------------------------------- 更新检查
-
-def _parse_version(v: str) -> tuple:
-    """把 'v1.3.0' / '1.3.0' 解析为可比较的整数元组（非数字后缀按 0 处理）。"""
-    nums = []
-    for part in str(v).strip().lstrip("vV").split("."):
-        digits = "".join(ch for ch in part if ch.isdigit())
-        nums.append(int(digits) if digits else 0)
-    return tuple(nums) if nums else (0,)
-
-def fetch_latest_release(timeout: int = 8) -> dict:
-    """查询 GitHub 最新 Release。
-
-    返回 {"ok": True, "tag", "url", "newer"} 或 {"ok": False, "msg"}。
-    仅用标准库 urllib，PyInstaller 打包后无需额外依赖。
-    """
-    import urllib.error
-    import urllib.request
-
-    url = f"https://api.github.com/repos/{REPO_SLUG}/releases/latest"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": f"MemGuard/{__version__}",
-        "Accept": "application/vnd.github+json",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return {"ok": False, "msg": "该仓库暂无 Release（或不可访问）"}
-        return {"ok": False, "msg": f"检查更新失败：HTTP {e.code}"}
-    except Exception as e:
-        return {"ok": False, "msg": f"检查更新失败：{e}"}
-
-    tag = str(data.get("tag_name") or "").strip()
-    if not tag:
-        return {"ok": False, "msg": "最新 Release 缺少版本号"}
-    return {
-        "ok": True,
-        "tag": tag,
-        "url": data.get("html_url") or f"https://github.com/{REPO_SLUG}/releases",
-        "newer": _parse_version(tag) > _parse_version(__version__),
-    }
+from .diag import export_diagnostics
+from .ui import make_icon, show_advice_window, show_top_window, show_trend_window
+from .update import fetch_latest_release
+from .winapi import get_mem, is_admin
 
 # ---------------------------------------------------------------- 主程序
 

@@ -166,7 +166,7 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 
 ## 版本
 
-当前版本 `1.3.6`。
+当前版本 `1.3.7`。
 
 ## 源码结构
 
@@ -178,9 +178,12 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 | `memguard/winapi.py` | ctypes 绑定：内存读取（`get_mem`）、特权（启用/禁用/查询）、单实例互斥体、底层清理调用（`_purge_list` / `clear_file_cache`） |
 | `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets`）、Top 进程统计、清理所需特权集合 |
 | `memguard/ui.py` | 界面层：托盘图标绘制（`make_icon`）、气泡提示（`message_box`）、Top10 / 趋势 / 优化建议窗口 |
-| `memguard/tray.py` | 右键菜单编排、开机自启计划任务、诊断导出、更新检查、主循环 `Guard` |
+| `memguard/autostart.py` | 开机自启：计划任务注册 / 查询 / 卸载（`autostart_enabled` / `install_autostart` / `remove_autostart`） |
+| `memguard/diag.py` | 诊断导出：内存状态 / 进程 / 日志 / 配置打包为 zip（`export_diagnostics`） |
+| `memguard/update.py` | 更新检查：查询 GitHub 最新 Release 并比较版本（`fetch_latest_release` / `_parse_version`） |
+| `memguard/tray.py` | 右键菜单编排与主循环 `Guard` |
 | `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、控制台隐藏等启动流处理 |
 | `memguard/advisor.py` | 优化建议引擎：基于内存状态与配置生成分级建议（`analyze` / `format_advice`） |
 | `mem_guard.py` | 薄启动器，仅 `from memguard.cli import main`，保持 `python mem_guard.py` 入口不变 |
 
-模块依赖为单向无环：`config` ← `winapi` ← `clean` ← `advisor` ← `ui` ← `tray` ← `cli`。
+模块依赖为单向无环：`config` ← `winapi` ← `clean` ← `advisor` ← `ui` ← `autostart` ← `diag` ← `tray` ← `cli`（`update` 仅依赖 `config`）。
