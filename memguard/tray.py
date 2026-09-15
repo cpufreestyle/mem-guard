@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-托盘编排：右键菜单与主循环 Guard。
+托盘主循环 Guard：运行状态、配置热重载、监控循环与图标自愈。
 
-界面细节见 ui.py；开机自启见 autostart.py；诊断导出见 diag.py；更新检查见 update.py。
+菜单树与菜单回调见 menu.py；界面见 ui.py；
+自启 / 诊断 / 更新检查分别见 autostart.py / diag.py / update.py。
 自身不实现清理，只编排调用。
 """
 from __future__ import annotations
@@ -14,24 +15,14 @@ import time
 
 import pystray
 
-from .advisor import analyze
-from .autostart import autostart_enabled, install_autostart, remove_autostart
 from .clean import do_clean, top_processes_list
-from .config import (
-    CONFIG_PATH,
-    LOG_PATH,
-    __version__,
-    gb,
-    load_config,
-    log,
-    save_config,
-)
-from .diag import export_diagnostics
-from .ui import make_icon, show_advice_window, show_top_window, show_trend_window
-from .update import fetch_latest_release
+from .config import CONFIG_PATH, __version__, gb, load_config, log
+from .menu import build_menu
+from .ui import make_icon
 from .winapi import get_mem, is_admin
 
 # ---------------------------------------------------------------- 主程序
+
 
 class Guard:
     def __init__(self) -> None:
@@ -44,211 +35,6 @@ class Guard:
         self._warned = False         # 是否已就本次接近阈值发过预警（避免反复弹）
         self.stop = threading.Event()
         self.icon: pystray.Icon | None = None
-
-    # -- 菜单回调 ------------------------------------------------
-
-    def on_clean_now(self, icon=None, item=None) -> None:
-        r = do_clean("手动")
-        if not r["ok"]:
-            icon.notify(r["msg"], "MemGuard")
-            return
-        freed = max(r["freed"], 0)
-        top3 = top_processes_list(3)
-        top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
-        icon.notify(
-            f"释放 {gb(freed)}  可用物理 {gb(r['after']['avail_phys'])}\n"
-            f"当前占用 Top3:\n{top_txt}",
-            "MemGuard 清理完成",
-        )
-        self.refresh()
-
-    def on_top(self, icon=None, item=None) -> None:
-        show_top_window()
-
-    def on_toggle_auto(self, icon, item) -> None:
-        self.cfg["auto_clean"] = not self.cfg["auto_clean"]
-        save_config(self.cfg)
-        log(f"自动清理 -> {'开启' if self.cfg['auto_clean'] else '关闭'}")
-
-    def on_open_log(self, icon=None, item=None) -> None:
-        try:
-            os.startfile(LOG_PATH)
-        except Exception:
-            pass
-
-    def on_quit(self, icon, item) -> None:
-        self.stop.set()
-        icon.stop()
-
-    @staticmethod
-    def _preset(cfg, phys, commit):
-        def setter(icon, item):
-            cfg["phys_threshold"] = phys
-            cfg["commit_threshold"] = commit
-            save_config(cfg)
-        return setter
-
-    @staticmethod
-    def _set_cooldown(cfg, minutes):
-        def setter(icon, item):
-            cfg["cooldown"] = minutes * 60
-            save_config(cfg)
-        return setter
-
-    @staticmethod
-    def _set_level(cfg, level):
-        def setter(icon, item):
-            cfg["clean_level"] = level
-            save_config(cfg)
-            log(f"清理档位 -> {'激进' if level == 'aggressive' else '保守'}")
-        return setter
-
-    def on_toggle_autostart(self, icon, item) -> None:
-        if autostart_enabled():
-            ok = remove_autostart()
-            log(f"取消开机自启 -> {'成功' if ok else '失败'}")
-            icon.notify("已取消开机自启" if ok else "取消失败", "MemGuard")
-        else:
-            ok = install_autostart()
-            log(f"设置开机自启 -> {'成功' if ok else '失败'}")
-            icon.notify("已设置开机自启（登录时自动启动）" if ok
-                        else "设置失败（需管理员权限）", "MemGuard")
-
-    def on_trend(self, icon=None, item=None) -> None:
-        show_trend_window(lambda: list(self.history))
-
-    def on_advice(self, icon=None, item=None) -> None:
-        show_advice_window(self.cfg)
-
-    def on_export(self, icon=None, item=None) -> None:
-        path = export_diagnostics()
-        if path.startswith("ERR:"):
-            icon.notify("诊断导出失败：" + path, "MemGuard")
-        else:
-            icon.notify("诊断已导出：\n" + path, "MemGuard 诊断")
-
-    def on_check_update(self, icon=None, item=None) -> None:
-        """后台线程查询 GitHub Release，避免联网阻塞托盘菜单。"""
-        def worker() -> None:
-            r = fetch_latest_release()
-            if not r.get("ok"):
-                log(r.get("msg", "检查更新失败"))
-                if self.icon:
-                    try:
-                        self.icon.notify(r.get("msg", "检查更新失败"), "MemGuard 更新")
-                    except Exception:
-                        pass
-                return
-            if r["newer"]:
-                log(f"发现新版本 {r['tag']}（当前 v{__version__}）")
-                if self.icon:
-                    try:
-                        self.icon.notify(
-                            f"发现新版本 {r['tag']}（当前 v{__version__}）\n正在打开下载页…",
-                            "MemGuard 更新",
-                        )
-                    except Exception:
-                        pass
-                try:
-                    import webbrowser
-                    webbrowser.open(r["url"])
-                except Exception:
-                    pass
-            else:
-                log(f"已是最新版本 v{__version__}")
-                if self.icon:
-                    try:
-                        self.icon.notify(f"已是最新版本（v{__version__}）", "MemGuard 更新")
-                    except Exception:
-                        pass
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def build_menu(self) -> pystray.Menu:
-        cfg = self.cfg
-
-        def line_phys(_):
-            s = self.state
-            return f"物理内存  {s['phys_pct']:.0f}%   ({gb(s['used_phys'])} / {gb(s['total_phys'])})"
-
-        def line_commit(_):
-            s = self.state
-            return f"提交内存  {s['commit_pct']:.0f}%   (可用 {gb(s['avail_commit'])})"
-
-        def line_tip(_):
-            return "↑ 内存不足报错看这一行"
-
-        def preset_menu():
-            return pystray.Menu(
-                pystray.MenuItem(
-                    "激进  物理75% / 提交85%",
-                    self._preset(cfg, 75, 85), radio=True,
-                    checked=lambda i: cfg["phys_threshold"] == 75,
-                ),
-                pystray.MenuItem(
-                    "标准  物理85% / 提交90%",
-                    self._preset(cfg, 85, 90), radio=True,
-                    checked=lambda i: cfg["phys_threshold"] == 85,
-                ),
-                pystray.MenuItem(
-                    "宽松  物理92% / 提交95%",
-                    self._preset(cfg, 92, 95), radio=True,
-                    checked=lambda i: cfg["phys_threshold"] == 92,
-                ),
-            )
-
-        def cooldown_menu():
-            choices = [(1, "1 分钟"), (5, "5 分钟"), (10, "10 分钟"), (30, "30 分钟")]
-            return pystray.Menu(*[
-                pystray.MenuItem(
-                    label,
-                    self._set_cooldown(cfg, m), radio=True,
-                    checked=(lambda i, mm=m: cfg["cooldown"] == mm * 60),
-                ) for m, label in choices
-            ])
-
-        def level_menu():
-            return pystray.Menu(
-                pystray.MenuItem(
-                    "保守  只清缓存(最温和)",
-                    self._set_level(cfg, "conservative"), radio=True,
-                    checked=lambda i: cfg.get("clean_level") == "conservative",
-                ),
-                pystray.MenuItem(
-                    "激进  额外清空进程工作集",
-                    self._set_level(cfg, "aggressive"), radio=True,
-                    checked=lambda i: cfg.get("clean_level") == "aggressive",
-                ),
-            )
-
-        return pystray.Menu(
-            pystray.MenuItem(line_phys, None, enabled=False),
-            pystray.MenuItem(line_commit, None, enabled=False),
-            pystray.MenuItem(line_tip, None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("立即清理", self.on_clean_now),
-            pystray.MenuItem("内存占用 Top10", self.on_top),
-            pystray.MenuItem("内存趋势", self.on_trend),
-            pystray.MenuItem(lambda i: f"优化建议（{len(analyze(self.cfg))} 条）",
-                             self.on_advice),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("自动清理", self.on_toggle_auto,
-                             checked=lambda i: cfg["auto_clean"]),
-            pystray.MenuItem("清理阈值", preset_menu()),
-            pystray.MenuItem("清理力度", level_menu()),
-            pystray.MenuItem("清理冷却", cooldown_menu()),
-            pystray.MenuItem("开机自启", self.on_toggle_autostart,
-                             checked=lambda i: autostart_enabled()),
-            pystray.MenuItem(
-                lambda i: "权限：管理员（可清理）" if is_admin() else "⚠ 非管理员，无法清理",
-                None, enabled=False,
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("打开日志", self.on_open_log),
-            pystray.MenuItem("导出诊断", self.on_export),
-            pystray.MenuItem(f"检查更新（v{__version__}）", self.on_check_update),
-            pystray.MenuItem("退出", self.on_quit),
-        )
 
     # -- 循环 ----------------------------------------------------
 
@@ -347,7 +133,7 @@ class Guard:
             try:
                 self.icon = pystray.Icon(
                     "MemGuard", make_icon(self.state["phys_pct"], self.cfg["phys_threshold"]),
-                    "MemGuard 运行中", self.build_menu(),
+                    "MemGuard 运行中", build_menu(self),
                 )
                 self.icon.run()
             except Exception as e:

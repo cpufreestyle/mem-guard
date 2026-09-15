@@ -166,7 +166,7 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 
 ## 版本
 
-当前版本 `1.3.7`。
+当前版本 `1.3.8`。
 
 ## 源码结构
 
@@ -181,9 +181,10 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 | `memguard/autostart.py` | 开机自启：计划任务注册 / 查询 / 卸载（`autostart_enabled` / `install_autostart` / `remove_autostart`） |
 | `memguard/diag.py` | 诊断导出：内存状态 / 进程 / 日志 / 配置打包为 zip（`export_diagnostics`） |
 | `memguard/update.py` | 更新检查：查询 GitHub 最新 Release 并比较版本（`fetch_latest_release` / `_parse_version`） |
-| `memguard/tray.py` | 右键菜单编排与主循环 `Guard` |
+| `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（`build_menu(guard)`） |
+| `memguard/tray.py` | 主循环 `Guard`：运行状态、配置热重载、监控循环与托盘图标自愈 |
 | `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、控制台隐藏等启动流处理 |
 | `memguard/advisor.py` | 优化建议引擎：基于内存状态与配置生成分级建议（`analyze` / `format_advice`） |
 | `mem_guard.py` | 薄启动器，仅 `from memguard.cli import main`，保持 `python mem_guard.py` 入口不变 |
 
-模块依赖为单向无环：`config` ← `winapi` ← `clean` ← `advisor` ← `ui` ← `autostart` ← `diag` ← `tray` ← `cli`（`update` 仅依赖 `config`）。
+模块依赖为单向无环：`config` ← `winapi` ← `clean` ← `advisor` ← `ui` ← `autostart` ← `diag` ← `menu` ← `tray` ← `cli`（`update` 仅依赖 `config`）。

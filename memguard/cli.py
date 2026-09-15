@@ -20,6 +20,7 @@ from .config import (
 from .clean import do_clean, top_processes
 from .advisor import analyze, format_advice
 from .autostart import autostart_enabled
+from .menu import build_menu
 from .tray import Guard
 from .ui import make_icon, message_box
 from .update import _parse_version
@@ -97,6 +98,7 @@ def selftest() -> int:
         f"{len(analyze(normalize_config({})))} 条 / "
         f"{len(format_advice(analyze(normalize_config({}))))} 字符"
     ))
+    check("build_menu", lambda: f"菜单构建成功（{type(build_menu(Guard())).__name__}）")
 
     ok_all = all(ok for _, ok, _ in results)
     for name, ok, val in results:
