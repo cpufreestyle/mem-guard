@@ -19,13 +19,8 @@ from .config import (
 )
 from .clean import do_clean, top_processes
 from .advisor import analyze, format_advice
-from .tray import (
-    Guard,
-    _parse_version,
-    autostart_enabled,
-    make_icon,
-    message_box,
-)
+from .tray import Guard, _parse_version, autostart_enabled
+from .ui import make_icon, message_box
 from .winapi import (
     acquire_single_instance,
     get_mem,
