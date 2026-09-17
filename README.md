@@ -176,7 +176,9 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 |---|---|
 | `memguard/config.py` | 版本/路径、默认配置、配置校验与钳制、落盘日志（`log`） |
 | `memguard/winapi.py` | ctypes 绑定：内存读取（`get_mem`）、特权（启用/禁用/查询）、单实例互斥体、底层清理调用（`_purge_list` / `clear_file_cache`） |
-| `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets`）、Top 进程统计、清理所需特权集合 |
+| `memguard/privileges.py` | 清理所需高危特权的启用与「用完即恢复」（`clean_privileges` 上下文管理器） |
+| `memguard/actions.py` | 单步清理动作封装：工作集 / 修改页 / standby / 文件缓存，返回原始 NTSTATUS（`purge_working_sets` 等） |
+| `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets`）、Top 进程统计 |
 | `memguard/ui.py` | 界面层：托盘图标绘制（`make_icon`）、气泡提示（`message_box`）、Top10 / 趋势 / 优化建议窗口 |
 | `memguard/autostart.py` | 开机自启：计划任务注册 / 查询 / 卸载（`autostart_enabled` / `install_autostart` / `remove_autostart`） |
 | `memguard/diag.py` | 诊断导出：内存状态 / 进程 / 日志 / 配置打包为 zip（`export_diagnostics`） |
@@ -187,4 +189,4 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 | `memguard/advisor.py` | 优化建议引擎：基于内存状态与配置生成分级建议（`analyze` / `format_advice`） |
 | `mem_guard.py` | 薄启动器，仅 `from memguard.cli import main`，保持 `python mem_guard.py` 入口不变 |
 
-模块依赖为单向无环：`config` ← `winapi` ← `clean` ← `advisor` ← `ui` ← `autostart` ← `diag` ← `menu` ← `tray` ← `cli`（`update` 仅依赖 `config`）。
+模块依赖为单向无环：`config` ← `winapi` ← `privileges` / `actions` ← `clean` ← `advisor` ← `ui` ← `autostart` ← `diag` ← `menu` ← `tray` ← `cli`（`update` 仅依赖 `config`）。

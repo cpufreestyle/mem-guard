@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 
-__version__ = "1.3.8"
+__version__ = "1.3.9"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"

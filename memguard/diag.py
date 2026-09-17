@@ -11,8 +11,9 @@ import zipfile
 from datetime import datetime
 
 from .autostart import autostart_enabled
-from .clean import CLEAN_PRIVILEGES, top_processes_list
+from .clean import top_processes_list
 from .config import BASE_DIR, CONFIG_PATH, LOG_PATH, __version__, gb
+from .privileges import CLEAN_PRIVILEGES
 from .winapi import get_mem, is_admin, privilege_state
 
 

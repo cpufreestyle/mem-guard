@@ -19,7 +19,11 @@ _CREATE_NO_WINDOW = 0x08000000
 def _run_silent(cmd: list) -> bool:
     """静默运行外部命令（不弹控制台窗口），返回是否成功。"""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        # errors="replace"：中文系统下 schtasks 输出为 GBK，若按 Unicode 严格解码会在
+        # subprocess 的 reader 线程里抛 UnicodeDecodeError——该异常不经过主线程的
+        # except（线程内异常无法被外层捕获），只会在日志留下 traceback。此处只用
+        # returncode，输出内容无需精确解析，故坏字节直接替换即可。
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                            creationflags=_CREATE_NO_WINDOW)
         return r.returncode == 0
     except Exception:
