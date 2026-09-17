@@ -103,11 +103,12 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 
 - **杀软误报（未根治）**：因调用 `NtSetSystemInformation`，行为类似 ISLC/Mem Reduct，易被启发式误报 / SmartScreen 拦截。**代码签名用户已明确搁置**（2026-09-16），目前只能加白名单缓解。若日后要做，需提供证书或接入付费签名服务。
 - **非管理员清理无效**：自动清理在非管理员下只记录不执行（这是设计，不是 bug）。
-- **历史 bug 已修**：`clean.py` 曾漏导入 `MemoryEmptyWorkingSets/FlushModifiedList/PurgeStandbyList` 三个常量，非管理员路径永不触发所以 `--selftest` 发现不了，**管理员下清理会 `NameError` 失效**。此问题在 v1.3.9 候选改动（`actions.py` 显式导入）中修复，发布 v1.3.9 后即为正式修复。
+- **历史 bug 已修（v1.3.9 正式修复）**：`clean.py` 曾漏导入 `MemoryEmptyWorkingSets/FlushModifiedList/PurgeStandbyList` 三个常量，非管理员路径永不触发所以 `--selftest` 发现不了，**管理员下清理会 `NameError` 失效**。v1.3.9 由 `actions.py` 显式导入修复，已发布。
+- **自启查询解码异常（v1.3.9 修复）**：`autostart._run_silent` 用 `subprocess.run(text=True)` 且未给 `errors`，中文系统下 `schtasks` 输出 GBK 会在 subprocess reader **线程**内抛 `UnicodeDecodeError`（主线程的 `except` 抓不到，只在日志留 traceback）。已加 `errors="replace"`；该函数只用 `returncode`，不解析输出。
 
 ## 8. 待办 / 接手清单
 
-1. **收尾 v1.3.9（当前工作区未提交改动）**：已新增 `privileges.py`/`actions.py`、`clean.py` 重写、修复上述 `NameError`、自检新增 `build_menu` 用例。接手者需：本地 `--selftest` 全 PASS → 升版本号 → commit → tag `v1.3.9` → push（触发 CI 发布）→ 同步 README 模块表与依赖链。
+1. **~~收尾 v1.3.9~~（已完成 2026-09-18）**：已新增 `privileges.py`/`actions.py`、`clean.py` 重写、`NameError` 修复、自检新增 `build_menu` 用例，README 模块表与依赖链已同步；本地 `--selftest` 全 PASS，已 commit `50b8fd1` 并 tag `v1.3.9` 推送（CI 自动发布 Release）。
 2. **补 pytest 单元测试（tests/）**：覆盖 `config`/`advisor`/`update`/`ui`/`menu`/`clean`（确定性断言，如注入 `mem` 测 advisor、测 `purge_*` 返回 int 以挡 NameError 类回归）；加 `requirements-dev.txt`，CI 在打包前跑 `pytest`。
 3. **安装器（NSIS/Inno Setup）**：生成 `setup.exe` 改善分发；CI 加编译步骤并随 Release 发布（版本号建议从 `config.py` 动态注入 `.iss`/`.nsi`，避免发版时忘改）。
 4. **`clean.py` 的 `do_clean` 若进一步拆**：可考虑把结果统计与进程统计再独立，但收益已很低。
