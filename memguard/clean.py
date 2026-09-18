@@ -75,8 +75,13 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             log(f"{reason}清理失败 | {why} | {', '.join(detail)}")
             return {"ok": False, "msg": f"清理失败（{why}）"}
 
-        time.sleep(1.5)  # 等系统把页回收计入可用内存
+        # 等系统把回收的页计入可用内存：轮询最多 1.5s，一旦可用物理回升立即返回，
+        # 比原来固定 sleep(1.5) 更快给出反馈（手动清理时尤其明显）。
+        deadline = time.time() + 1.5
         after = get_mem()
+        while time.time() < deadline and after["avail_phys"] <= before["avail_phys"]:
+            time.sleep(0.15)
+            after = get_mem()
 
         freed = after["avail_phys"] - before["avail_phys"]
         result = {

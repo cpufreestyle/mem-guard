@@ -69,7 +69,7 @@ class MEMORYSTATUSEX(ctypes.Structure):
     ]
 
 
-# GlobalMemoryStatusEx 的精确参数类型（上面的 if False 占位仅用于兼容；此处真正声明）
+# GlobalMemoryStatusEx 需按引用传入 MEMORYSTATUSEX，故在此声明精确参数类型
 kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
 
 
@@ -98,11 +98,18 @@ def get_mem() -> dict:
 
 # ---------------------------------------------------------------- 权限 / 单实例
 
+# 管理员身份在进程生命周期内不变，缓存一次即可（菜单/建议/清理/自检都会反复调用）
+_admin_cache: bool | None = None
+
+
 def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+    global _admin_cache
+    if _admin_cache is None:
+        try:
+            _admin_cache = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            _admin_cache = False
+    return _admin_cache
 
 
 # 命名互斥体句柄：需保持引用到进程退出，否则互斥体被回收会导致锁失效
@@ -132,22 +139,30 @@ class TOKEN_PRIVILEGES(ctypes.Structure):
     _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
 
 
+# 特权相关 Win32 函数的参数/返回类型在此**一次声明**：原先散落在各函数体内，每次调用
+# 都重复赋值（既浪费又易漏），一旦漏声明 64 位句柄会被 ctypes 按 32 位截断而静默失败。
+advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+advapi32.OpenProcessToken.restype = wintypes.BOOL
+advapi32.AdjustTokenPrivileges.argtypes = [
+    wintypes.HANDLE, wintypes.BOOL,
+    ctypes.POINTER(TOKEN_PRIVILEGES), wintypes.DWORD,
+    ctypes.POINTER(TOKEN_PRIVILEGES), ctypes.POINTER(wintypes.DWORD),
+]
+advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+advapi32.GetTokenInformation.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+]
+advapi32.GetTokenInformation.restype = wintypes.BOOL
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+
+
 def _set_privilege(name: str, attributes: int) -> bool:
     """设置指定特权的属性（0x2 启用 / 0 禁用），返回是否成功。"""
-    advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
-    advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
-    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.AdjustTokenPrivileges.argtypes = [
-        wintypes.HANDLE, wintypes.BOOL,
-        ctypes.POINTER(TOKEN_PRIVILEGES), wintypes.DWORD,
-        ctypes.POINTER(TOKEN_PRIVILEGES), ctypes.POINTER(wintypes.DWORD),
-    ]
-    advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(
         kernel32.GetCurrentProcess(), 0x0008 | 0x0020, ctypes.byref(token)
@@ -182,15 +197,6 @@ def disable_privilege(name: str) -> bool:
 def privilege_state(name: str) -> int | None:
     """查询指定特权当前属性位（0=禁用, 2=启用）；查询失败返回 None。"""
     TokenPrivileges = 3
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
-    advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
-
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
         return None
@@ -229,10 +235,13 @@ class SYSTEM_MEMORY_LIST_COMMAND(ctypes.Structure):
     _fields_ = [("Version", wintypes.ULONG), ("Command", wintypes.ULONG)]
 
 
+# NtSetSystemInformation 的类型声明同样集中一次（SetSystemFileCacheSize 已在顶部声明）
+ntdll.NtSetSystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, wintypes.ULONG]
+ntdll.NtSetSystemInformation.restype = ctypes.c_long
+
+
 def _purge_list(cmd: int) -> int:
     c = SYSTEM_MEMORY_LIST_COMMAND(1, cmd)
-    ntdll.NtSetSystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, wintypes.ULONG]
-    ntdll.NtSetSystemInformation.restype = ctypes.c_long
     return ntdll.NtSetSystemInformation(
         SystemMemoryListInformation, ctypes.byref(c), ctypes.sizeof(c)
     )
@@ -240,6 +249,4 @@ def _purge_list(cmd: int) -> int:
 
 def clear_file_cache() -> bool:
     """清空系统文件缓存工作集。传 -1 表示不限大小，效果为立即释放缓存。"""
-    kernel32.SetSystemFileCacheSize.argtypes = [ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD]
-    kernel32.SetSystemFileCacheSize.restype = wintypes.BOOL
     return bool(kernel32.SetSystemFileCacheSize(ctypes.c_size_t(-1), ctypes.c_size_t(-1), 0))

@@ -23,28 +23,58 @@ from .winapi import get_mem, user32
 # ---------------------------------------------------------------- 托盘图标
 
 
-def make_icon(pct: float, threshold: float = 85.0) -> Image.Image:
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+_ICON_SIZE = 64
+_ICON_FONT_PX = 26
+_FONT_CACHE: dict = {}
+# 图标内容只取决于「显示文本 + 颜色档」，故按该组合缓存；分桶后组合数很少，
+# 无需每轮刷新都重新绘制并重新加载字体文件。
+_ICON_CACHE: dict = {}
+_ICON_CACHE_MAX = 512
 
-    # 颜色分档跟随可调的物理阈值：红=达到阈值，黄=阈值前 10% 区间，绿=更宽松
+
+def _icon_font():
+    """加载图标字体（只读一次，避免每帧 truetype 反复读字体文件）。"""
+    font = _FONT_CACHE.get(_ICON_FONT_PX)
+    if font is None:
+        try:
+            font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", _ICON_FONT_PX)
+        except Exception:
+            font = ImageFont.load_default()
+        _FONT_CACHE[_ICON_FONT_PX] = font
+    return font
+
+
+def _icon_color(pct: float, threshold: float) -> tuple:
+    """按物理使用率与阈值分档取色：红=达到阈值，黄=阈值前 10% 区间，绿=更宽松。"""
     warn = max(threshold - 10.0, 1.0)
     if pct < warn:
-        color = (46, 160, 67, 255)     # 绿
-    elif pct < threshold:
-        color = (214, 158, 46, 255)    # 黄
-    else:
-        color = (207, 59, 54, 255)     # 红
+        return (46, 160, 67, 255)     # 绿
+    if pct < threshold:
+        return (214, 158, 46, 255)    # 黄
+    return (207, 59, 54, 255)         # 红
 
+
+def make_icon(pct: float, threshold: float = 85.0) -> Image.Image:
+    """绘制托盘图标；相同（文本, 颜色）组合直接复用缓存图像（只读共享）。"""
+    text = str(int(round(pct)))
+    key = (text, _icon_color(pct, threshold))
+    cached = _ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    img = _render_icon(text, key[1])
+    if len(_ICON_CACHE) >= _ICON_CACHE_MAX:
+        _ICON_CACHE.clear()
+    _ICON_CACHE[key] = img
+    return img
+
+
+def _render_icon(text: str, color: tuple) -> Image.Image:
+    size = _ICON_SIZE
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
     d.ellipse([2, 2, size - 3, size - 3], fill=color)
 
-    try:
-        font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", 26)
-    except Exception:
-        font = ImageFont.load_default()
-
-    text = str(int(round(pct)))
+    font = _icon_font()
     bbox = d.textbbox((0, 0), text, font=font)
     w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     d.text(((size - w) / 2 - bbox[0], (size - h) / 2 - bbox[1] - 2),

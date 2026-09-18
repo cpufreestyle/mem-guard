@@ -7,7 +7,7 @@
 Windows 托盘小工具：实时监控**物理内存**与**提交内存(commit)**，超阈值自动清理并提醒，专治「明明还剩几 G 却一直弹『内存不足』」——根因是 commit 耗尽（提交上限 = 物理 + 页面文件），而非物理内存。
 
 - 仓库：`cpufreestyle/mem-guard`（本地 `D:\ai share\repo\mem-guard`，main 分支）
-- 最新已发布 tag：`v1.3.8`（CI 自动出 Release，附件 `mem_guard.exe`）
+- 最新已发布 tag：`v1.3.10`（CI 自动出 Release，附件 `mem_guard.exe`）
 - 语言/平台：Python 3.8+ / Windows only（清理调用 `NtSetSystemInformation`，无法跨平台）
 
 ## 2. 快速上手
@@ -50,8 +50,6 @@ config ← winapi ← privileges ← actions ← clean ← advisor ← ui ← au
                                                           （update 仅依赖 config）
 ```
 
-> 注意：`README.md` 的依赖链尚未包含 `privileges.py`/`actions.py`（它们属于工作区未发布的 v1.3.9 候选改动）。提交 v1.3.9 时记得同步 README。
-
 ## 4. 关键设计点（改代码前必读）
 
 - **特权用完即关**：清理用的 `SeDebugPrivilege` 等高危特权在 `clean_privileges()` 上下文管理器内启用，退出时把「原本禁用」的恢复禁用，不常驻。
@@ -62,6 +60,7 @@ config ← winapi ← privileges ← actions ← clean ← advisor ← ui ← au
 - **配置热重载**：`Guard.maybe_reload_config` 比对 `mem_guard.json` 的 mtime，变化即重载；越界值被 `normalize_config` 钳制。
 - **托盘自愈**：`Guard.run` 监控线程常驻，图标进程异常退出后自动重建，避免「程序在跑但图标没了」。
 - **无控制台窗口**：`--noconsole` 子系统；GUI 下 `sys.stdout is None`，日志走 `log()` 写文件而非 `print`。
+- **缓存与节流（v1.3.10 起）**：`is_admin`、自启查询 `autostart_enabled`、托盘图标 `make_icon` 均有进程内缓存；托盘菜单展开时**不再**扫描全进程或启动 `schtasks` 子进程（优化建议条数由 `Guard` 在监控线程后台刷新到 `guard.advice_count`，菜单标签只读该缓存）。清理后改为轮询等待可用内存回升（最多 1.5s），日志轮转检查按写入次数节流。改动这些地方请保持"变更后失效 / 后台刷新"的语义。
 
 ## 5. 构建与发布
 
@@ -120,4 +119,4 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 - 后台化 + 输出重定向到工作区文件 = **撑爆磁盘风险**（实测 33GB 直到 C 盘 0 字节）：构建日志写 `$env:TEMP` 并加 `try/catch` 兜底。
 
 ---
-最后更新：2026-09-16（对应未发布工作区 = v1.3.9 候选）
+最后更新：2026-09-18（对应 v1.3.10：性能与健壮性优化）

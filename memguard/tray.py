@@ -15,6 +15,7 @@ import time
 
 import pystray
 
+from .advisor import analyze
 from .clean import do_clean, top_processes_list
 from .config import CONFIG_PATH, __version__, gb, load_config, log
 from .menu import build_menu
@@ -33,6 +34,8 @@ class Guard:
         self.history = collections.deque(maxlen=120)  # 内存使用率采样历史
         self._cfg_mtime = None       # 配置热重载：记录上次 mtime
         self._warned = False         # 是否已就本次接近阈值发过预警（避免反复弹）
+        self.advice_count = 0        # 后台低频刷新的「优化建议条数」，供菜单标签零成本读取
+        self._advice_tick = 0
         self.stop = threading.Event()
         self.icon: pystray.Icon | None = None
 
@@ -61,6 +64,14 @@ class Guard:
                 self.refresh()
                 s = self.state
                 self.history.append((time.time(), s["phys_pct"], s["commit_pct"]))
+                # 优化建议条数在监控线程后台低频刷新：菜单标签只读缓存值，
+                # 避免每次展开菜单都遍历全进程（原实现的明显卡顿来源）。
+                self._advice_tick += 1
+                if self._advice_tick % 3 == 1:
+                    try:
+                        self.advice_count = len(analyze(self.cfg))
+                    except Exception:
+                        pass
                 if self.icon:
                     # 托盘重建/退出瞬间 icon 可能短暂失效，单独容错避免整轮监控被中断
                     try:

@@ -39,9 +39,27 @@ def _pythonw_path():
     return None
 
 
-def autostart_enabled() -> bool:
-    """查询计划任务 MemGuard 是否已注册。"""
-    return _run_silent(["schtasks", "/Query", "/TN", AUTOSTART_TASK])
+# 查询计划任务要启动 schtasks 子进程（几十毫秒）。托盘菜单每次展开都会读取勾选状态，
+# 若每次真查会明显卡顿，故缓存结果，仅在安装/卸载成功后失效。
+_autostart_cache: bool | None = None
+
+
+def autostart_enabled(use_cache: bool = True) -> bool:
+    """查询计划任务 MemGuard 是否已注册。
+
+    use_cache=True（默认）复用上次结果，避免菜单反复展开时反复启动 schtasks 子进程；
+    诊断导出等需要实时值时可传 False。
+    """
+    global _autostart_cache
+    if use_cache and _autostart_cache is not None:
+        return _autostart_cache
+    _autostart_cache = _run_silent(["schtasks", "/Query", "/TN", AUTOSTART_TASK])
+    return _autostart_cache
+
+
+def _invalidate_autostart_cache() -> None:
+    global _autostart_cache
+    _autostart_cache = None
 
 
 def install_autostart() -> bool:
@@ -50,6 +68,13 @@ def install_autostart() -> bool:
     打包成 exe 后直接把 exe 自身注册进去，不依赖 Python 与外部脚本；
     源码运行时优先复用 install_autostart.ps1，否则退回 schtasks + pythonw。
     """
+    ok = _install_autostart_impl()
+    if ok:
+        _invalidate_autostart_cache()
+    return ok
+
+
+def _install_autostart_impl() -> bool:
     if getattr(sys, "frozen", False):
         # frozen 下 BASE_DIR 取自 exe 所在目录，无需设置任务的工作目录
         exe = os.path.abspath(sys.executable)
@@ -70,6 +95,13 @@ def install_autostart() -> bool:
 
 def remove_autostart() -> bool:
     """删除开机自启计划任务。"""
+    ok = _remove_autostart_impl()
+    if ok:
+        _invalidate_autostart_cache()
+    return ok
+
+
+def _remove_autostart_impl() -> bool:
     ps1 = os.path.join(BASE_DIR, "install_autostart.ps1")
     if os.path.exists(ps1):
         return _run_silent(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",

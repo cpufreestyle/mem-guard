@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from .clean import top_processes_list
-from .config import CLEAN_BLACKLIST_STEMS, _norm_proc_name, gb  # noqa: F401 (CLEAN_BLACKLIST_STEMS 备用)
+from .config import _norm_proc_name, gb
 from .winapi import get_mem, is_admin
 
 # 激进档下常被清空工作集、导致卡顿的常见程序（建议加入 user_blacklist）

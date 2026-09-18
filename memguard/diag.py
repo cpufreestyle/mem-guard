@@ -28,7 +28,7 @@ def export_diagnostics() -> str:
             f"admin={is_admin()}",
             f"物理 {s['phys_pct']:.1f}%  ({gb(s['used_phys'])} / {gb(s['total_phys'])})",
             f"提交 {s['commit_pct']:.1f}%  (可用 {gb(s['avail_commit'])} / {gb(s['total_commit'])})",
-            f"autostart={autostart_enabled()}",
+            f"autostart={autostart_enabled(use_cache=False)}",
         ]
         for p in CLEAN_PRIVILEGES:
             info.append(f"priv {p}={privilege_state(p)}")

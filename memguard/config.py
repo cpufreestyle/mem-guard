@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 
-__version__ = "1.3.9"
+__version__ = "1.3.10"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -135,9 +135,18 @@ def _rotate_log_if_needed() -> None:
         pass
 
 
+# 轮转检查（stat 文件大小）不必每次写日志都做，按写入次数节流即可；
+# 最多多写几十行（几 KB）才触发轮转，上限仍有保障。
+_LOG_ROTATE_EVERY = 64
+_log_write_count = 0
+
+
 def log(msg: str) -> None:
+    global _log_write_count
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
-    _rotate_log_if_needed()
+    _log_write_count += 1
+    if _log_write_count % _LOG_ROTATE_EVERY == 1:
+        _rotate_log_if_needed()
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")

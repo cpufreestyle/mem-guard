@@ -12,7 +12,6 @@ import threading
 
 import pystray
 
-from .advisor import analyze
 from .autostart import autostart_enabled, install_autostart, remove_autostart
 from .clean import do_clean, top_processes_list
 from .config import LOG_PATH, __version__, gb, log, save_config
@@ -33,7 +32,13 @@ def build_menu(guard) -> pystray.Menu:
     # -- 菜单回调 ------------------------------------------------
 
     def on_clean_now(icon=None, item=None) -> None:
-        r = do_clean("手动")
+        try:
+            r = do_clean("手动")
+        except Exception as e:
+            log(f"手动清理异常: {e!r}")
+            if icon:
+                icon.notify(f"清理异常：{e}", "MemGuard")
+            return
         if not r["ok"]:
             icon.notify(r["msg"], "MemGuard")
             return
@@ -193,7 +198,7 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("立即清理", on_clean_now),
         pystray.MenuItem("内存占用 Top10", on_top),
         pystray.MenuItem("内存趋势", on_trend),
-        pystray.MenuItem(lambda i: f"优化建议（{len(analyze(guard.cfg))} 条）", on_advice),
+        pystray.MenuItem(lambda i: f"优化建议（{guard.advice_count} 条）", on_advice),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("自动清理", on_toggle_auto,
                          checked=lambda i: cfg["auto_clean"]),
