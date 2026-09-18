@@ -74,7 +74,10 @@ pip install pyinstaller
 .\build.ps1 -Upx            # 启用 UPX 压缩（默认关：易被杀软误报）
 ```
 
-**自动发布（GitHub Actions）**：`.github/workflows/release.yml` 为 `on: push: tags: ["v*"]`。流程：自检 → PyInstaller 打包 → 冻结版 exe 跑 `--selftest` → 上传 → 创建 Release。
+**本地编译安装器（可选）**：需自装 Inno Setup 6，然后执行
+`ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss`，产物为 `dist\MemGuard-Setup-<版本>.exe`。
+
+**自动发布（GitHub Actions）**：`.github/workflows/release.yml` 为 `on: push: tags: ["v*"]`。流程：安装依赖 → `pytest -q` → `--selftest` → PyInstaller 打包 → 冻结版 exe 跑 `--selftest` → **Inno Setup 编译安装器**（`installer/mem_guard.iss`，版本号从 `config.py` 注入）→ 上传产物 → 创建 Release（附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）。
 
 ```powershell
 # 发版三步
@@ -110,7 +113,7 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 
 1. **~~收尾 v1.3.9~~（已完成 2026-09-18）**：已新增 `privileges.py`/`actions.py`、`clean.py` 重写、`NameError` 修复、自检新增 `build_menu` 用例，README 模块表与依赖链已同步；本地 `--selftest` 全 PASS，已 commit `50b8fd1` 并 tag `v1.3.9` 推送（CI 自动发布 Release）。
 2. **~~补 pytest 单元测试~~（已完成 2026-09-18，v1.3.11）**：已加 `tests/`（51 项）与 `requirements-dev.txt`，CI 在打包前跑 `python -m pytest -q`；`clean`/`actions` 常量绑定回归、`ui` 取色 float 回归等均已覆盖。
-3. **安装器（NSIS/Inno Setup）**：生成 `setup.exe` 改善分发；CI 加编译步骤并随 Release 发布（版本号建议从 `config.py` 动态注入 `.iss`/`.nsi`，避免发版时忘改）。
+3. **~~安装器~~（已完成 2026-09-18，v1.3.12）**：采用 Inno Setup（`installer/mem_guard.iss`，**当前用户安装** `{localappdata}\Programs\MemGuard`，安装免 UAC，配置/日志可正常写入）；CI 用 `choco install innosetup` 编译、版本号从 `config.py` 注入，Release 同时附带 `MemGuard-Setup-x.y.z.exe`。注意：脚本已探测 `ISCC.exe` 常见路径，找不到会**告警并跳过**而非让发布失败。
 4. **`clean.py` 的 `do_clean` 若进一步拆**：可考虑把结果统计与进程统计再独立，但收益已很低。
 
 ## 9. 其他踩坑索引（详见 `.codebuddy/memory` 的 `MEMORY.md`）
@@ -120,4 +123,4 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 - 后台化 + 输出重定向到工作区文件 = **撑爆磁盘风险**（实测 33GB 直到 C 盘 0 字节）：构建日志写 `$env:TEMP` 并加 `try/catch` 兜底。
 
 ---
-最后更新：2026-09-18（对应 v1.3.11：补 pytest 单元测试 + CI 跑测试）
+最后更新：2026-09-18（对应 v1.3.12：新增 Inno Setup 安装器）

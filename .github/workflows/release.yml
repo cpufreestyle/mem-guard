@@ -63,16 +63,45 @@ jobs:
             exit 1
           }
 
+      - name: 安装 Inno Setup
+        continue-on-error: true
+        run: choco install innosetup -y --no-progress
+
+      - name: 编译安装器
+        shell: pwsh
+        run: |
+          # 版本号从 config.py 动态读取，避免发版时忘记同步安装器版本
+          $iscc = @(
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Host "::warning title=跳过安装器::未找到 ISCC.exe（Inno Setup 未安装成功）"
+            exit 0
+          }
+          $ver = (Select-String -Path memguard\config.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "编译安装器，版本 $ver"
+          & $iscc "/DAppVersion=$ver" "installer\mem_guard.iss"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error title=安装器编译失败::ISCC 退出码 $LASTEXITCODE"
+            exit 1
+          }
+          Get-ChildItem dist\MemGuard-Setup-*.exe | ForEach-Object { Write-Host ("产物: " + $_.Name) }
+
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: mem_guard-exe
-          path: dist/mem_guard.exe
-          if-no-files-found: error
+          path: |
+            dist/mem_guard.exe
+            dist/MemGuard-Setup-*.exe
+          if-no-files-found: warn
 
       - name: 发布 Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/mem_guard.exe
+          files: |
+            dist/mem_guard.exe
+            dist/MemGuard-Setup-*.exe
           generate_release_notes: true

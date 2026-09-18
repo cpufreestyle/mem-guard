@@ -49,6 +49,9 @@ python mem_guard.py
 > 提示：托盘程序请用 `pythonw.exe` 启动（本 bat 已自动优先使用），这样不会出现控制台黑框；
 > 若用 `python.exe` 启动，程序也会在启动瞬间自动隐藏控制台窗口。
 
+从 Release 安装（普通用户推荐）：下载 `MemGuard-Setup-x.y.z.exe` 双击安装即可——为**当前用户安装**
+（无需管理员/UAC），安装时可勾选创建桌面图标；清理内存时程序会提示以管理员身份运行。
+
 命令行辅助模式：
 
 ```powershell
@@ -85,10 +88,16 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 （避免开发机装了它们时被连带打包），单文件版实测约 **18MB**；
 构建结束会自动对产物跑一次 `--selftest` 冒烟测试，失败即报错。
 
+生成安装器（可选，需自装 [Inno Setup](https://jrsoftware.org/isinfo.php) 6）：
+
+```powershell
+ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-Setup-<版本>.exe
+```
+
 ### 自动构建与发布（GitHub Actions）
 
 仓库内置 `.github/workflows/release.yml`：推送 `v*` 标签时（例如 `git tag v1.3.0 && git push origin v1.3.0`）
-会在 Windows runner 上自动跑自检、打包 exe 并创建 Release（附件即 `mem_guard.exe`）；
+会在 Windows runner 上自动跑单元测试与自检、打包 exe、用 Inno Setup 生成安装器并创建 Release（附件为 `mem_guard.exe` 与 `MemGuard-Setup-x.y.z.exe`）；
 也可在仓库 Actions 页面手动触发，构建产物在 Artifacts 中下载。
 
 打包后的行为：
@@ -167,7 +176,7 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 
 ## 版本
 
-当前版本 `1.3.11`。
+当前版本 `1.3.12`。
 
 ## 源码结构
 
