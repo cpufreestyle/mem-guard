@@ -95,8 +95,9 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 
 ## 6. 测试现状
 
+- **单元测试（v1.3.11 起）**：`tests/` 下 pytest 用例（51 项）覆盖 `config` 归一化/钳制、`update._parse_version`、`advisor.analyze`（注入内存状态，不依赖真实机器）、`ui` 图标取色与缓存（含"颜色须按原始 float 判断"的回归）、`clean`/`actions` 常量绑定回归（拦截底层调用，防 `NameError` 类回归）、`autostart` 缓存语义、`menu`/`tray` 构建、`winapi` 读取与缓存。运行：`pip install -r requirements-dev.txt && python -m pytest -q`。
 - **内置自检**：`python mem_guard.py --selftest` 覆盖 get_mem / make_icon / 配置钳制 / 黑名单匹配 / `_parse_version` / advisor / `build_menu` 等，全 PASS 才说明导入链与基本逻辑 OK。非管理员环境下 `do_clean` 走「需管理员」早返回分支，不会真正清理。
-- **pytest 尚未引入（TODO）**：当前没有独立的 `tests/` 与 `requirements-dev.txt`，CI 也不跑 pytest。接手项见 §8。
+- **CI 顺序**：安装 `requirements-dev.txt` → `pytest -q` → `--selftest` → PyInstaller 打包 → 对**冻结版 exe** 再跑一次 `--selftest` 冒烟。
 
 ## 7. 已知问题 / 风险
 
@@ -108,7 +109,7 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 ## 8. 待办 / 接手清单
 
 1. **~~收尾 v1.3.9~~（已完成 2026-09-18）**：已新增 `privileges.py`/`actions.py`、`clean.py` 重写、`NameError` 修复、自检新增 `build_menu` 用例，README 模块表与依赖链已同步；本地 `--selftest` 全 PASS，已 commit `50b8fd1` 并 tag `v1.3.9` 推送（CI 自动发布 Release）。
-2. **补 pytest 单元测试（tests/）**：覆盖 `config`/`advisor`/`update`/`ui`/`menu`/`clean`（确定性断言，如注入 `mem` 测 advisor、测 `purge_*` 返回 int 以挡 NameError 类回归）；加 `requirements-dev.txt`，CI 在打包前跑 `pytest`。
+2. **~~补 pytest 单元测试~~（已完成 2026-09-18，v1.3.11）**：已加 `tests/`（51 项）与 `requirements-dev.txt`，CI 在打包前跑 `python -m pytest -q`；`clean`/`actions` 常量绑定回归、`ui` 取色 float 回归等均已覆盖。
 3. **安装器（NSIS/Inno Setup）**：生成 `setup.exe` 改善分发；CI 加编译步骤并随 Release 发布（版本号建议从 `config.py` 动态注入 `.iss`/`.nsi`，避免发版时忘改）。
 4. **`clean.py` 的 `do_clean` 若进一步拆**：可考虑把结果统计与进程统计再独立，但收益已很低。
 
@@ -119,4 +120,4 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 - 后台化 + 输出重定向到工作区文件 = **撑爆磁盘风险**（实测 33GB 直到 C 盘 0 字节）：构建日志写 `$env:TEMP` 并加 `try/catch` 兜底。
 
 ---
-最后更新：2026-09-18（对应 v1.3.10：性能与健壮性优化）
+最后更新：2026-09-18（对应 v1.3.11：补 pytest 单元测试 + CI 跑测试）

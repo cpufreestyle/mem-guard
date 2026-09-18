@@ -54,6 +54,7 @@ python mem_guard.py
 ```powershell
 python mem_guard.py --once       # 打印一次内存状态并执行一次清理
 python mem_guard.py --selftest   # 运行内置自检
+python -m pytest -q              # 运行单元测试（先 pip install -r requirements-dev.txt）
 ```
 
 ## 打包为独立 exe（免 Python、跨机器分发）
@@ -166,7 +167,7 @@ pip install pyinstaller           # 打包工具（requirements.txt 不含）
 
 ## 版本
 
-当前版本 `1.3.10`。
+当前版本 `1.3.11`。
 
 ## 源码结构
 

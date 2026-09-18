@@ -1,0 +1,3 @@
+# 开发/CI 依赖：运行时依赖 + 测试框架
+-r requirements.txt
+pytest>=7.0.0
