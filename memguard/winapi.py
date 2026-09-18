@@ -225,10 +225,13 @@ def privilege_state(name: str) -> int | None:
 # ---------------------------------------------------------------- 底层清理（Native API）
 
 # NtSetSystemInformation(SystemMemoryListInformation = 80)
+# 命令值取自 SYSTEM_MEMORY_LIST_COMMAND 枚举（winnt.h）
 SystemMemoryListInformation = 80
 MemoryEmptyWorkingSets = 2
 MemoryFlushModifiedList = 3
 MemoryPurgeStandbyList = 4
+# 只清理 standby 列表中的低优先级部分（较新 Windows 支持；不支持时返回非 0，属预期）
+MemoryPurgeLowPriorityStandbyList = 5
 
 
 class SYSTEM_MEMORY_LIST_COMMAND(ctypes.Structure):

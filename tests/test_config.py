@@ -74,3 +74,30 @@ def test_normalize_config_accepts_non_dict():
 def test_gb_format():
     assert gb(1024 ** 3) == "1.0GB"
     assert gb(0) == "0.0GB"
+
+
+def test_normalize_config_new_fields_defaults():
+    cfg = normalize_config({})
+    assert cfg["min_avail_mb"] == 0
+    assert cfg["scheduled_minutes"] == 0
+    assert cfg["clean_on_start"] is False
+    assert cfg["clean_areas"] == {
+        "standby": True, "low_priority_standby": True, "modified": True,
+        "file_cache": True, "working_sets": True,
+    }
+    assert cfg["stats"] == {"count": 0, "freed": 0}
+
+
+def test_normalize_config_new_fields_clamped():
+    cfg = normalize_config({
+        "clean_areas": {"standby": False, "bogus": True},   # 未知键丢弃，缺失沿用默认
+        "min_avail_mb": -5,
+        "scheduled_minutes": 99999,
+        "stats": {"count": "3", "freed": 1024},
+    })
+    assert cfg["clean_areas"]["standby"] is False
+    assert cfg["clean_areas"]["modified"] is True
+    assert "bogus" not in cfg["clean_areas"]
+    assert cfg["min_avail_mb"] == 0
+    assert cfg["scheduled_minutes"] == 24 * 60
+    assert cfg["stats"] == {"count": 3, "freed": 1024}

@@ -14,11 +14,16 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - 悬停显示物理内存 + 提交内存详情
 - 任一指标超阈值时自动清理并弹气泡提醒；接近阈值（`warn_margin`）时先弹**预警**，只提醒不清理
 - 清理动作**分两档**（原理同 ISLC / Mem Reduct，调用 `NtSetSystemInformation`）：
-  - **保守档（默认）**：1) 刷写修改页列表（FlushModifiedList）2) 清理 standby list（PurgeStandbyList）
-    3) 清空系统文件缓存工作集 —— 温和，对前台程序几乎无影响
-  - **激进档**：在保守档基础上再清空各进程工作集（EmptyWorkingSet）—— 释放更多，但前台程序下次访问需重新读盘
+  - **保守档（默认）**：1) 清理低优先级 standby list 2) 刷写修改页列表（FlushModifiedList）
+    3) 清理 standby list（PurgeStandbyList）4) 清空系统文件缓存工作集 —— 温和，对前台程序几乎无影响
+  - **激进档**：在保守档基础上再清空系统/各进程工作集（EmptyWorkingSet）—— 释放更多，但前台程序下次访问需重新读盘
+- **清理区域可勾选**（`clean_areas`，对标 WinMemoryCleaner）：standby / 低优先级 standby / 修改页 / 文件缓存 /
+  系统工作集逐项开关，托盘菜单「清理区域」即可调整
+- **多种触发方式**（对标 Mem Reduct）：超阈值百分比、可用内存低于绝对值（`min_avail_mb`）、
+  定时清理（`scheduled_minutes`）、启动时清理（`clean_on_start`）；菜单顶部可看**累计清理次数与释放量**
 - **进程白名单**（`user_blacklist`）：指定进程在激进档下跳过工作集清空，避免浏览器 / IDE / 游戏被清后卡顿
-- 右键菜单：立即清理 / 内存占用 Top10（可刷新窗口）/ 自动清理开关 / 清理阈值（激进·标准·宽松）/ 清理力度（保守·激进）/ 清理冷却（1/5/10/30 分钟）/ 开机自启开关 / 打开日志 / 退出
+- 右键菜单：立即清理 / 内存占用 Top10（可刷新窗口）/ 自动清理开关 / 清理阈值 / 清理力度 / 清理冷却 /
+  清理区域 / 定时清理 / 低内存触发 / 启动时清理 / 开机自启开关 / 打开日志 / 导出诊断 / 检查更新 / 退出
 - 日志自动轮转（超过 1MB 归档为 `mem_guard.log.1`）
 - 单实例运行（命名互斥体）
 - 清理所需特权**用完即关**（不常驻 `SeDebugPrivilege` 等高危特权）
@@ -131,6 +136,11 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 | `clean_level` | 清理力度：`conservative`(保守，只清缓存) / `aggressive`(激进，额外清空进程工作集) | conservative |
 | `user_blacklist` | 额外跳过工作集清空的进程名，如 `["chrome", "code.exe"]`（不区分大小写、可带可不带 `.exe`） | [] |
 | `warn_margin` | 距阈值还差多少个百分点时先弹预警，0=关闭预警 | 15 |
+| `min_avail_mb` | 可用物理内存低于该值(MB)也触发清理，0=关闭 | 0 |
+| `scheduled_minutes` | 每隔 N 分钟主动清理一次（不看内存占用），0=关闭 | 0 |
+| `clean_on_start` | 启动后先清理一次 | false |
+| `clean_areas` | 清理区域开关：`standby` / `low_priority_standby` / `modified` / `file_cache` / `working_sets` | 全部 true |
+| `stats` | 累计统计（清理次数 / 释放量），程序自动维护，菜单顶部可见 | {"count": 0, "freed": 0} |
 
 > 以上数值都会做合法性钳制（如阈值限 50–99、`interval` 限 2–3600 秒），手误写超范围会自动修正，无需担心配置写坏。
 

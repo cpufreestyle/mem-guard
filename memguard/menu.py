@@ -90,6 +90,74 @@ def build_menu(guard) -> pystray.Menu:
             log(f"清理档位 -> {'激进' if level == 'aggressive' else '保守'}")
         return setter
 
+    # -- 清理区域 / 触发方式（v1.4.0，对标 WinMemoryCleaner / Mem Reduct）--
+
+    def _toggle_area(key, label):
+        def setter(icon, item):
+            areas = dict(cfg.get("clean_areas") or {})
+            areas[key] = not areas.get(key, True)
+            cfg["clean_areas"] = areas
+            save_config(cfg)
+            log(f"清理区域[{label}] -> {'开' if areas[key] else '关'}")
+        return setter
+
+    def areas_menu():
+        rows = [
+            ("standby", "Standby 列表"),
+            ("low_priority_standby", "低优先级 Standby"),
+            ("modified", "修改页列表"),
+            ("file_cache", "系统文件缓存"),
+            ("working_sets", "系统工作集（仅激进档）"),
+        ]
+        return pystray.Menu(*[
+            pystray.MenuItem(
+                label, _toggle_area(k, label),
+                checked=(lambda i, kk=k: bool((cfg.get("clean_areas") or {}).get(kk, True))),
+            )
+            for k, label in rows
+        ])
+
+    def _set_scheduled(minutes):
+        def setter(icon, item):
+            cfg["scheduled_minutes"] = minutes
+            save_config(cfg)
+            log(f"定时清理 -> {'关闭' if not minutes else f'{minutes} 分钟'}")
+        return setter
+
+    def scheduled_menu():
+        choices = [(0, "关闭"), (15, "15 分钟"), (30, "30 分钟"),
+                   (60, "1 小时"), (180, "3 小时")]
+        return pystray.Menu(*[
+            pystray.MenuItem(label, _set_scheduled(m), radio=True,
+                             checked=(lambda i, mm=m: cfg.get("scheduled_minutes", 0) == mm))
+            for m, label in choices
+        ])
+
+    def _set_min_avail(mb):
+        def setter(icon, item):
+            cfg["min_avail_mb"] = mb
+            save_config(cfg)
+            log(f"低内存触发 -> {'关闭' if not mb else f'{mb} MB'}")
+        return setter
+
+    def min_avail_menu():
+        choices = [(0, "关闭"), (512, "512 MB"), (1024, "1 GB"),
+                   (2048, "2 GB"), (4096, "4 GB")]
+        return pystray.Menu(*[
+            pystray.MenuItem(label, _set_min_avail(mb), radio=True,
+                             checked=(lambda i, mm=mb: cfg.get("min_avail_mb", 0) == mm))
+            for mb, label in choices
+        ])
+
+    def on_toggle_clean_on_start(icon, item) -> None:
+        cfg["clean_on_start"] = not bool(cfg.get("clean_on_start", False))
+        save_config(cfg)
+        log(f"启动时清理 -> {'开' if cfg['clean_on_start'] else '关'}")
+
+    def line_stats(_):
+        st = cfg.get("stats") or {}
+        return f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
+
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
             ok = remove_autostart()
@@ -194,6 +262,7 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem(line_phys, None, enabled=False),
         pystray.MenuItem(line_commit, None, enabled=False),
         pystray.MenuItem(line_tip, None, enabled=False),
+        pystray.MenuItem(line_stats, None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("立即清理", on_clean_now),
         pystray.MenuItem("内存占用 Top10", on_top),
@@ -205,6 +274,11 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("清理阈值", preset_menu()),
         pystray.MenuItem("清理力度", level_menu()),
         pystray.MenuItem("清理冷却", cooldown_menu()),
+        pystray.MenuItem("清理区域", areas_menu()),
+        pystray.MenuItem("定时清理", scheduled_menu()),
+        pystray.MenuItem("低内存触发", min_avail_menu()),
+        pystray.MenuItem("启动时清理", on_toggle_clean_on_start,
+                         checked=lambda i: bool(cfg.get("clean_on_start"))),
         pystray.MenuItem("开机自启", on_toggle_autostart,
                          checked=lambda i: autostart_enabled()),
         pystray.MenuItem(

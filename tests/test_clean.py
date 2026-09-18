@@ -9,6 +9,7 @@ from memguard import actions, clean
 from memguard.winapi import (
     MemoryEmptyWorkingSets,
     MemoryFlushModifiedList,
+    MemoryPurgeLowPriorityStandbyList,
     MemoryPurgeStandbyList,
 )
 
@@ -47,3 +48,18 @@ def test_top_processes_list_shape():
 
 def test_top_processes_text_lines():
     assert len(clean.top_processes(3).splitlines()) <= 3
+
+
+def test_low_priority_standby_binds_constant(monkeypatch):
+    """回归：低优先级 standby 动作必须正确引用命令常量，否则会 NameError。"""
+    seen = []
+    monkeypatch.setattr(actions, "_purge_list", lambda cmd: seen.append(cmd) or 0)
+    assert actions.purge_low_priority_standby() == 0
+    assert seen == [MemoryPurgeLowPriorityStandbyList]
+
+
+def test_do_clean_areas_all_off_not_reported_failed(monkeypatch):
+    """所有核心区域关闭时不应误报失败（非管理员直接早返回，这里强制管理员分支关闭）。"""
+    monkeypatch.setattr(clean, "is_admin", lambda: False)
+    r = clean.do_clean("测试")
+    assert r["ok"] is False and "管理员" in r["msg"]

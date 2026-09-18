@@ -31,7 +31,7 @@ python mem_guard.py --selftest          # 内置自检（CI 与打包后冒烟�
 | `memguard/config.py` | 版本/路径、默认配置、**配置校验与钳制**、落盘日志 `log` | `__version__`、`load_config`、`normalize_config`、`gb`、`CLEAN_BLACKLIST_STEMS`、`_norm_proc_name`、`_blacklist_stems`、`BASE_DIR`、`LOG_PATH` |
 | `memguard/winapi.py` | ctypes 绑定：内存读取、特权启用/禁用/查询、单实例互斥体、底层清理调用 | `get_mem`、`is_admin`、`privilege_state`、`enable_privilege`、`disable_privilege`、`_purge_list`、`clear_file_cache`、`single_instance`、`MemoryEmptyWorkingSets/FlushModifiedList/PurgeStandbyList` |
 | `memguard/privileges.py` | **特权管理**：清理所需高特权启用 + 用完即恢复的上下文管理器 | `CLEAN_PRIVILEGES`、`clean_privileges()` |
-| `memguard/actions.py` | **清理动作**：单个底层调用的封装（缓存/工作集/修改页/standby） | `purge_working_sets`、`flush_modified_list`、`purge_standby_list`、`clear_system_file_cache`、`empty_process_working_sets` |
+| `memguard/actions.py` | **清理动作**：单个底层调用的封装（缓存/工作集/修改页/standby/低优先级 standby） | `purge_working_sets`、`flush_modified_list`、`purge_standby_list`、`purge_low_priority_standby`、`clear_system_file_cache`、`empty_process_working_sets` |
 | `memguard/clean.py` | **清理编排与统计**：编排各动作、汇总结果；进程 Top 统计 | `do_clean`、`top_processes_list`、`top_processes` |
 | `memguard/advisor.py` | 优化建议引擎（基于内存状态+配置生成分级建议） | `analyze`、`format_advice` |
 | `memguard/ui.py` | 界面层：图标绘制、气泡、Top10/趋势/建议窗口（不依赖 pystray） | `make_icon`、`message_box`、`show_top_window`、`show_trend_window`、`show_advice_window` |
@@ -61,6 +61,7 @@ config ← winapi ← privileges ← actions ← clean ← advisor ← ui ← au
 - **托盘自愈**：`Guard.run` 监控线程常驻，图标进程异常退出后自动重建，避免「程序在跑但图标没了」。
 - **无控制台窗口**：`--noconsole` 子系统；GUI 下 `sys.stdout is None`，日志走 `log()` 写文件而非 `print`。
 - **缓存与节流（v1.3.10 起）**：`is_admin`、自启查询 `autostart_enabled`、托盘图标 `make_icon` 均有进程内缓存；托盘菜单展开时**不再**扫描全进程或启动 `schtasks` 子进程（优化建议条数由 `Guard` 在监控线程后台刷新到 `guard.advice_count`，菜单标签只读该缓存）。清理后改为轮询等待可用内存回升（最多 1.5s），日志轮转检查按写入次数节流。改动这些地方请保持"变更后失效 / 后台刷新"的语义。
+- **清理区域与多触发源（v1.4.0 起）**：`clean_areas` 控制各清理区域开关（含新增的 `MemoryPurgeLowPriorityStandbyList = 5` 低优先级 standby；旧系统不支持会返回非 0 并如实展示，不算失败）。触发源三种——超阈值（带防抖/冷却）、可用内存低于 `min_avail_mb`（受冷却约束）、定时 `scheduled_minutes`（不受冷却约束），统一走 `Guard._auto_clean`；`clean_on_start` 在监控线程启动时清一次。累计统计 `stats`（count/freed）在 `do_clean` 成功后经 `save_config` 持久化——**每次成功清理都会写一次配置文件**，勿在热重载 mtime 比较上引入写盘循环。
 
 ## 5. 构建与发布
 
@@ -123,4 +124,4 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 - 后台化 + 输出重定向到工作区文件 = **撑爆磁盘风险**（实测 33GB 直到 C 盘 0 字节）：构建日志写 `$env:TEMP` 并加 `try/catch` 兜底。
 
 ---
-最后更新：2026-09-18（对应 v1.3.12：新增 Inno Setup 安装器）
+最后更新：2026-09-18（对应 v1.4.0：清理区域开关 + 多触发源 + 累计统计，对标 WinMemoryCleaner / Mem Reduct）

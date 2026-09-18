@@ -18,12 +18,18 @@ from .actions import (
     clear_system_file_cache,
     empty_process_working_sets,
     flush_modified_list,
+    purge_low_priority_standby,
     purge_standby_list,
     purge_working_sets,
 )
-from .config import CLEAN_LEVELS, gb, load_config, log
+from .config import CLEAN_LEVELS, gb, load_config, log, save_config
 from .privileges import clean_privileges
 from .winapi import get_mem, is_admin
+
+
+def _status(rc: int) -> str:
+    """把 NTSTATUS 渲染为可读文案。"""
+    return "成功" if rc == 0 else f"失败(0x{rc & 0xffffffff:X})"
 
 
 def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None) -> dict:
@@ -31,6 +37,8 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
 
     level: "conservative"（默认，只清 standby/修改页/文件缓存）或
     "aggressive"（在此基础上额外清空各进程工作集）；None 时读取配置里的 clean_level。
+    具体清理哪些区域由配置 clean_areas 控制（对标 WinMemoryCleaner 的勾选项）；
+    全部核心区域被关闭时不会误报失败。清理成功后更新累计统计（stats）并持久化。
     """
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
@@ -41,6 +49,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         lvl = "conservative"
     aggressive = lvl == "aggressive"
     bl = cfg.get("user_blacklist") if user_blacklist is None else user_blacklist
+    areas = cfg.get("clean_areas") or {}
 
     with clean_privileges() as failed_privs:
         before = get_mem()
@@ -48,16 +57,30 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         if failed_privs:
             detail.append("特权启用失败:" + ",".join(failed_privs))
 
-        r_ws = 0
+        core = []  # 参与整体成败判断的核心 NT 操作返回码
+
         if aggressive:
-            r_ws = purge_working_sets()
-            detail.append(f"清空工作集:{'成功' if r_ws == 0 else f'失败(0x{r_ws & 0xffffffff:X})'}")
+            if areas.get("working_sets", True):
+                r_ws = purge_working_sets()
+                core.append(r_ws)
+                detail.append(f"清空工作集:{_status(r_ws)}")
+            else:
+                detail.append("清空工作集:已关闭")
 
-        r_fm = flush_modified_list()
-        detail.append(f"刷写修改页:{'成功' if r_fm == 0 else f'失败(0x{r_fm & 0xffffffff:X})'}")
+        if areas.get("modified", True):
+            r_fm = flush_modified_list()
+            core.append(r_fm)
+            detail.append(f"刷写修改页:{_status(r_fm)}")
 
-        r_sb = purge_standby_list()
-        detail.append(f"清理Standby:{'成功' if r_sb == 0 else f'失败(0x{r_sb & 0xffffffff:X})'}")
+        if areas.get("standby", True):
+            r_sb = purge_standby_list()
+            core.append(r_sb)
+            detail.append(f"清理Standby:{_status(r_sb)}")
+
+        # 低优先级 standby：影响面更小的一步（部分系统不支持该命令，会如实展示失败码）
+        if areas.get("low_priority_standby", True):
+            r_lp = purge_low_priority_standby()
+            detail.append(f"清理低优先级Standby:{_status(r_lp)}")
 
         if aggressive:
             n, skipped = empty_process_working_sets(bl)
@@ -65,12 +88,14 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         else:
             detail.append("进程工作集:已跳过(保守档)")
 
-        fc = clear_system_file_cache()
-        detail.append(f"文件缓存:{'成功' if fc else '失败'}")
+        if areas.get("file_cache", True):
+            fc = clear_system_file_cache()
+            detail.append(f"文件缓存:{'成功' if fc else '失败'}")
+        else:
+            detail.append("文件缓存:已关闭")
 
         # 核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
-        core = [r_fm, r_sb] + ([r_ws] if aggressive else [])
-        if all(rc != 0 for rc in core):
+        if core and all(rc != 0 for rc in core):
             why = ("特权启用失败: " + ", ".join(failed_privs)) if failed_privs else "特权未启用或权限不足"
             log(f"{reason}清理失败 | {why} | {', '.join(detail)}")
             return {"ok": False, "msg": f"清理失败（{why}）"}
@@ -92,6 +117,16 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             "level": lvl,
             "detail": ", ".join(detail),
         }
+        # 累计统计（对标 Mem Reduct）：只统计真正成功的清理，随配置持久化
+        try:
+            st = cfg.get("stats") or {}
+            st["count"] = int(st.get("count", 0)) + 1
+            st["freed"] = int(st.get("freed", 0)) + max(freed, 0)
+            cfg["stats"] = st
+            save_config(cfg)
+            result["stats"] = dict(st)
+        except Exception:
+            pass
         log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "
             f"(释放 {gb(max(freed, 0))}) | 提交 {before['commit_pct']:.0f}% -> {after['commit_pct']:.0f}% | {result['detail']}")
         return result

@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 
-__version__ = "1.3.12"
+__version__ = "1.4.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -38,9 +38,26 @@ DEFAULT_CONFIG = {
     "clean_level": "conservative",
     "user_blacklist": [],    # 额外跳过清空工作集的进程名，如 ["chrome", "code.exe"]（不区分大小写）
     "warn_margin": 15,       # 距阈值还差多少个百分点时先弹预警(0=关闭预警)
+    # ---- 清理触发方式（对标 Mem Reduct / WinMemoryCleaner）----
+    "min_avail_mb": 0,       # 可用物理内存低于该值(MB)也触发清理；0=关闭
+    "scheduled_minutes": 0,  # 每隔 N 分钟主动清理一次（不看内存占用）；0=关闭
+    "clean_on_start": False, # 启动后先清理一次
+    # ---- 清理区域开关（对标 WinMemoryCleaner 的勾选项）----
+    "clean_areas": {
+        "standby": True,              # 清理 standby 列表
+        "low_priority_standby": True, # 优先清理 standby 中的低优先级部分（更温和）
+        "modified": True,             # 刷写 modified page 列表
+        "file_cache": True,           # 清空系统文件缓存工作集
+        "working_sets": True,         # 清空系统工作集（仅激进档生效）
+    },
+    # ---- 累计统计（由 do_clean 维护并持久化）----
+    "stats": {"count": 0, "freed": 0},
 }
 
 CLEAN_LEVELS = ("conservative", "aggressive")
+
+# 清理区域开关的合法键（菜单与配置校验共用）
+CLEAN_AREA_KEYS = ("standby", "low_priority_standby", "modified", "file_cache", "working_sets")
 
 # 不对其做 EmptyWorkingSet 的进程，清空这些进程的工作集会导致系统不稳定或界面闪烁
 CLEAN_BLACKLIST = {
@@ -95,9 +112,26 @@ def normalize_config(raw) -> dict:
     cfg["debounce_sec"] = _clamp_int(cfg.get("debounce_sec"), 0, 3600, DEFAULT_CONFIG["debounce_sec"])
     cfg["warn_margin"] = _clamp_int(cfg.get("warn_margin"), 0, 50, DEFAULT_CONFIG["warn_margin"])
     cfg["auto_clean"] = bool(cfg.get("auto_clean", True))
+    cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
     cfg["user_blacklist"] = sorted(_blacklist_stems(cfg.get("user_blacklist")))
+    # 清理触发方式
+    cfg["min_avail_mb"] = _clamp_int(cfg.get("min_avail_mb"), 0, 10 ** 7, 0)
+    cfg["scheduled_minutes"] = _clamp_int(cfg.get("scheduled_minutes"), 0, 24 * 60, 0)
+    # 清理区域开关：只接受已知键的布尔值，缺失的沿用默认
+    raw_areas = cfg.get("clean_areas")
+    raw_areas = raw_areas if isinstance(raw_areas, dict) else {}
+    cfg["clean_areas"] = {
+        k: bool(raw_areas.get(k, DEFAULT_CONFIG["clean_areas"][k])) for k in CLEAN_AREA_KEYS
+    }
+    # 累计统计：非负整数
+    raw_stats = cfg.get("stats")
+    raw_stats = raw_stats if isinstance(raw_stats, dict) else {}
+    cfg["stats"] = {
+        "count": _clamp_int(raw_stats.get("count"), 0, 10 ** 9, 0),
+        "freed": _clamp_int(raw_stats.get("freed"), 0, 10 ** 18, 0),
+    }
     return cfg
 
 

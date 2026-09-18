@@ -16,6 +16,7 @@ from .config import CLEAN_BLACKLIST_STEMS, _blacklist_stems, _norm_proc_name
 from .winapi import (
     MemoryEmptyWorkingSets,
     MemoryFlushModifiedList,
+    MemoryPurgeLowPriorityStandbyList,
     MemoryPurgeStandbyList,
     clear_file_cache,
     kernel32,
@@ -37,6 +38,15 @@ def flush_modified_list() -> int:
 def purge_standby_list() -> int:
     """清理 standby list（MemoryPurgeStandbyList），返回 NTSTATUS。"""
     return _purge_list(MemoryPurgeStandbyList)
+
+
+def purge_low_priority_standby() -> int:
+    """只清理 standby list 中的低优先级部分（MemoryPurgeLowPriorityStandbyList）。
+
+    对标 ISLC/WinMemoryCleaner 的「低优先级 standby」清理：影响面比清全部 standby 更小，
+    适合作为更温和的第一步。系统不支持该命令时会返回非 0，由上层如实展示。
+    """
+    return _purge_list(MemoryPurgeLowPriorityStandbyList)
 
 
 def clear_system_file_cache() -> bool:

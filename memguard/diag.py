@@ -12,7 +12,7 @@ from datetime import datetime
 
 from .autostart import autostart_enabled
 from .clean import top_processes_list
-from .config import BASE_DIR, CONFIG_PATH, LOG_PATH, __version__, gb
+from .config import BASE_DIR, CONFIG_PATH, LOG_PATH, __version__, gb, load_config
 from .privileges import CLEAN_PRIVILEGES
 from .winapi import get_mem, is_admin, privilege_state
 
@@ -23,12 +23,17 @@ def export_diagnostics() -> str:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_path = os.path.join(BASE_DIR, f"diagnostics_{ts}.zip")
         s = get_mem()
+        cfg = load_config()
+        st = cfg.get("stats") or {}
+        areas = cfg.get("clean_areas") or {}
         info = [
             f"version={__version__}",
             f"admin={is_admin()}",
             f"物理 {s['phys_pct']:.1f}%  ({gb(s['used_phys'])} / {gb(s['total_phys'])})",
             f"提交 {s['commit_pct']:.1f}%  (可用 {gb(s['avail_commit'])} / {gb(s['total_commit'])})",
             f"autostart={autostart_enabled(use_cache=False)}",
+            f"stats: 清理 {int(st.get('count', 0))} 次 / 累计释放 {gb(int(st.get('freed', 0)))}",
+            "clean_areas: " + " ".join(f"{k}={'on' if v else 'off'}" for k, v in areas.items()),
         ]
         for p in CLEAN_PRIVILEGES:
             info.append(f"priv {p}={privilege_state(p)}")

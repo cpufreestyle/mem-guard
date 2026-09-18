@@ -36,6 +36,7 @@ class Guard:
         self._warned = False         # 是否已就本次接近阈值发过预警（避免反复弹）
         self.advice_count = 0        # 后台低频刷新的「优化建议条数」，供菜单标签零成本读取
         self._advice_tick = 0
+        self.last_scheduled = time.time()  # 定时清理计时起点（启动后先等一个完整周期）
         self.stop = threading.Event()
         self.icon: pystray.Icon | None = None
 
@@ -43,6 +44,26 @@ class Guard:
 
     def refresh(self) -> None:
         self.state = get_mem()
+
+    def _auto_clean(self, now: float, reason: str, s: dict) -> None:
+        """执行一次自动清理并弹通知（各触发源共用；reason 用于日志与通知标题）。"""
+        self.last_clean = now
+        self.over_since = None
+        r = do_clean(reason)
+        if r["ok"] and self.icon:
+            top3 = top_processes_list(3)
+            top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
+            lvl_txt = "激进" if r.get("level") == "aggressive" else "保守"
+            title = "MemGuard 自动清理" if reason == "自动" else f"MemGuard {reason}清理"
+            try:
+                self.icon.notify(
+                    f"物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
+                    f"已释放 {gb(max(r['freed'], 0))}（{lvl_txt}档）\n"
+                    f"当前占用 Top3:\n{top_txt}",
+                    title,
+                )
+            except Exception:
+                pass
 
     def maybe_reload_config(self) -> None:
         """检查配置文件 mtime，变化则热重载（无需重启托盘）。"""
@@ -58,6 +79,14 @@ class Guard:
 
     def monitor(self) -> None:
         self.maybe_reload_config()
+        # 启动时清理（对标 Mem Reduct）：放监控线程内做，不阻塞托盘图标出现
+        if self.cfg.get("clean_on_start"):
+            try:
+                log("启动时清理：按配置执行一次")
+                do_clean("启动")
+                self.last_clean = time.time()
+            except Exception as e:
+                log(f"启动清理异常: {e!r}")
         while not self.stop.is_set():
             try:
                 self.maybe_reload_config()
@@ -102,6 +131,7 @@ class Guard:
                                 pass
                 else:
                     self._warned = False
+                # 触发源 1：超阈值（百分比，带防抖 + 冷却 + 自动清理开关）
                 if over:
                     if self.over_since is None:
                         self.over_since = now
@@ -109,24 +139,20 @@ class Guard:
                     due = (self.cfg["auto_clean"] and debounced
                            and now - self.last_clean > self.cfg["cooldown"])
                     if due:
-                        self.last_clean = now
-                        self.over_since = None
-                        r = do_clean("自动")
-                        if r["ok"] and self.icon:
-                            top3 = top_processes_list(3)
-                            top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
-                            lvl_txt = "激进" if r.get("level") == "aggressive" else "保守"
-                            try:
-                                self.icon.notify(
-                                    f"物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}% 超阈值\n"
-                                    f"已释放 {gb(max(r['freed'], 0))}（{lvl_txt}档）\n"
-                                    f"当前占用 Top3:\n{top_txt}",
-                                    "MemGuard 自动清理",
-                                )
-                            except Exception:
-                                pass
+                        self._auto_clean(now, "自动", s)
                 else:
                     self.over_since = None
+                # 触发源 2：可用物理内存低于绝对阈值（对标 Mem Reduct 的低内存触发器）
+                min_avail = self.cfg.get("min_avail_mb", 0)
+                if (min_avail and s["avail_phys"] < min_avail * 1024 * 1024
+                        and self.cfg["auto_clean"]
+                        and now - self.last_clean > self.cfg["cooldown"]):
+                    self._auto_clean(now, "低内存", s)
+                # 触发源 3：定时清理（不看内存占用，按设定间隔触发）
+                sched = self.cfg.get("scheduled_minutes", 0)
+                if sched and now - self.last_scheduled >= sched * 60:
+                    self.last_scheduled = now
+                    self._auto_clean(now, "定时", s)
             except Exception as e:
                 log(f"监控异常: {e}")
             self.stop.wait(self.cfg["interval"])
