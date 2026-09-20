@@ -90,6 +90,26 @@ def test_format_advice_empty():
     assert "未发现" in advisor.format_advice([])
 
 
+def test_analyze_uses_injected_top_snapshot(monkeypatch):
+    """传入 top 快照时不得再自行扫描进程（监控线程要复用同一份采样）。"""
+    def _boom(n=15):
+        raise AssertionError("注入 top 之后不应再扫描进程")
+
+    monkeypatch.setattr(advisor, "top_processes_list", _boom)
+    items = advisor.analyze(normalize_config({}), _mem(), [("chrome.exe", 6 * GB, 1)])
+    assert any("高内存占用进程" in i["title"] for i in items)
+
+
+def test_analyze_scans_processes_only_when_top_missing(monkeypatch):
+    """未注入 top 时才现场扫描，保持菜单/窗口等单次调用方的实时性。"""
+    calls = []
+    monkeypatch.setattr(advisor, "top_processes_list",
+                        lambda n=15: calls.append(n) or [("chrome.exe", 6 * GB, 1)])
+    items = advisor.analyze(normalize_config({}), _mem())
+    assert calls == [15]
+    assert any("高内存占用进程" in i["title"] for i in items)
+
+
 def test_format_advice_nonempty():
     text = advisor.format_advice([{"level": advisor.LEVEL_TIP, "title": "T", "text": "X"}])
     assert "[建议] T" in text

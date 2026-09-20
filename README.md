@@ -136,6 +136,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 | `clean_level` | 清理力度：`conservative`(保守，只清缓存) / `aggressive`(激进，额外清空进程工作集) | conservative |
 | `user_blacklist` | 额外跳过工作集清空的进程名，如 `["chrome", "code.exe"]`（不区分大小写、可带可不带 `.exe`） | [] |
 | `warn_margin` | 距阈值还差多少个百分点时先弹预警，0=关闭预警 | 15 |
+| `advice_refresh_sec` | 后台刷新「优化建议条数」的最小间隔(秒)，限 15–600；越低越跟手但越费 CPU | 60 |
 | `min_avail_mb` | 可用物理内存低于该值(MB)也触发清理，0=关闭 | 0 |
 | `scheduled_minutes` | 每隔 N 分钟主动清理一次（不看内存占用），0=关闭 | 0 |
 | `clean_on_start` | 启动后先清理一次 | false |
@@ -186,7 +187,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 
 ## 版本
 
-当前版本 `1.3.12`。
+当前版本 `1.4.1`。
 
 ## 源码结构
 
@@ -195,7 +196,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 | 文件 | 职责 |
 |---|---|
 | `memguard/config.py` | 版本/路径、默认配置、配置校验与钳制、落盘日志（`log`） |
-| `memguard/winapi.py` | ctypes 绑定：内存读取（`get_mem`）、特权（启用/禁用/查询）、单实例互斥体、底层清理调用（`_purge_list` / `clear_file_cache`） |
+| `memguard/winapi.py` | ctypes 绑定：内存读取（`get_mem`）、进程快路径枚举（`process_working_sets`，Toolhelp32 + `GetProcessMemoryInfo`）、特权（启用/禁用/查询）、单实例互斥体、底层清理调用（`_purge_list` / `clear_file_cache`） |
 | `memguard/privileges.py` | 清理所需高危特权的启用与「用完即恢复」（`clean_privileges` 上下文管理器） |
 | `memguard/actions.py` | 单步清理动作封装：工作集 / 修改页 / standby / 文件缓存，返回原始 NTSTATUS（`purge_working_sets` 等） |
 | `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets`）、Top 进程统计 |

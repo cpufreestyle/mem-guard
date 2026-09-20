@@ -18,29 +18,52 @@ from PIL import Image, ImageDraw, ImageFont
 from .advisor import analyze, format_advice
 from .clean import top_processes
 from .config import gb
-from .winapi import get_mem, user32
+from .winapi import SM_CXSMICON, get_mem, user32
 
 # ---------------------------------------------------------------- 托盘图标
 
 
-_ICON_SIZE = 64
-_ICON_FONT_PX = 26
+# 绘制边长取系统托盘指标（Windows 已按当前 DPI 折算），并夹到可读区间：
+# 小于 32px 两位数字糊成一团，大于 64px 只是白占内存。
+_ICON_SIZE_MIN = 32
+_ICON_SIZE_MAX = 64
+_ICON_SIZE_FALLBACK = 32
+_ICON_FONT_RATIO = 0.4
 _FONT_CACHE: dict = {}
 # 图标内容只取决于「显示文本 + 颜色档」，故按该组合缓存；分桶后组合数很少，
 # 无需每轮刷新都重新绘制并重新加载字体文件。
 _ICON_CACHE: dict = {}
-_ICON_CACHE_MAX = 512
+_ICON_CACHE_MAX = 128
+_icon_size_cache: int | None = None
+
+
+def _tray_px() -> int:
+    """系统托盘图标的像素边长；读不到返回 0。"""
+    try:
+        return int(user32.GetSystemMetrics(SM_CXSMICON))
+    except Exception:
+        return 0
+
+
+def _icon_size() -> int:
+    """绘制边长：托盘指标夹到 [MIN, MAX]，进程内只实测一次。"""
+    global _icon_size_cache
+    if _icon_size_cache is None:
+        px = _tray_px() or _ICON_SIZE_FALLBACK
+        _icon_size_cache = max(_ICON_SIZE_MIN, min(_ICON_SIZE_MAX, px))
+    return _icon_size_cache
 
 
 def _icon_font():
-    """加载图标字体（只读一次，避免每帧 truetype 反复读字体文件）。"""
-    font = _FONT_CACHE.get(_ICON_FONT_PX)
+    """按绘制边长取图标字体（同尺寸只加载一次，避免每帧重读字体文件）。"""
+    px = max(9, round(_icon_size() * _ICON_FONT_RATIO))
+    font = _FONT_CACHE.get(px)
     if font is None:
         try:
-            font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", _ICON_FONT_PX)
+            font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", px)
         except Exception:
             font = ImageFont.load_default()
-        _FONT_CACHE[_ICON_FONT_PX] = font
+        _FONT_CACHE[px] = font
     return font
 
 
@@ -62,14 +85,14 @@ def make_icon(pct: float, threshold: float = 85.0) -> Image.Image:
     if cached is not None:
         return cached
     img = _render_icon(text, key[1])
-    if len(_ICON_CACHE) >= _ICON_CACHE_MAX:
-        _ICON_CACHE.clear()
+    while len(_ICON_CACHE) >= _ICON_CACHE_MAX:
+        _ICON_CACHE.pop(next(iter(_ICON_CACHE)))   # dict 保持插入顺序，弹掉最旧的键
     _ICON_CACHE[key] = img
     return img
 
 
 def _render_icon(text: str, color: tuple) -> Image.Image:
-    size = _ICON_SIZE
+    size = _icon_size()
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse([2, 2, size - 3, size - 3], fill=color)

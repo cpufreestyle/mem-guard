@@ -24,7 +24,10 @@ from .actions import (
 )
 from .config import CLEAN_LEVELS, gb, load_config, log, save_config
 from .privileges import clean_privileges
-from .winapi import get_mem, is_admin
+from .winapi import get_mem, is_admin, process_working_sets
+
+# 快路径句柄被拒的进程数超过该上限就不再用 psutil 补齐（见 top_processes_list）
+_FILL_MAX = 24
 
 
 def _status(rc: int) -> str:
@@ -133,7 +136,35 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
 
 
 def top_processes_list(n: int = 10) -> list:
-    """返回物理内存占用最高的 n 个进程 [(name, rss_bytes, pid), ...]。"""
+    """返回物理内存占用最高的 n 个进程 [(name, rss_bytes, pid), ...]。
+
+    主用 Toolhelp32 快路径（一次全量约 16ms）；其中句柄被拒绝的受保护进程
+    （工作集为 0）只对这几个 PID 用 psutil 定点补齐，整体失败才回退到 psutil
+    全量扫描（约 1s，仅兜底）。
+    """
+    try:
+        rows = process_working_sets()
+    except Exception:
+        return _top_processes_via_psutil(n)
+
+    by_pid = {pid: [name, rss] for name, rss, pid in rows}
+    denied = [p for p, (_, rss) in by_pid.items() if not rss]
+    # 管理员下句柄被拒的通常只有个位数（PPL 保护进程），补齐它们才划算；
+    # 非管理员下别人会话的进程会成片被拒，逐个 psutil 补齐会把整体从十几毫秒拖回秒级，
+    # 这时宁可少几行也不补。
+    if len(denied) <= _FILL_MAX:
+        for pid in denied:
+            try:
+                by_pid[pid][1] = psutil.Process(pid).memory_info().rss
+            except Exception:
+                continue    # 进程已退出或完全不可读，跳过这一行
+    out = [(nm, rss, pid) for pid, (nm, rss) in by_pid.items() if rss]
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out[:n]
+
+
+def _top_processes_via_psutil(n: int = 10) -> list:
+    """psutil 全量扫描：快路径不可用时的兜底，口径与历史实现一致。"""
     rows = []
     for p in psutil.process_iter(["name", "memory_info"]):
         try:

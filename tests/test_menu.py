@@ -13,4 +13,4 @@ def test_build_menu_returns_menu():
 def test_guard_exposes_advice_count():
     guard = Guard()
     assert isinstance(guard.advice_count, int)
-    assert isinstance(guard._advice_tick, int)
+    assert isinstance(guard._advice_at, float)

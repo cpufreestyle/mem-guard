@@ -25,11 +25,11 @@ LEVEL_INFO = "info"
 _LEVEL_ORDER = {LEVEL_WARN: 0, LEVEL_TIP: 1, LEVEL_INFO: 2}
 
 
-def analyze(cfg: dict, mem: dict | None = None) -> list:
+def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list:
     """返回建议列表，每条为 {"level", "title", "text"}。
 
-    mem 可外部传入（便于测试或复用实时采样）；省略时现场调用 get_mem()。
-    任何单条建议计算失败都不应阻断其它建议，故逐段 try 容错。
+    mem / top 可外部传入（便于测试，或让监控线程复用同一份采样，避免每轮刷新都扫全进程）；
+    省略时现场取值。任何单条建议计算失败都不应阻断其它建议，故逐段 try 容错。
     """
     items: list = []
     try:
@@ -113,10 +113,11 @@ def analyze(cfg: dict, mem: dict | None = None) -> list:
         })
 
     # ---- 4. 进程 / 白名单 ----
-    try:
-        top = top_processes_list(15)
-    except Exception:
-        top = []
+    if top is None:     # 调用方没给采样才现场扫描（要实时数据的场景才付这个代价）
+        try:
+            top = top_processes_list(15)
+        except Exception:
+            top = []
     if top:
         hi = max(1.5 * 1024 ** 3, s["total_phys"] * 0.12)
         big = [(n, r) for n, r, _ in top if r > hi]

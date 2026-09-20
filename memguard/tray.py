@@ -35,7 +35,8 @@ class Guard:
         self._cfg_mtime = None       # 配置热重载：记录上次 mtime
         self._warned = False         # 是否已就本次接近阈值发过预警（避免反复弹）
         self.advice_count = 0        # 后台低频刷新的「优化建议条数」，供菜单标签零成本读取
-        self._advice_tick = 0
+        self._advice_at = 0.0        # 上次刷新建议的时间戳（按 advice_refresh_sec 节流）
+        self._icon_img = None        # 当前托盘图标正在显示的图像对象，用于跳过无变化的重绘
         self.last_scheduled = time.time()  # 定时清理计时起点（启动后先等一个完整周期）
         self.stop = threading.Event()
         self.icon: pystray.Icon | None = None
@@ -77,6 +78,43 @@ class Guard:
         except Exception as e:
             log(f"配置重载检查失败: {e}")
 
+    def _refresh_advice(self, now: float) -> None:
+        """按时间节流刷新「优化建议条数」：一次进程扫描同时喂给 analyze。
+
+        菜单标签只读 advice_count，所以这里可以放心低频；扫描失败保留上次的值，
+        且时间戳已前移，不会在监控线程里对失败项发起热重试。
+        """
+        if now - self._advice_at < self.cfg.get("advice_refresh_sec", 60):
+            return
+        self._advice_at = now
+        try:
+            self.advice_count = len(analyze(self.cfg, self.state, top_processes_list(15)))
+        except Exception:
+            pass
+
+    def _refresh_icon(self) -> None:
+        """刷新托盘显示；图标内容没变就不赋值给 pystray。
+
+        pystray 的 icon 赋值没有内部判等：每次都会 DestroyIcon + 重建 HICON +
+        发一次 NIM_MODIFY，而 make_icon 对相同（文本, 颜色）返回同一对象，判身份即可。
+        鼠标提示每次都赋值：pystray 的 title setter 自己判等，且可用内存数值确实会变。
+        """
+        icon = self.icon
+        if not icon:
+            return
+        s = self.state
+        try:
+            img = make_icon(s["phys_pct"], self.cfg["phys_threshold"])
+            if img is not self._icon_img:
+                self._icon_img = img
+                icon.icon = img
+            icon.title = (
+                f"MemGuard  物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
+                f"可用物理 {gb(s['avail_phys'])}    可用提交 {gb(s['avail_commit'])}"
+            )
+        except Exception:
+            pass
+
     def monitor(self) -> None:
         self.maybe_reload_config()
         # 启动时清理（对标 Mem Reduct）：放监控线程内做，不阻塞托盘图标出现
@@ -93,25 +131,9 @@ class Guard:
                 self.refresh()
                 s = self.state
                 self.history.append((time.time(), s["phys_pct"], s["commit_pct"]))
-                # 优化建议条数在监控线程后台低频刷新：菜单标签只读缓存值，
-                # 避免每次展开菜单都遍历全进程（原实现的明显卡顿来源）。
-                self._advice_tick += 1
-                if self._advice_tick % 3 == 1:
-                    try:
-                        self.advice_count = len(analyze(self.cfg))
-                    except Exception:
-                        pass
-                if self.icon:
-                    # 托盘重建/退出瞬间 icon 可能短暂失效，单独容错避免整轮监控被中断
-                    try:
-                        self.icon.icon = make_icon(s["phys_pct"], self.cfg["phys_threshold"])
-                        self.icon.title = (
-                            f"MemGuard  物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
-                            f"可用物理 {gb(s['avail_phys'])}    可用提交 {gb(s['avail_commit'])}"
-                        )
-                    except Exception:
-                        pass
                 now = time.time()
+                self._refresh_advice(now)
+                self._refresh_icon()
                 over = (s["phys_pct"] >= self.cfg["phys_threshold"]
                         or s["commit_pct"] >= self.cfg["commit_threshold"])
                 # -- 接近阈值预警：只提醒不清理，让人有提前手动干预的机会 --

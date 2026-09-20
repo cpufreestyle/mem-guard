@@ -15,8 +15,16 @@ from memguard.config import (
 def test_default_config_keys_present():
     for key in ("phys_threshold", "commit_threshold", "interval", "cooldown",
                 "auto_clean", "debounce_sec", "clean_level", "user_blacklist",
-                "warn_margin"):
+                "warn_margin", "advice_refresh_sec"):
         assert key in DEFAULT_CONFIG
+
+
+def test_advice_refresh_sec_default_and_clamp():
+    """建议条数刷新间隔：默认 60s，钳到 [15, 600]，非法值回落默认。"""
+    assert normalize_config({})["advice_refresh_sec"] == 60
+    assert normalize_config({"advice_refresh_sec": 1})["advice_refresh_sec"] == 15
+    assert normalize_config({"advice_refresh_sec": 99999})["advice_refresh_sec"] == 600
+    assert normalize_config({"advice_refresh_sec": "abc"})["advice_refresh_sec"] == 60
 
 
 @pytest.mark.parametrize("raw,expected", [

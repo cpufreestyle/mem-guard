@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
     "clean_level": "conservative",
     "user_blacklist": [],    # 额外跳过清空工作集的进程名，如 ["chrome", "code.exe"]（不区分大小写）
     "warn_margin": 15,       # 距阈值还差多少个百分点时先弹预警(0=关闭预警)
+    "advice_refresh_sec": 60,  # 后台刷新「优化建议条数」的最小间隔(秒)，越低越跟手但越费 CPU
     # ---- 清理触发方式（对标 Mem Reduct / WinMemoryCleaner）----
     "min_avail_mb": 0,       # 可用物理内存低于该值(MB)也触发清理；0=关闭
     "scheduled_minutes": 0,  # 每隔 N 分钟主动清理一次（不看内存占用）；0=关闭
@@ -111,6 +112,8 @@ def normalize_config(raw) -> dict:
     cfg["cooldown"] = _clamp_int(cfg.get("cooldown"), 0, 86400, DEFAULT_CONFIG["cooldown"])
     cfg["debounce_sec"] = _clamp_int(cfg.get("debounce_sec"), 0, 3600, DEFAULT_CONFIG["debounce_sec"])
     cfg["warn_margin"] = _clamp_int(cfg.get("warn_margin"), 0, 50, DEFAULT_CONFIG["warn_margin"])
+    cfg["advice_refresh_sec"] = _clamp_int(
+        cfg.get("advice_refresh_sec"), 15, 600, DEFAULT_CONFIG["advice_refresh_sec"])
     cfg["auto_clean"] = bool(cfg.get("auto_clean", True))
     cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
