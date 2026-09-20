@@ -7,7 +7,7 @@
 Windows 托盘小工具：实时监控**物理内存**与**提交内存(commit)**，超阈值自动清理并提醒，专治「明明还剩几 G 却一直弹『内存不足』」——根因是 commit 耗尽（提交上限 = 物理 + 页面文件），而非物理内存。
 
 - 仓库：`cpufreestyle/mem-guard`（本地 `D:\ai share\repo\mem-guard`，main 分支）
-- 最新已发布 tag：`v1.4.0`（CI 自动出 Release，附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）
+- 最新已发布 tag：`v1.4.1`（CI 自动出 Release，附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）
 - 语言/平台：Python 3.8+ / Windows only（清理调用 `NtSetSystemInformation`，无法跨平台）
 
 ## 2. 快速上手
@@ -97,7 +97,7 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 
 ### ⚠ 发布相关雷区（已踩过，必看）
 
-- **确认发布状态别用 GitHub API**：匿名 API 限流 60 次/小时，会误判成「404/失败」。改用 `releases.atom` 订阅源或 Releases 网页确认最稳。
+- **确认发布状态别用 GitHub API**：匿名 API 限流 60 次/小时，会误判成「404/失败」。改用 `releases.atom` 订阅源或 Releases 网页确认最稳。注意 atom 也可能因本机到 `github.com:443` 的连接超时而**假阴性**（`curl -s` 会把错误吞掉），此时用 `api.github.com` 的 `releases/latest` 与 `actions/runs` 交叉确认，别据单次失败判定发布失败。
 - **CI 中文乱码**：GitHub Windows runner 控制台非 UTF-8，Python 打中文会 `UnicodeEncodeError` 致自检失败。CI 已设 `PYTHONUTF8: 1` + `PYTHONIOENCODING: utf-8`，`cli.py` 入口也有 `sys.stdout.reconfigure(encoding='utf-8', errors='replace')` 兜底——新增打印中文处别破坏这个。
 - **GUI 子系统 exe 退出码**：PowerShell 7（CI runner 默认）下 `& exe; $LASTEXITCODE` 不可靠，必须用 `Start-Process -Wait -PassThru` 取 `.ExitCode`（见 `release.yml` / `build.ps1`）。
 - **runner 偶发卡顿**：个别 tag 构建耗时可达 3 分钟（正常约 1 分钟），是排队变慢不是失败，等一会儿再确认。
@@ -121,7 +121,7 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 2. **~~补 pytest 单元测试~~（已完成 2026-09-18，v1.3.11）**：已加 `tests/`（51 项）与 `requirements-dev.txt`，CI 在打包前跑 `python -m pytest -q`；`clean`/`actions` 常量绑定回归、`ui` 取色 float 回归等均已覆盖。
 3. **~~安装器~~（已完成 2026-09-18，v1.3.12）**：采用 Inno Setup（`installer/mem_guard.iss`，**当前用户安装** `{localappdata}\Programs\MemGuard`，安装免 UAC，配置/日志可正常写入）；CI 用 `choco install innosetup` 编译、版本号从 `config.py` 注入，Release 同时附带 `MemGuard-Setup-x.y.z.exe`。注意：脚本已探测 `ISCC.exe` 常见路径，找不到会**告警并跳过**而非让发布失败。
 4. **`clean.py` 的 `do_clean` 若进一步拆**：可考虑把结果统计与进程统计再独立，但收益已很低。
-5. **v1.4.1 资源占用优化已完成，尚未发布**：见 §4「自身资源占用」。版本号与 README「当前版本」已升到 1.4.1，**尚未 commit / tag**；接手时按 §5 的三步发版即可。遗留可选项：`advisor` 里「高内存占用进程」与菜单 Top10 仍各自扫描（都是人触发的低频路径，不影响常驻开销）；Pillow 仍在依赖里（`make_icon` 用它绘图，去掉要自写位图渲染，收益不抵风险）。
+5. **~~v1.4.1 资源占用优化~~（已完成并发布 2026-09-20）**：见 §4「自身资源占用」。commit `e1d54f7`、tag `v1.4.1` 已推送，CI run #15 success，Release 附件 `mem_guard.exe` + `MemGuard-Setup-1.4.1.exe`。180 秒空载实测累计 CPU 3.547s → 0.047s。遗留可选项：`advisor` 里「高内存占用进程」与菜单 Top10 仍各自扫描（都是人触发的低频路径，不影响常驻开销）；Pillow 仍在依赖里（`make_icon` 用它绘图，去掉要自写位图渲染，收益不抵风险）。
 
 ## 9. 其他踩坑索引（详见 `.codebuddy/memory` 的 `MEMORY.md`）
 
@@ -130,4 +130,4 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 - 后台化 + 输出重定向到工作区文件 = **撑爆磁盘风险**（实测 33GB 直到 C 盘 0 字节）：构建日志写 `$env:TEMP` 并加 `try/catch` 兜底。
 
 ---
-最后更新：2026-09-20（对应 v1.4.1：自身资源占用优化——进程扫描快路径、后台建议按时间节流并复用快照、托盘图标按需重绘且按系统指标尺寸绘制；已发布版本仍为 v1.4.0）
+最后更新：2026-09-20（对应 v1.4.1：自身资源占用优化——进程扫描快路径、后台建议按时间节流并复用快照、托盘图标按需重绘且按系统指标尺寸绘制；180 秒空载 CPU 由单核 1.97% 降到 0.026%，已发布）
