@@ -1,9 +1,20 @@
 # -*- coding: utf-8 -*-
-"""ui：托盘图标分档取色、绘制尺寸与缓存（不弹任何窗口）。"""
+"""ui：托盘图标分档取色/绘制尺寸/缓存、概览与表格纯函数、无 tkinter 回退（不弹窗口）。
+
+回退用例用 sys.modules["tkinter"]=None 触发 ImportError，并 monkeypatch message_box
+记录调用，绝不弹出真实窗口。
+"""
+import sys
+import threading
+import time
+
 import pytest
 
 from memguard import ui
-from memguard.ui import _icon_color, make_icon
+from memguard.ui import (_fmt_bytes, _group_rows, _icon_color, _overview_text,
+                          _table_rows, _top_grouped, make_icon,
+                          show_advice_window, show_overview_window, show_top_window,
+                          show_trend_window)
 
 GREEN = (46, 160, 67, 255)
 YELLOW = (214, 158, 46, 255)
@@ -88,3 +99,184 @@ def test_icon_color_uses_raw_float():
 
 def test_threshold_affects_cache_key():
     assert make_icon(80, 85) is not make_icon(80, 92)
+
+
+def test_icon_text_is_drawn_and_centered(clean_cache):
+    """回归：数字必须真的画在图内且大致居中。
+
+    超采样版本曾把 bbox 又乘了一次倍数，文字被画到画布外，图标只剩一个色块——
+    这种"看起来还在"的问题只能靠像素断言兜住。
+    """
+    img = make_icon(62, 85)
+    px = img.load()
+    # 抗锯齿后边缘是混色，只有字形核心接近纯白；用容差而不是严格相等
+    ink = [(x, y) for y in range(img.size[1]) for x in range(img.size[0])
+           if px[x, y][0] > 200 and px[x, y][1] > 200 and px[x, y][2] > 200 and px[x, y][3] > 200]
+    assert ink, "图标里应该画出白色数字"
+    xs, ys = [p[0] for p in ink], [p[1] for p in ink]
+    size = img.size[0]
+    assert abs((min(xs) + max(xs)) / 2 - size / 2) <= 2.5, "数字应在水平居中位置"
+    # 字形 bbox 含上下留白，且绘制时有 -2px 的光学居中修正，故垂直容差放宽
+    assert abs((min(ys) + max(ys)) / 2 - size / 2) <= 4.0, "数字应在垂直居中附近"
+
+
+def test_icon_edges_are_anti_aliased(clean_cache):
+    """超采样再缩回，边缘应出现半透明过渡，而不是 0/255 硬切。"""
+    px = make_icon(50, 85).load()
+    size = 32
+    alphas = [px[x, 0][3] for x in range(size)] + [px[0, y][3] for y in range(size)]
+    assert any(0 < a < 255 for a in alphas), "边缘应有抗锯齿过渡像素"
+# -*- coding: utf-8 -*-
+GB = 1024 ** 3
+
+
+def _stub_sys(monkeypatch):
+    """把内存/进程查询替换成确定值，让纯函数与回退测试不依赖真实系统。"""
+    monkeypatch.setattr(ui, "get_mem", lambda: {
+        "phys_pct": 55.0, "commit_pct": 60.0, "used_phys": 8 * GB, "total_phys": 16 * GB,
+        "avail_phys": 8 * GB, "used_commit": 20 * GB, "total_commit": 32 * GB,
+        "avail_commit": 12 * GB,
+    })
+    monkeypatch.setattr(ui, "top_processes_list",
+                        lambda n: [("chrome.exe", 3 * GB, 1234)][:n])
+    monkeypatch.setattr(ui, "top_processes", lambda n: "  1. chrome.exe 3.00GB")
+
+
+def _capture_box(monkeypatch):
+    """拦截 message_box，捕获 (title, text) 并用 Event 通知，绝不弹真实窗口。"""
+    seen = {}
+
+    def fake_box(title, text):
+        seen["title"] = title
+        seen["text"] = text
+        seen["ev"].set()
+
+    seen["ev"] = threading.Event()
+    monkeypatch.setattr(ui, "message_box", fake_box)
+    return seen
+
+
+def _wait(predicate, timeout=3.0):
+    """轮询等待 predicate() 为真（回退发生在 daemon 线程里，等待其收尾再断言）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+# ------------------------------------------------------- 概览 / 表格纯函数
+
+
+def test_group_rows_merges_same_name_processes():
+    """同名多开合并成一行：内存求和、实例计数、PID 取最大。"""
+    rows = [("a.exe", 2 * GB, 10), ("b.exe", 1 * GB, 20), ("a.exe", 3 * GB, 5)]
+    assert _group_rows(rows) == [("a.exe", 5 * GB, 2, 10), ("b.exe", 1 * GB, 1, 20)]
+
+
+def test_group_rows_sorted_by_total_desc():
+    """合并后按合计内存降序，与各进程独立占用无关。"""
+    rows = [("small.exe", 1 * GB, 1), ("chrome.exe", 1 * GB, 2),
+            ("chrome.exe", 1 * GB, 3), ("mid.exe", 3 * GB, 4)]
+    out = _group_rows(rows)
+    assert [name for name, *_ in out] == ["mid.exe", "chrome.exe", "small.exe"]
+
+
+def test_fmt_bytes_units():
+    """表格口径：不足 1GB 用整数 MB，否则保留两位小数的 GB。"""
+    assert _fmt_bytes(512 * 1024 ** 2) == "512MB"
+    assert _fmt_bytes(0) == "0MB"
+    assert _fmt_bytes(2 * GB) == "2.00GB"
+    assert _fmt_bytes(1536 * 1024 ** 2) == "1.50GB"
+
+
+def test_table_rows_marks_multi_instance():
+    """多实例组名带 ×N 标记，单实例保持原名；积分比按合计内存算。"""
+    groups = _group_rows([("a.exe", 3 * GB, 10), ("a.exe", 2 * GB, 5), ("b.exe", 1 * GB, 20)])
+    rows = _table_rows(groups, 16 * GB)
+    assert rows[0] == ("a.exe ×2", "5.00GB", "31.2%", 10)
+    assert rows[1][0] == "b.exe"
+
+
+def test_table_rows_zero_total_shows_dash():
+    """总物理为 0 时占比显示 '-'，而不是 ZeroDivisionError。"""
+    rows = _table_rows([("a.exe", 1 * GB, 1, 1)], 0)
+    assert rows[0][2] == "-"
+
+
+def test_top_grouped_oversamples_before_merge(monkeypatch):
+    """先把 n*4 进程取回来再合并，避免同名多开把名额吃光后凑不满 N 组。"""
+    seen = {}
+    rows = [("chrome.exe", 4 * GB, 2), ("chrome.exe", 4 * GB, 5),
+            ("chrome.exe", 4 * GB, 9), ("big.exe", 9 * GB, 99)]
+
+    def fake_top(n):
+        seen["n"] = n
+        return sorted(rows, key=lambda r: r[1], reverse=True)[:n]
+
+    monkeypatch.setattr(ui, "top_processes_list", fake_top)
+    out = _top_grouped(2)
+    assert seen["n"] == max(2 * 4, 2 + 10) == 12, "为凑满 N 组先按超采样量取进程"
+    # 三实例 4GB 合并成 12GB，超过单进程 big.exe(9GB)，故合并后排第一
+    assert out[0] == ("chrome.exe", 12 * GB, 3, 9)
+    assert [name for name, *_ in out] == ["chrome.exe", "big.exe"]
+
+
+def test_overview_text_includes_summary_and_top(monkeypatch):
+    """无 tkinter 回退文案：头部两条内存概况 + Top 列表（可被测试稳定断言）。"""
+    _stub_sys(monkeypatch)
+    text = _overview_text()
+    assert "物理内存" in text and "提交内存" in text
+    assert "可用 物理" in text and "可用 提交" in text
+    assert "chrome.exe" in text
+
+
+# ------------------------------------------------ 无 tkinter 的回退（不弹窗）
+
+
+def test_overview_falls_back_to_messagebox_without_tkinter(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tkinter", None)
+    _stub_sys(monkeypatch)
+    box = _capture_box(monkeypatch)
+    assert ui._overview_window_open is False
+    show_overview_window({"clean": lambda: None})
+    assert _wait(box["ev"].is_set)
+    assert box["title"] == "MemGuard - 内存概览"
+    assert "物理内存" in box["text"] and "chrome.exe" in box["text"]
+    assert ui._overview_window_open is False
+
+
+def test_top_falls_back_to_messagebox_without_tkinter(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tkinter", None)
+    _stub_sys(monkeypatch)
+    box = _capture_box(monkeypatch)
+    show_top_window()
+    assert _wait(box["ev"].is_set)
+    assert box["title"] == "内存占用 Top10"
+    assert "chrome.exe" in box["text"]
+    assert ui._top_window_open is False
+
+
+def test_advice_falls_back_to_messagebox_without_tkinter(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tkinter", None)
+    monkeypatch.setattr(ui, "analyze",
+                        lambda cfg: [{"level": "tip", "title": "标题", "text": "正文"}])
+    box = _capture_box(monkeypatch)
+    show_advice_window({})
+    assert _wait(box["ev"].is_set)
+    assert box["title"] == "MemGuard - 优化建议"
+    assert "标题" in box["text"] and "正文" in box["text"]
+    assert ui._advice_window_open is False
+
+
+def test_trend_returns_silently_without_tkinter(monkeypatch):
+    """趋势没有可回退的文本形态，无 tkinter 时静默返回并复位开关（不弹窗）。"""
+    monkeypatch.setitem(sys.modules, "tkinter", None)
+    boxes = []
+    monkeypatch.setattr(ui, "message_box", lambda t, x: boxes.append(t))
+    assert ui._trend_window_open is False
+    show_trend_window(lambda: [])
+    # show_trend_window 先把开关置 True 再起 worker；import 失败由 worker 复位，需轮询等它
+    assert _wait(lambda: ui._trend_window_open is False), "无 tkinter 时应复位开关"
+    assert boxes == [], "趋势无文本回退，不应弹任何窗口"

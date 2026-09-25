@@ -22,8 +22,11 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - **多种触发方式**（对标 Mem Reduct）：超阈值百分比、可用内存低于绝对值（`min_avail_mb`）、
   定时清理（`scheduled_minutes`）、启动时清理（`clean_on_start`）；菜单顶部可看**累计清理次数与释放量**
 - **进程白名单**（`user_blacklist`）：指定进程在激进档下跳过工作集清空，避免浏览器 / IDE / 游戏被清后卡顿
-- 右键菜单：立即清理 / 内存占用 Top10（可刷新窗口）/ 自动清理开关 / 清理阈值 / 清理力度 / 清理冷却 /
-  清理区域 / 定时清理 / 低内存触发 / 启动时清理 / 开机自启开关 / 打开日志 / 导出诊断 / 检查更新 / 退出
+- **左键点托盘图标**打开「内存概览」主窗口（对标 WinMemoryCleaner / Mem Reduct）：物理 / 提交两条
+  进度条 + 当前占用 Top5（同名多开自动合并为一行）+ 立即清理 / 刷新 / Top10 / 趋势 / 优化建议 快捷按钮
+- 右键菜单：内存概览（左键）/ 立即清理 / 内存占用 Top10（可刷新窗口）/ 内存趋势 / 优化建议 / 自动清理开关 /
+  清理阈值 / 清理力度 / 清理冷却 / 清理区域 / 定时清理 / 低内存触发 / 启动时清理 / 开机自启开关 /
+  打开日志 / 导出诊断 / 检查更新 / 退出
 - 日志自动轮转（超过 1MB 归档为 `mem_guard.log.1`）
 - 单实例运行（命名互斥体）
 - 清理所需特权**用完即关**（不常驻 `SeDebugPrivilege` 等高危特权）
@@ -34,6 +37,17 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - **托盘自愈**：托盘后端异常退出（如 Explorer 重启）后自动重建图标，避免「程序在跑但图标不见了」
 - **检查更新**：托盘菜单可查询 GitHub 最新 Release，发现新版本会自动打开下载页
 - **优化建议**：托盘菜单「优化建议」一键分析当前内存状态与配置，给出分级可操作项（页面文件/虚拟内存、权限、阈值合理性、进程高占用与白名单、健康态），无 tkinter 时回退为气泡文本
+
+## 界面预览
+
+左键点托盘图标即打开「内存概览」主窗口（无 tkinter 环境自动回退为气泡文本，功能不受影响）：
+
+- **概览窗**：物理 / 提交两条进度条（数值按压力变色）**每秒实时刷新**，占用 Top5 表格每 3s 刷新
+  （同名多开如多个 Chrome 合并为「进程 ×N」一行，避免每帧重排刷屏）；底部「立即清理 / 刷新 / Top10 /
+  趋势 / 优化建议」直达各功能。
+- **Top10 窗**：可刷新的占用排行表格，斑马纹、列宽/对齐按数据类型区分，同样按进程名合并。
+- **趋势窗**：物理 / 提交两条曲线，带 0–100% 纵轴刻度、时间刻度与末端当前值标注；首帧不再空白。
+- **建议窗**：分级（注意 / 建议 / 提示）着色列出可操作项，可实时刷新。
 
 ## 环境要求
 
@@ -145,6 +159,8 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 
 > 以上数值都会做合法性钳制（如阈值限 50–99、`interval` 限 2–3600 秒），手误写超范围会自动修正，无需担心配置写坏。
 
+> 改完保存即生效（热重载，不用重启托盘）；托盘菜单里的改动会在当前配置之上增量合并，不会覆盖你刚手改的字段，多个改动入口之间也不会互相冲掉。
+
 ## 优化建议（实用建议）
 
 托盘菜单「优化建议」会根据当前内存状态与你的配置，实时给出分级建议（注意 / 建议 / 提示），
@@ -187,7 +203,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 
 ## 版本
 
-当前版本 `1.4.1`。
+当前版本 `1.4.2`。
 
 ## 源码结构
 
@@ -200,7 +216,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 | `memguard/privileges.py` | 清理所需高危特权的启用与「用完即恢复」（`clean_privileges` 上下文管理器） |
 | `memguard/actions.py` | 单步清理动作封装：工作集 / 修改页 / standby / 文件缓存，返回原始 NTSTATUS（`purge_working_sets` 等） |
 | `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets`）、Top 进程统计 |
-| `memguard/ui.py` | 界面层：托盘图标绘制（`make_icon`）、气泡提示（`message_box`）、Top10 / 趋势 / 优化建议窗口 |
+| `memguard/ui.py` | 界面层：抗锯齿托盘图标绘制（`make_icon`，4× 超采样）、气泡提示（`message_box`）、内存概览（`show_overview_window`）/ Top10 / 趋势 / 优化建议窗口 |
 | `memguard/autostart.py` | 开机自启：计划任务注册 / 查询 / 卸载（`autostart_enabled` / `install_autostart` / `remove_autostart`） |
 | `memguard/diag.py` | 诊断导出：内存状态 / 进程 / 日志 / 配置打包为 zip（`export_diagnostics`） |
 | `memguard/update.py` | 更新检查：查询 GitHub 最新 Release 并比较版本（`fetch_latest_release` / `_parse_version`） |

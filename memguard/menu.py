@@ -14,7 +14,7 @@ import pystray
 
 from .autostart import autostart_enabled, install_autostart, remove_autostart
 from .clean import do_clean, top_processes_list
-from .config import LOG_PATH, __version__, gb, log, save_config
+from .config import LOG_PATH, __version__, gb, log, update_config
 from .diag import export_diagnostics
 from .ui import show_advice_window, show_top_window, show_trend_window
 from .update import fetch_latest_release
@@ -25,9 +25,11 @@ def build_menu(guard) -> pystray.Menu:
     """构建托盘右键菜单。
 
     guard 为 tray.Guard 实例（此处不做类型注解以避免循环导入）。
-    每次重建图标都会调用本函数，故能拿到热重载后的最新配置。
+
+    所有配置读写都走 ``guard.cfg`` 而不是在闭包里缓存字典引用：监控线程热重载时
+    ``guard.cfg`` 会被整体替换成新字典，缓存旧引用会让菜单读到过期值，更糟的是
+    勾选动作会把旧值整份写回 mem_guard.json，覆盖掉用户刚改的配置。
     """
-    cfg = guard.cfg
 
     # -- 菜单回调 ------------------------------------------------
 
@@ -42,6 +44,8 @@ def build_menu(guard) -> pystray.Menu:
         if not r["ok"]:
             icon.notify(r["msg"], "MemGuard")
             return
+        if r.get("stats"):
+            guard.cfg["stats"] = r["stats"]   # 与 do_clean 的落盘保持一致，菜单立即刷新
         freed = max(r["freed"], 0)
         top3 = top_processes_list(3)
         top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
@@ -52,12 +56,14 @@ def build_menu(guard) -> pystray.Menu:
         )
         guard.refresh()
 
+    def on_overview(icon=None, item=None) -> None:
+        guard.open_overview()
+
     def on_top(icon=None, item=None) -> None:
         show_top_window()
 
     def on_toggle_auto(icon, item) -> None:
-        guard.cfg["auto_clean"] = not guard.cfg["auto_clean"]
-        save_config(guard.cfg)
+        guard.cfg = update_config({"auto_clean": not guard.cfg["auto_clean"]})
         log(f"自动清理 -> {'开启' if guard.cfg['auto_clean'] else '关闭'}")
 
     def on_open_log(icon=None, item=None) -> None:
@@ -72,21 +78,17 @@ def build_menu(guard) -> pystray.Menu:
 
     def _preset(phys, commit):
         def setter(icon, item):
-            cfg["phys_threshold"] = phys
-            cfg["commit_threshold"] = commit
-            save_config(cfg)
+            guard.cfg = update_config({"phys_threshold": phys, "commit_threshold": commit})
         return setter
 
     def _set_cooldown(minutes):
         def setter(icon, item):
-            cfg["cooldown"] = minutes * 60
-            save_config(cfg)
+            guard.cfg = update_config({"cooldown": minutes * 60})
         return setter
 
     def _set_level(level):
         def setter(icon, item):
-            cfg["clean_level"] = level
-            save_config(cfg)
+            guard.cfg = update_config({"clean_level": level})
             log(f"清理档位 -> {'激进' if level == 'aggressive' else '保守'}")
         return setter
 
@@ -94,10 +96,9 @@ def build_menu(guard) -> pystray.Menu:
 
     def _toggle_area(key, label):
         def setter(icon, item):
-            areas = dict(cfg.get("clean_areas") or {})
+            areas = dict(guard.cfg.get("clean_areas") or {})
             areas[key] = not areas.get(key, True)
-            cfg["clean_areas"] = areas
-            save_config(cfg)
+            guard.cfg = update_config({"clean_areas": areas})
             log(f"清理区域[{label}] -> {'开' if areas[key] else '关'}")
         return setter
 
@@ -112,15 +113,14 @@ def build_menu(guard) -> pystray.Menu:
         return pystray.Menu(*[
             pystray.MenuItem(
                 label, _toggle_area(k, label),
-                checked=(lambda i, kk=k: bool((cfg.get("clean_areas") or {}).get(kk, True))),
+                checked=(lambda i, kk=k: bool((guard.cfg.get("clean_areas") or {}).get(kk, True))),
             )
             for k, label in rows
         ])
 
     def _set_scheduled(minutes):
         def setter(icon, item):
-            cfg["scheduled_minutes"] = minutes
-            save_config(cfg)
+            guard.cfg = update_config({"scheduled_minutes": minutes})
             log(f"定时清理 -> {'关闭' if not minutes else f'{minutes} 分钟'}")
         return setter
 
@@ -129,14 +129,13 @@ def build_menu(guard) -> pystray.Menu:
                    (60, "1 小时"), (180, "3 小时")]
         return pystray.Menu(*[
             pystray.MenuItem(label, _set_scheduled(m), radio=True,
-                             checked=(lambda i, mm=m: cfg.get("scheduled_minutes", 0) == mm))
+                             checked=(lambda i, mm=m: guard.cfg.get("scheduled_minutes", 0) == mm))
             for m, label in choices
         ])
 
     def _set_min_avail(mb):
         def setter(icon, item):
-            cfg["min_avail_mb"] = mb
-            save_config(cfg)
+            guard.cfg = update_config({"min_avail_mb": mb})
             log(f"低内存触发 -> {'关闭' if not mb else f'{mb} MB'}")
         return setter
 
@@ -145,17 +144,17 @@ def build_menu(guard) -> pystray.Menu:
                    (2048, "2 GB"), (4096, "4 GB")]
         return pystray.Menu(*[
             pystray.MenuItem(label, _set_min_avail(mb), radio=True,
-                             checked=(lambda i, mm=mb: cfg.get("min_avail_mb", 0) == mm))
+                             checked=(lambda i, mm=mb: guard.cfg.get("min_avail_mb", 0) == mm))
             for mb, label in choices
         ])
 
     def on_toggle_clean_on_start(icon, item) -> None:
-        cfg["clean_on_start"] = not bool(cfg.get("clean_on_start", False))
-        save_config(cfg)
-        log(f"启动时清理 -> {'开' if cfg['clean_on_start'] else '关'}")
+        guard.cfg = update_config(
+            {"clean_on_start": not bool(guard.cfg.get("clean_on_start", False))})
+        log(f"启动时清理 -> {'开' if guard.cfg['clean_on_start'] else '关'}")
 
     def line_stats(_):
-        st = cfg.get("stats") or {}
+        st = guard.cfg.get("stats") or {}
         return f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
 
     def on_toggle_autostart(icon, item) -> None:
@@ -235,27 +234,27 @@ def build_menu(guard) -> pystray.Menu:
     def preset_menu():
         return pystray.Menu(
             pystray.MenuItem("激进  物理75% / 提交85%", _preset(75, 85), radio=True,
-                             checked=lambda i: cfg["phys_threshold"] == 75),
+                             checked=lambda i: guard.cfg["phys_threshold"] == 75),
             pystray.MenuItem("标准  物理85% / 提交90%", _preset(85, 90), radio=True,
-                             checked=lambda i: cfg["phys_threshold"] == 85),
+                             checked=lambda i: guard.cfg["phys_threshold"] == 85),
             pystray.MenuItem("宽松  物理92% / 提交95%", _preset(92, 95), radio=True,
-                             checked=lambda i: cfg["phys_threshold"] == 92),
+                             checked=lambda i: guard.cfg["phys_threshold"] == 92),
         )
 
     def cooldown_menu():
         choices = [(1, "1 分钟"), (5, "5 分钟"), (10, "10 分钟"), (30, "30 分钟")]
         return pystray.Menu(*[
             pystray.MenuItem(label, _set_cooldown(m), radio=True,
-                             checked=(lambda i, mm=m: cfg["cooldown"] == mm * 60))
+                             checked=(lambda i, mm=m: guard.cfg["cooldown"] == mm * 60))
             for m, label in choices
         ])
 
     def level_menu():
         return pystray.Menu(
             pystray.MenuItem("保守  只清缓存(最温和)", _set_level("conservative"), radio=True,
-                             checked=lambda i: cfg.get("clean_level") == "conservative"),
+                             checked=lambda i: guard.cfg.get("clean_level") == "conservative"),
             pystray.MenuItem("激进  额外清空进程工作集", _set_level("aggressive"), radio=True,
-                             checked=lambda i: cfg.get("clean_level") == "aggressive"),
+                             checked=lambda i: guard.cfg.get("clean_level") == "aggressive"),
         )
 
     return pystray.Menu(
@@ -264,13 +263,14 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem(line_tip, None, enabled=False),
         pystray.MenuItem(line_stats, None, enabled=False),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("内存概览（左键）", on_overview),
         pystray.MenuItem("立即清理", on_clean_now),
         pystray.MenuItem("内存占用 Top10", on_top),
         pystray.MenuItem("内存趋势", on_trend),
         pystray.MenuItem(lambda i: f"优化建议（{guard.advice_count} 条）", on_advice),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("自动清理", on_toggle_auto,
-                         checked=lambda i: cfg["auto_clean"]),
+                         checked=lambda i: guard.cfg["auto_clean"]),
         pystray.MenuItem("清理阈值", preset_menu()),
         pystray.MenuItem("清理力度", level_menu()),
         pystray.MenuItem("清理冷却", cooldown_menu()),
@@ -278,7 +278,7 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("定时清理", scheduled_menu()),
         pystray.MenuItem("低内存触发", min_avail_menu()),
         pystray.MenuItem("启动时清理", on_toggle_clean_on_start,
-                         checked=lambda i: bool(cfg.get("clean_on_start"))),
+                         checked=lambda i: bool(guard.cfg.get("clean_on_start"))),
         pystray.MenuItem("开机自启", on_toggle_autostart,
                          checked=lambda i: autostart_enabled()),
         pystray.MenuItem(

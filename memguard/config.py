@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from datetime import datetime
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -149,12 +150,34 @@ def load_config() -> dict:
     return normalize_config(raw)
 
 
+# 配置写路径的锁：写盘是「读当前文件 - 改 - 写回」，菜单勾选、清理统计都会写，
+# 不串行的话两个线程各拿一份旧配置互相覆盖（例：刚勾选的开关被一次自动清理写回旧值）。
+# 用可重入锁：update_config 持锁后再调 save_config 不会自我死锁。
+_CONFIG_LOCK = threading.RLock()
+
+
 def save_config(cfg: dict) -> None:
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(normalize_config(cfg), f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    """把配置写盘（会经过 _CONFIG_LOCK，保证同一时刻只有一份写）。"""
+    with _CONFIG_LOCK:
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(normalize_config(cfg), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+def update_config(changes: dict) -> dict:
+    """以磁盘当前配置为基准叠加变更并写回，返回合并后的新配置。
+
+    所有配置写盘都应走这里而不是 save_config(内存里的字典)：内存副本可能是热重载前
+    的，直接写回会覆盖用户手改的字段；读-改-写全程持锁也避免与并发写盘互相抵消。
+    """
+    with _CONFIG_LOCK:
+        # 归一化后再返回/落盘：调用方（菜单）会把它直接赋回 guard.cfg，
+        # 若带着越界值，勾选态与启动时的钳制口径就会不一致。
+        cfg = normalize_config({**load_config(), **changes})
+        save_config(cfg)
+        return cfg
 
 
 LOG_MAX_BYTES = 1 * 1024 * 1024  # 日志超过 1MB 时轮转为 mem_guard.log.1

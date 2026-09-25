@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """config：配置校验与钳制、黑名单归一化、容量格式化。"""
+import json
+
 import pytest
 
+from memguard import config
 from memguard.config import (
     DEFAULT_CONFIG,
     _blacklist_stems,
@@ -109,3 +112,51 @@ def test_normalize_config_new_fields_clamped():
     assert cfg["min_avail_mb"] == 0
     assert cfg["scheduled_minutes"] == 24 * 60
     assert cfg["stats"] == {"count": 3, "freed": 1024}
+
+
+# ---------------------------------------------------------------- update_config（唯一写盘入口）
+
+def _write_cfg(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def test_update_config_merges_into_on_disk_config(monkeypatch, tmp_path):
+    """以磁盘当前配置为基准做增量合并，而不是拿内存里的旧副本整份覆盖。"""
+    cfg_file = tmp_path / "mem_guard.json"
+    _write_cfg(cfg_file, {"phys_threshold": 77, "cooldown": 900, "auto_clean": False})
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    merged = config.update_config({"auto_clean": True})
+
+    assert merged["phys_threshold"] == 77, "磁盘上的其它字段不能被默认值覆盖"
+    assert merged["cooldown"] == 900
+    assert merged["auto_clean"] is True
+    assert json.loads(cfg_file.read_text(encoding="utf-8")) == merged, "落盘内容与返回一致"
+
+
+def test_update_config_survives_stale_snapshot(monkeypatch, tmp_path):
+    """拿着过期副本发起变更，也不会把期间别人的写入回滚掉。"""
+    cfg_file = tmp_path / "mem_guard.json"
+    _write_cfg(cfg_file, {"cooldown": 300, "auto_clean": True})
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    stale = config.load_config()                  # 过期副本（之后文件还会被改）
+    config.update_config({"auto_clean": False})   # 别的写入先落盘
+    stale.update({"cooldown": 120})               # 基于过期副本算出的变更
+    config.update_config({"cooldown": 120})
+
+    final = config.load_config()
+    assert final["auto_clean"] is False, "并发/先到的写入不能被回滚"
+    assert final["cooldown"] == 120
+
+
+def test_update_config_normalizes_values(monkeypatch, tmp_path):
+    """合并时仍走 normalize_config：越界/脏值被钳制，不会把配置写坏。"""
+    cfg_file = tmp_path / "mem_guard.json"
+    _write_cfg(cfg_file, {})
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    merged = config.update_config({"phys_threshold": 999, "clean_level": "xx"})
+
+    assert merged["phys_threshold"] == 99
+    assert merged["clean_level"] == "conservative"

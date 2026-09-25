@@ -19,7 +19,8 @@ from .advisor import analyze
 from .clean import do_clean, top_processes_list
 from .config import CONFIG_PATH, __version__, gb, load_config, log
 from .menu import build_menu
-from .ui import make_icon
+from .ui import (make_icon, show_advice_window, show_overview_window,
+                show_top_window, show_trend_window)
 from .winapi import get_mem, is_admin
 
 # ---------------------------------------------------------------- 主程序
@@ -46,11 +47,30 @@ class Guard:
     def refresh(self) -> None:
         self.state = get_mem()
 
+    # -- 概览窗口（对标 WinMemoryCleaner / Mem Reduct：左键点托盘就打开主窗口）----
+
+    def open_overview(self) -> None:
+        """打开内存概览窗口。
+
+        用 hooks 把窗口里的按钮接回 Guard，ui 层因此不需要反向依赖 tray。
+        """
+        show_overview_window({
+            "clean": lambda: do_clean("手动"),
+            "top": show_top_window,
+            "trend": lambda: show_trend_window(lambda: list(self.history)),
+            "advice": lambda: show_advice_window(self.cfg),
+        })
+
     def _auto_clean(self, now: float, reason: str, s: dict) -> None:
         """执行一次自动清理并弹通知（各触发源共用；reason 用于日志与通知标题）。"""
         self.last_clean = now
         self.over_since = None
         r = do_clean(reason)
+        if r["ok"]:
+            # 统计已在 do_clean 里落盘：顺手同步回内存，否则菜单顶部那行累计统计要等
+            # 下一次热重载（间隔由 interval 决定，最长可能等很久）才刷新
+            if r.get("stats"):
+                self.cfg["stats"] = r["stats"]
         if r["ok"] and self.icon:
             top3 = top_processes_list(3)
             top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
@@ -74,6 +94,9 @@ class Guard:
                 self._cfg_mtime = mtime
                 if mtime is not None:
                     self.cfg = load_config()
+                    # 配置刚变（可能换了档位/阈值），把建议节流计时清零，让菜单上的
+                    # 「优化建议（N 条）」立刻反映新配置，而不是最多再等一个周期
+                    self._advice_at = 0.0
                     log("配置已热重载（来自 mem_guard.json）")
         except Exception as e:
             log(f"配置重载检查失败: {e}")
@@ -190,9 +213,9 @@ class Guard:
 
         while not self.stop.is_set():
             try:
-                self.icon = pystray.Icon(
+                self.icon = _GuardIcon(
                     "MemGuard", make_icon(self.state["phys_pct"], self.cfg["phys_threshold"]),
-                    "MemGuard 运行中", build_menu(self),
+                    "MemGuard 运行中", build_menu(self), on_left_click=self.open_overview,
                 )
                 self.icon.run()
             except Exception as e:
@@ -204,3 +227,24 @@ class Guard:
             log("托盘未正常退出，1 秒后重建图标（自愈）")
             time.sleep(1.0)
         log("MemGuard 已退出")
+
+
+class _GuardIcon(pystray.Icon):
+    """左键打开概览窗口的托盘图标。
+
+    pystray 默认左键展开右键菜单（`Icon.__call__`），同类工具（WinMemoryCleaner /
+    Mem Reduct）都是左键开主窗口、右键给菜单；这里只覆盖左键行为，右键菜单不变。
+    """
+
+    def __init__(self, *args, on_left_click=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_left_click = on_left_click
+
+    def __call__(self):
+        if self._on_left_click is None:
+            super().__call__()
+            return
+        try:
+            self._on_left_click()
+        except Exception as e:
+            log(f"概览窗口打开失败: {e!r}")

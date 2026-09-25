@@ -22,7 +22,7 @@ from .actions import (
     purge_standby_list,
     purge_working_sets,
 )
-from .config import CLEAN_LEVELS, gb, load_config, log, save_config
+from .config import CLEAN_LEVELS, _CONFIG_LOCK, gb, load_config, log, save_config
 from .privileges import clean_privileges
 from .winapi import get_mem, is_admin, process_working_sets
 
@@ -33,6 +33,105 @@ _FILL_MAX = 24
 def _status(rc: int) -> str:
     """把 NTSTATUS 渲染为可读文案。"""
     return "成功" if rc == 0 else f"失败(0x{rc & 0xffffffff:X})"
+
+
+# 清理后等系统把回收的页计入可用物理内存：最多等一个窗口；连续 _RECLAIM_SETTLE 秒
+# 没有回升就提前收尾——那说明这次清理没释放出可用内存，再等也不会变（旧实现会
+# 把整个窗口等满，手动清理时能明显感觉到托盘卡住）。
+_RECLAIM_WINDOW = 1.5
+_RECLAIM_SAMPLE = 0.15
+_RECLAIM_SETTLE = 0.45
+
+
+def _wait_avail_rise(before: dict) -> dict:
+    """轮询等待可用物理内存回升，返回最后一次采样。
+
+    一回升就返回（和"干等"相比反馈最快）；迟迟不回升则最多多等 _RECLAIM_SETTLE 秒，
+    不会把整个窗口等满。
+    """
+    deadline = time.time() + _RECLAIM_WINDOW
+    flat_since = time.time()
+    after = get_mem()
+    while time.time() < deadline:
+        if after["avail_phys"] > before["avail_phys"]:
+            return after
+        if time.time() - flat_since >= _RECLAIM_SETTLE:
+            break
+        time.sleep(_RECLAIM_SAMPLE)
+        after = get_mem()
+    return after
+
+
+def _bump_stats(freed: int) -> dict:
+    """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
+
+    在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
+    或用户手改覆盖掉，直接写回会把别人的改动一起回滚。
+    """
+    with _CONFIG_LOCK:
+        cfg = load_config()
+        st = cfg.get("stats") or {}
+        st["count"] = int(st.get("count", 0)) + 1
+        st["freed"] = int(st.get("freed", 0)) + max(freed, 0)
+        cfg["stats"] = st
+        save_config(cfg)
+        return dict(st)
+
+
+def _run_clean_actions(aggressive: bool, areas: dict, blacklist) -> tuple:
+    """在「用完即关」的特权窗口内执行全部清理动作。
+
+    返回 (detail, core, failed_privs)：detail 是人看的明细文案，core 是参与整体
+    成败判断的核心 NT 操作返回码（0=成功），failed_privs 是启用失败的特权名。
+    只编排动作，不做成败判定与统计（见 do_clean）。
+    """
+    with clean_privileges() as failed_privs:
+        detail = [f"档位:{'激进' if aggressive else '保守'}"]
+        if failed_privs:
+            detail.append("特权启用失败:" + ",".join(failed_privs))
+
+        core = []  # 参与整体成败判断的核心 NT 操作返回码
+
+        if aggressive:
+            if areas.get("working_sets", True):
+                r_ws = purge_working_sets()
+                core.append(r_ws)
+                detail.append(f"清空工作集:{_status(r_ws)}")
+            else:
+                detail.append("清空工作集:已关闭")
+
+        if areas.get("modified", True):
+            r_fm = flush_modified_list()
+            core.append(r_fm)
+            detail.append(f"刷写修改页:{_status(r_fm)}")
+        else:
+            detail.append("刷写修改页:已关闭")
+
+        if areas.get("standby", True):
+            r_sb = purge_standby_list()
+            core.append(r_sb)
+            detail.append(f"清理Standby:{_status(r_sb)}")
+        else:
+            detail.append("清理Standby:已关闭")
+
+        # 低优先级 standby：影响面更小的一步（部分系统不支持该命令，会如实展示失败码）
+        if areas.get("low_priority_standby", True):
+            r_lp = purge_low_priority_standby()
+            detail.append(f"清理低优先级Standby:{_status(r_lp)}")
+
+        if aggressive:
+            n, skipped = empty_process_working_sets(blacklist)
+            detail.append(f"进程工作集:{n} 个" + (f"（白名单跳过 {skipped}）" if skipped else ""))
+        else:
+            detail.append("进程工作集:已跳过(保守档)")
+
+        if areas.get("file_cache", True):
+            fc = clear_system_file_cache()
+            detail.append(f"文件缓存:{'成功' if fc else '失败'}")
+        else:
+            detail.append("文件缓存:已关闭")
+
+        return detail, core, failed_privs
 
 
 def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None) -> dict:
@@ -54,85 +153,35 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     bl = cfg.get("user_blacklist") if user_blacklist is None else user_blacklist
     areas = cfg.get("clean_areas") or {}
 
-    with clean_privileges() as failed_privs:
-        before = get_mem()
-        detail = [f"档位:{'激进' if aggressive else '保守'}"]
-        if failed_privs:
-            detail.append("特权启用失败:" + ",".join(failed_privs))
+    # before 必须在动手前采样，否则"释放了多少"无从算起
+    before = get_mem()
+    detail, core, failed_privs = _run_clean_actions(aggressive, areas, bl)
 
-        core = []  # 参与整体成败判断的核心 NT 操作返回码
+    # 核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
+    if core and all(rc != 0 for rc in core):
+        why = ("特权启用失败: " + ", ".join(failed_privs)) if failed_privs else "特权未启用或权限不足"
+        log(f"{reason}清理失败 | {why} | {', '.join(detail)}")
+        return {"ok": False, "msg": f"清理失败（{why}）"}
 
-        if aggressive:
-            if areas.get("working_sets", True):
-                r_ws = purge_working_sets()
-                core.append(r_ws)
-                detail.append(f"清空工作集:{_status(r_ws)}")
-            else:
-                detail.append("清空工作集:已关闭")
+    after = _wait_avail_rise(before)
 
-        if areas.get("modified", True):
-            r_fm = flush_modified_list()
-            core.append(r_fm)
-            detail.append(f"刷写修改页:{_status(r_fm)}")
-
-        if areas.get("standby", True):
-            r_sb = purge_standby_list()
-            core.append(r_sb)
-            detail.append(f"清理Standby:{_status(r_sb)}")
-
-        # 低优先级 standby：影响面更小的一步（部分系统不支持该命令，会如实展示失败码）
-        if areas.get("low_priority_standby", True):
-            r_lp = purge_low_priority_standby()
-            detail.append(f"清理低优先级Standby:{_status(r_lp)}")
-
-        if aggressive:
-            n, skipped = empty_process_working_sets(bl)
-            detail.append(f"进程工作集:{n} 个" + (f"（白名单跳过 {skipped}）" if skipped else ""))
-        else:
-            detail.append("进程工作集:已跳过(保守档)")
-
-        if areas.get("file_cache", True):
-            fc = clear_system_file_cache()
-            detail.append(f"文件缓存:{'成功' if fc else '失败'}")
-        else:
-            detail.append("文件缓存:已关闭")
-
-        # 核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
-        if core and all(rc != 0 for rc in core):
-            why = ("特权启用失败: " + ", ".join(failed_privs)) if failed_privs else "特权未启用或权限不足"
-            log(f"{reason}清理失败 | {why} | {', '.join(detail)}")
-            return {"ok": False, "msg": f"清理失败（{why}）"}
-
-        # 等系统把回收的页计入可用内存：轮询最多 1.5s，一旦可用物理回升立即返回，
-        # 比原来固定 sleep(1.5) 更快给出反馈（手动清理时尤其明显）。
-        deadline = time.time() + 1.5
-        after = get_mem()
-        while time.time() < deadline and after["avail_phys"] <= before["avail_phys"]:
-            time.sleep(0.15)
-            after = get_mem()
-
-        freed = after["avail_phys"] - before["avail_phys"]
-        result = {
-            "ok": True,
-            "freed": freed,
-            "before": before,
-            "after": after,
-            "level": lvl,
-            "detail": ", ".join(detail),
-        }
-        # 累计统计（对标 Mem Reduct）：只统计真正成功的清理，随配置持久化
-        try:
-            st = cfg.get("stats") or {}
-            st["count"] = int(st.get("count", 0)) + 1
-            st["freed"] = int(st.get("freed", 0)) + max(freed, 0)
-            cfg["stats"] = st
-            save_config(cfg)
-            result["stats"] = dict(st)
-        except Exception:
-            pass
-        log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "
-            f"(释放 {gb(max(freed, 0))}) | 提交 {before['commit_pct']:.0f}% -> {after['commit_pct']:.0f}% | {result['detail']}")
-        return result
+    freed = after["avail_phys"] - before["avail_phys"]
+    result = {
+        "ok": True,
+        "freed": freed,
+        "before": before,
+        "after": after,
+        "level": lvl,
+        "detail": ", ".join(detail),
+    }
+    # 累计统计：只统计真正成功的清理，随配置持久化；写盘失败不影响本次清理结果
+    try:
+        result["stats"] = _bump_stats(freed)
+    except Exception:
+        pass
+    log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "
+        f"(释放 {gb(max(freed, 0))}) | 提交 {before['commit_pct']:.0f}% -> {after['commit_pct']:.0f}% | {result['detail']}")
+    return result
 
 
 def top_processes_list(n: int = 10) -> list:
