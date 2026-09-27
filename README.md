@@ -134,6 +134,8 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 - 方式一：运行 `安装 MemGuard 开机自启（管理员）.bat`（注册登录时以最高权限启动的计划任务，无 UAC 弹窗）
 - 方式二：在托盘右键菜单勾选「开机自启」
 - 卸载：`卸载 MemGuard 开机自启（管理员）.bat`，或在菜单取消勾选
+（绿色版/本地 `dist\mem_guard.exe` 同理：托盘菜单勾选即把 **exe 绝对路径** 注册为登录计划任务。
+搬家或重新打包后，exe 路径变了，重新勾选一次即可；桌面图标重新「发送到 → 桌面快捷方式」即可。）
 
 ## 配置文件
 
@@ -203,7 +205,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 
 ## 版本
 
-当前版本 `1.4.2`。
+当前版本 `1.4.3`。
 
 ## 源码结构
 

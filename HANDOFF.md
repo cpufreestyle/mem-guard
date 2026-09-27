@@ -7,7 +7,7 @@
 Windows 托盘小工具：实时监控**物理内存**与**提交内存(commit)**，超阈值自动清理并提醒，专治「明明还剩几 G 却一直弹『内存不足』」——根因是 commit 耗尽（提交上限 = 物理 + 页面文件），而非物理内存。
 
 - 仓库：`cpufreestyle/mem-guard`（本地 `D:\ai share\repo\mem-guard`，main 分支）
-- 最新已发布 tag：`v1.4.1`（CI 自动出 Release，附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）
+- 最新已发布 tag：`v1.4.3`（CI 自动出 Release，附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）
 - 语言/平台：Python 3.8+ / Windows only（清理调用 `NtSetSystemInformation`，无法跨平台）
 
 ## 2. 快速上手
@@ -35,7 +35,7 @@ python mem_guard.py --selftest          # 内置自检（CI 与打包后冒烟�
 | `memguard/clean.py` | **清理编排与统计**：编排各动作、汇总结果；进程 Top 统计（快路径 + 定点补齐 + psutil 兜底） | `do_clean`、`top_processes_list`、`top_processes`、`_run_clean_actions`、`_wait_avail_rise`、`_bump_stats` |
 | `memguard/advisor.py` | 优化建议引擎（基于内存状态+配置生成分级建议） | `analyze`、`format_advice` |
 | `memguard/ui.py` | 界面层：图标绘制、气泡、Top10/趋势/建议窗口（不依赖 pystray） | `make_icon`、`message_box`、`show_top_window`、`show_trend_window`、`show_advice_window` |
-| `memguard/autostart.py` | 开机自启：计划任务注册/查询/卸载 | `autostart_enabled`、`install_autostart`、`remove_autostart` |
+| `memguard/autostart.py` | 开机自启：计划任务注册/查询/卸载（frozen 分支用 XML 导入，兼容含空格路径） | `autostart_enabled`、`install_autostart`、`remove_autostart` |
 | `memguard/diag.py` | 诊断导出：状态/进程/日志/配置打包 zip | `export_diagnostics` |
 | `memguard/update.py` | 更新检查：GitHub 最新 Release 查询与版本比较（纯标准库 urllib） | `fetch_latest_release`、`_parse_version` |
 | `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（以 `guard` 为参数，不反向 import tray） | `build_menu(guard)` |
@@ -134,7 +134,7 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 
 ## 6. 测试现状
 
-- **单元测试（v1.3.11 起）**：`tests/` 下 pytest 用例（108 项）覆盖 `config` 归一化/钳制、`update._parse_version`、`advisor.analyze`（注入内存状态与 `top` 快照，不依赖真实机器）、`ui` 图标取色/尺寸/缓存淘汰（含"颜色须按原始 float 判断"的回归）、`clean` 的快路径排序/定点补齐/超限不补齐/psutil 兜底、`winapi.process_working_sets` 真实进程对账、`tray` 的图标去重与建议时间节流、`clean`/`actions` 常量绑定回归（拦截底层调用，防 `NameError` 类回归）、`autostart` 缓存语义、`menu` 热重载后仍读写当前配置（防写回覆盖手改值）、`tray` 热重载清零建议节流、`update_config` 增量合并/不覆盖并发写、`_wait_avail_rise` 提前收敛与 `_bump_stats` 口径、`do_clean` **管理员路径**（mock 特权与各动作：档位/区域开关/成败判定/统计）、`winapi` 读取与缓存。v1.4.2 又补「美观/实用性」三项：`ui` 概览与表格纯函数（`_group_rows` 合并同名/`_top_grouped` 超采样再合并/`_fmt_bytes` 单位/`_table_rows` 的 ×N 标记与空 total 占位）、`show_overview/top/advice_window` 的**无 tkinter 回退**（`sys.modules["tkinter"]=None` 触发 ImportError + monkeypatch `message_box` 断言）、以及左键链路`_GuardIcon.__call__`→`open_overview` 与 hooks 绑定回归。运行：`pip install -r requirements-dev.txt && python -m pytest -q`。
+- **单元测试（v1.3.11 起）**：`tests/` 下 pytest 用例（110 项）覆盖 `config` 归一化/钳制、`update._parse_version`、`advisor.analyze`（注入内存状态与 `top` 快照，不依赖真实机器）、`ui` 图标取色/尺寸/缓存淘汰（含"颜色须按原始 float 判断"的回归）、`clean` 的快路径排序/定点补齐/超限不补齐/psutil 兜底、`winapi.process_working_sets` 真实进程对账、`tray` 的图标去重与建议时间节流、`clean`/`actions` 常量绑定回归（拦截底层调用，防 `NameError` 类回归）、`autostart` 缓存语义、`menu` 热重载后仍读写当前配置（防写回覆盖手改值）、`tray` 热重载清零建议节流、`update_config` 增量合并/不覆盖并发写、`_wait_avail_rise` 提前收敛与 `_bump_stats` 口径、`do_clean` **管理员路径**（mock 特权与各动作：档位/区域开关/成败判定/统计）、`winapi` 读取与缓存。v1.4.2 又补「美观/实用性」三项：`ui` 概览与表格纯函数（`_group_rows` 合并同名/`_top_grouped` 超采样再合并/`_fmt_bytes` 单位/`_table_rows` 的 ×N 标记与空 total 占位）、`show_overview/top/advice_window` 的**无 tkinter 回退**（`sys.modules["tkinter"]=None` 触发 ImportError + monkeypatch `message_box` 断言）、以及左键链路`_GuardIcon.__call__`→`open_overview` 与 hooks 绑定回归。运行：`pip install -r requirements-dev.txt && python -m pytest -q`。
 - **内置自检**：`python mem_guard.py --selftest` 覆盖 get_mem / make_icon / 配置钳制 / 黑名单匹配 / `_parse_version` / advisor / `build_menu` 等，全 PASS 才说明导入链与基本逻辑 OK。非管理员环境下 `do_clean` 走「需管理员」早返回分支，不会真正清理。
 - **CI 顺序**：安装 `requirements-dev.txt` → `pytest -q` → `--selftest` → PyInstaller 打包 → 对**冻结版 exe** 再跑一次 `--selftest` 冒烟。
 
@@ -167,8 +167,16 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 - 含中文的 `.ps1` 必须 **UTF-8 with BOM**，否则 PowerShell 5.1 按 GBK 解中文引号破坏语法。
 - `git commit -m` 信息里**不要写 `%TEMP%` 这类 `%VAR%`**，会触发「文件名语法不正确」导致整条命令（含 `git add`）失败。
 - 后台化 + 输出重定向到工作区文件 = **撑爆磁盘风险**（实测 33GB 直到 C 盘 0 字节）：构建日志写 `$env:TEMP` 并加 `try/catch` 兜底。
+- **`schtasks` 注册含空格路径会拆 Command/Arguments**：`schtasks /TR "D:\ai share\...\mem_guard.exe"` 会把路径按第一个空格拆成
+  `Command=D:\ai` + `Arguments=share\...\mem_guard.exe`，写入的计划任务开机根本起不来。**解法**：改用 XML 导入
+  （`schtasks /Create /TN MemGuard /XML <file> /F`，XML 里 `<Command>` 放完整路径、不带 `<Arguments>`），`RunLevel=HighestAvailable`
+  登录时静默提权、逐次无 UAC。另：在**非管理员** shell 里建 `HIGHEST` 计划任务会 `Access is denied`，需一次 UAC 提权
+  （`Start-Process schtasks ... -Verb RunAs`）；`autostart._install_autostart_impl` 冻结版就是注册 `sys.executable` 自身。
+- **桌面快捷方式**：`WshShortcut` 无法直接设「以管理员运行」，故快捷方式直接指向 exe；要双击即提权需用户在 .lnk 属性里勾选，
+  或靠托盘菜单「开机自启」的计划任务（HighestAvailable）实现静默提权自启。给提示气泡归因正常，避免用 powershell/cmd 壳进程当中转。
 
 ---
-最后更新：2026-09-25（v1.4.2 仍未发布：在「实用/美观」方向对标 WinMemoryCleaner / Mem Reduct——**左键点托盘打开内存概览主窗口**（`_GuardIcon` 覆写 `__call__` + `open_overview` 注入 hooks），概览窗带进度条 + Top5（同名进程合并 ×N）+ 快捷按钮；Top10/趋势/建议窗改 ttk 表格与斑马纹、趋势图加坐标轴与当前值标注、修趋势窗首帧空白；托盘图标改 4× 超采样抗锯齿。**修了一个漏 import 的 `NameError`**（`open_overview` 引用未导入的 `show_*_window`，三个跳转按钮全废）。补齐概览/表格纯函数、无 tkinter 回退、左键链路三类测试，概览窗再加每秒实时刷新（进度条每 1s、Top5 表每 3s）；三类纯函数/回退/链路测试补齐后共 108 项全绿，`pyflakes` 干净，`--selftest` 与 PyInstaller 冻结版冒烟全 PASS。上一节点见下）
+最后更新：2026-09-27（v1.4.3：修 `autostart.py` frozen 分支注册「开机自启」的方式—`schtasks /TR` 会把含空格路径（本机仓库就在 `D:\ai share\...`，打包后 exe 同病）按第一个空格拆成 `Command=D:\ai` + `Arguments=share\...`，登录时任务根本起不来；改为写临时 XML 走 `schtasks /Create /XML <file> /F` 导入。新增 `_task_xml`：`<Command>` 放完整路径、不带 `<Arguments>`，转义 `&<>`，`LogonTrigger` + `RunLevel=HighestAvailable` 与 `install_autostart.ps1` 口径一致。补两条回归测试（完整路径落在同一个 `<Command>` / XML 特殊字符转义），共 110 项全绿，`--selftest` 全 PASS。本机已落地桌面快捷方式「MemGuard 内存守护.lnk」+ 登录自启计划任务；README 补绿色版搬家/重打包后需重新勾选自启的说明。待 commit 后按 §5 三步 tag/push v1.4.3。上一节点见下）
+历史：2026-09-26（v1.4.2：在「实用/美观」方向对标 WinMemoryCleaner / Mem Reduct——**左键点托盘打开内存概览主窗口**（`_GuardIcon` 覆写 `__call__` + `open_overview` 注入 hooks），概览窗带进度条 + Top5（同名进程合并 ×N）+ 快捷按钮；Top10/趋势/建议窗改 ttk 表格与斑马纹、趋势图加坐标轴与当前值标注、修趋势窗首帧空白；托盘图标改 4× 超采样抗锯齿。**修了一个漏 import 的 `NameError`**（`open_overview` 引用未导入的 `show_*_window`，三个跳转按钮全废）。补齐概览/表格纯函数、无 tkinter 回退、左键链路三类测试，概览窗再加每秒实时刷新（进度条每 1s、Top5 表每 3s）；三类纯函数/回退/链路测试补齐后共 108 项全绿，`pyflakes` 干净，`--selftest` 与 PyInstaller 冻结版冒烟全 PASS。已 commit(`a5a5352`)并 tag/push v1.4.2（触发 CI Release，本机未确认 run 结果）。）
 历史：2026-09-24（v1.4.2 部分：菜单统一读 `guard.cfg`；新增唯一写盘入口 `update_config`（持锁增量合并）消灭配置写竞态；清理后等待回升提前收敛、统计同步回内存；`do_clean` 拆分出 `_run_clean_actions` 并补齐管理员路径测试（92 项），PyInstaller 冻结版冒烟通过）
 历史：2026-09-20（对应 v1.4.1：自身资源占用优化——进程扫描快路径、后台建议按时间节流并复用快照、托盘图标按需重绘且按系统指标尺寸绘制；180 秒空载 CPU 由单核 1.97% 降到 0.026%，已发布）

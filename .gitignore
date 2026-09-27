@@ -21,3 +21,6 @@ tools/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# local IDE cache (Qoder generated)
+.qoder/

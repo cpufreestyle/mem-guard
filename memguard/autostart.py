@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 
 from .config import BASE_DIR
 
@@ -74,13 +75,48 @@ def install_autostart() -> bool:
     return ok
 
 
+def _task_xml(exe: str) -> str:
+    r"""生成登录自启的 schtasks XML：最高权限、Command 为完整 exe 路径。
+
+    不走 schtasks /TR：它会把含空格的路径按第一个空格拆开（例如 "D:\ai share\...\mem_guard.exe"
+    会被存成 Command=D:\ai + Arguments=share\...），任务开机根本起不来。XML 导入完整保留路径；
+    这与 install_autostart.ps1 用 New-ScheduledTaskAction 的稳健做法一致。
+    """
+    safe = exe.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo><Description>MemGuard autostart (logon, elevated)</Description></RegistrationInfo>\n'
+        '  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>\n'
+        '  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType>'
+        '<RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <Enabled>true</Enabled>\n'
+        '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author"><Exec><Command>' + safe + '</Command></Exec></Actions>\n'
+        '</Task>\n'
+    )
+
+
 def _install_autostart_impl() -> bool:
     if getattr(sys, "frozen", False):
-        # frozen 下 BASE_DIR 取自 exe 所在目录，无需设置任务的工作目录
+        # frozen 下 BASE_DIR 取自 exe 所在目录；用 exe 自身 XML 导入，完整保留含空格路径
         exe = os.path.abspath(sys.executable)
-        return _run_silent(["schtasks", "/Create", "/TN", AUTOSTART_TASK,
-                            "/TR", f'"{exe}"', "/SC", "ONLOGON",
-                            "/RL", "HIGHEST", "/F"])
+        fd, xml_file = tempfile.mkstemp(prefix="memguard_task_", suffix=".xml")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-16") as f:
+                f.write(_task_xml(exe))
+            return _run_silent(["schtasks", "/Create", "/TN", AUTOSTART_TASK,
+                                "/XML", xml_file, "/F"])
+        except Exception:
+            return False
+        finally:
+            try:
+                os.remove(xml_file)
+            except OSError:
+                pass
     ps1 = os.path.join(BASE_DIR, "install_autostart.ps1")
     if os.path.exists(ps1):
         return _run_silent(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",

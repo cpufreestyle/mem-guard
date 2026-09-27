@@ -42,3 +42,25 @@ def test_remove_invalidates_cache(monkeypatch):
     assert autostart.remove_autostart() is True
     autostart.autostart_enabled()
     assert len(calls) == 1
+
+
+def test_task_xml_keeps_full_path_with_spaces():
+    """回归：含空格路径必须完整落在同一 <Command>，不能被拆成 Command/Arguments。
+
+    历史上 frozen 自启用 schtasks /TR 注册含空格路径会把路径按第一个空格拆开，
+    任务开机起不来。改为 XML 导入后 <Command> 应原样包含完整路径。
+    """
+    exe = r'D:\ai share\repo\mem-guard\dist\mem_guard.exe'
+    xml = autostart._task_xml(exe)
+    assert '<Command>' + exe + '</Command>' in xml
+    assert '<Arguments>' not in xml
+    assert '<RunLevel>HighestAvailable</RunLevel>' in xml
+    assert '<LogonType>InteractiveToken</LogonType>' in xml
+    assert '<LogonTrigger>' in xml
+
+
+def test_task_xml_escapes_xml_specials():
+    """路径里万一含 &、<、> 要转义，避免破坏 XML。"""
+    xml = autostart._task_xml(r'D:\a&b\c<d>e.exe')
+    assert '&amp;' in xml and '&lt;' in xml and '&gt;' in xml
+    assert '<Command>D:\\a&b\\c<d>e.exe</Command>' not in xml
