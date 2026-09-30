@@ -111,6 +111,29 @@ def selftest() -> int:
     return 0 if ok_all else 1
 
 
+_USAGE = """MemGuard 用法: mem_guard [选项]
+
+（无参数）   启动托盘常驻程序
+--once      打印一次内存状态并执行一次清理，不进托盘
+--selftest  运行内置自检
+--show      已有实例时静默唤出内存概览窗
+--help/-h   打印本说明
+"""
+
+_HELP_FLAGS = ("--help", "-h", "/?")
+_KNOWN_ARGS = ("--once", "--selftest", "--show") + _HELP_FLAGS
+
+
+def _print_usage(stream=None) -> None:
+    """打印用法；不给 stream 时走 stdout。"""
+    print(_USAGE.rstrip(), file=stream or sys.stdout)
+
+
+def _unknown_args(argv):
+    """返回 argv 里无法识别的参数（不含 argv[0]），供 main() 拒绝并退出。"""
+    return [a for a in argv[1:] if a not in _KNOWN_ARGS]
+
+
 def main() -> None:
     # 控制台 / CI 的默认编码可能无法表示中文（如英文 Windows 的 cp1252），
     # 统一把标准流切到 UTF-8 并容忍不可编码字符，避免打印时抛 UnicodeEncodeError。
@@ -120,6 +143,18 @@ def main() -> None:
                 _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    # 用法 / 写错的参数必须在 _hide_console() 与单实例锁之前分流：
+    # 否则像 `python mem_guard.py --help` 这种会滑进 GUI 分支，
+    # 控制台被藏掉、shell 看着像卡住，GUI 却常驻并持有互斥体，
+    # 之后所有启动都被判成「已有实例」秒退。
+    if [a for a in sys.argv[1:] if a in _HELP_FLAGS]:
+        _print_usage()
+        sys.exit(0)
+    _unknown = _unknown_args(sys.argv)
+    if _unknown:
+        _print_usage(sys.stderr)
+        print(f"未知参数: {' '.join(_unknown)}（可用 --help 查看用法）", file=sys.stderr)
+        sys.exit(2)
     if "--once" in sys.argv:
         once()
     elif "--selftest" in sys.argv:

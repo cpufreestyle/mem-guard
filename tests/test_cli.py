@@ -61,6 +61,51 @@ def test_show_start_falls_back_to_notice_when_signal_fails(monkeypatch):
     assert calls == ["box"]
 
 
+def test_help_flag_prints_usage_and_exits(monkeypatch, capsys):
+    """--help 必须先落到用法输出，不能滑进隐藏 GUI 分支。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--help"])
+    guard = _RecordingGuard()
+    monkeypatch.setattr(cli, "Guard", lambda: guard)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert "--selftest" in capsys.readouterr().out
+    assert guard.kwargs is None, "--help 不该启动托盘"
+
+
+def test_help_flag_wins_over_once(monkeypatch, capsys):
+    """--help 和其他参数同时出现时仍先打印用法，不执行清理。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--once", "--help"])
+    monkeypatch.setattr(cli, "once", lambda: pytest.fail("--help 不该触发 --once"))
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert "--once" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [
+    ["mem_guard.py", "--helpp"],
+    ["mem_guard.py", "--verbose"],
+    ["mem_guard.py", "--once", "--extra"],
+])
+def test_unknown_flag_rejected_instead_of_hidden_gui(monkeypatch, capsys, argv):
+    """写错的参数宁可退出码 2，也不要静默启动隐藏的托盘程序（幽灵实例坑）。"""
+    _quiet(monkeypatch, argv)
+    guard = _RecordingGuard()
+    monkeypatch.setattr(cli, "Guard", lambda: guard)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    assert "未知参数" in capsys.readouterr().err
+    assert guard.kwargs is None
+
+
 @pytest.mark.parametrize("argv,expected", [
     (["mem_guard.py", "--show"], True),
     (["mem_guard.py"], False),

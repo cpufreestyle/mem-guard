@@ -7,8 +7,8 @@
 Windows 托盘小工具：实时监控**物理内存**与**提交内存(commit)**，超阈值自动清理并提醒，专治「明明还剩几 G 却一直弹『内存不足』」——根因是 commit 耗尽（提交上限 = 物理 + 页面文件），而非物理内存。
 
 - 仓库：`cpufreestyle/mem-guard`（本地 `D:\ai share\repo\mem-guard`，main 分支）
-- 最新已发布 tag：`v1.4.3`（CI 自动出 Release，附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）
-- 开发中（**尚未提交**，勿据本文档判定已发布）：`v1.4.4`——任务栏图标链路：窗口图标 / AUMID 任务栏分组 / 桌面与任务栏快捷方式 / 二次启动唤窗
+- 最新已发布 tag：`v1.4.4`（CI 自动出 Release，附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）
+- 开发中（**尚未提交**，勿据本文档判定已发布）：`v1.4.5`——CLI 参数健壮性：`--help` 真正打印用法、未知参数直接退出码 2，堵掉「误触 GUI 分支 → 藏控制台 + 持互斥体」的幽灵实例坑
 - 语言/平台：Python 3.8+ / Windows only（清理调用 `NtSetSystemInformation`，无法跨平台）
 
 ## 2. 快速上手
@@ -146,7 +146,7 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 ## 6. 测试现状
 
 - **单元测试（v1.3.11 起）**：`tests/` 下 pytest 用例（134 项，11 个文件）覆盖 `config` 归一化/钳制、`update._parse_version`、`advisor.analyze`（注入内存状态与 `top` 快照，不依赖真实机器）、`ui` 图标取色/尺寸/缓存淘汰（含"颜色须按原始 float 判断"的回归）、`clean` 的快路径排序/定点补齐/超限不补齐/psutil 兜底、`winapi.process_working_sets` 真实进程对账、`tray` 的图标去重与建议时间节流、`clean`/`actions` 常量绑定回归（拦截底层调用，防 `NameError` 类回归）、`autostart` 缓存语义、`menu` 热重载后仍读写当前配置（防写回覆盖手改值）、`tray` 热重载清零建议节流、`update_config` 增量合并/不覆盖并发写、`_wait_avail_rise` 提前收敛与 `_bump_stats` 口径、`do_clean` **管理员路径**（mock 特权与各动作：档位/区域开关/成败判定/统计）、`winapi` 读取与缓存。v1.4.2 又补「美观/实用性」三项：`ui` 概览与表格纯函数（`_group_rows` 合并同名/`_top_grouped` 超采样再合并/`_fmt_bytes` 单位/`_table_rows` 的 ×N 标记与空 total 占位）、`show_overview/top/advice_window` 的**无 tkinter 回退**（`sys.modules["tkinter"]=None` 触发 ImportError + monkeypatch `message_box` 断言）、以及左键链路`_GuardIcon.__call__`→`open_overview` 与 hooks 绑定回归。运行：`pip install -r requirements-dev.txt && python -m pytest -q`。
-- **任务栏链路回归（v1.4.4 新增）**：`tests/test_pin.py`（8 项：AUMID 与 `cli.py` 侧对账、`SLDF_RUNAS_USER` 位翻/清、任务栏固定目录路径拼接）；`tests/test_cli.py`（4 项：`--show` 早退派发）；`tests/test_winapi.py`（17 项，含 `set_app_user_model_id` 与命名事件 `Local\MemGuard_ShowRequest` 的建/等/发）。注意：monkeypatch 唤醒事件常量时务必核对 `winapi.SHOW_EVENT_NAME`，写成 `SHOWOW_EVENT_NAME` 会让唤窗用例假绿。全量合计 144 项（11 个文件；v1.4.4 新增 test_cli.py 4 项、test_pin.py 8 项；收尾再加 test_winapi 类图标 7 项、test_ui 类图标覆盖 3 项）。
+- **任务栏链路回归（v1.4.4 新增）**：`tests/test_pin.py`（8 项：AUMID 与 `cli.py` 侧对账、`SLDF_RUNAS_USER` 位翻/清、任务栏固定目录路径拼接）；`tests/test_cli.py`（4 项：`--show` 早退派发）；`tests/test_winapi.py`（17 项，含 `set_app_user_model_id` 与命名事件 `Local\MemGuard_ShowRequest` 的建/等/发）。注意：monkeypatch 唤醒事件常量时务必核对 `winapi.SHOW_EVENT_NAME`，写成 `SHOWOW_EVENT_NAME` 会让唤窗用例假绿。全量合计 149 项（11 个文件；v1.4.4 新增 test_cli.py 4 项、test_pin.py 8 项；收尾再加 test_winapi 类图标 7 项、test_ui 类图标覆盖 3 项；v1.4.5 再补 test_cli.py 参数分流 5 项）。
 - **内置自检**：`python mem_guard.py --selftest` 覆盖 get_mem / make_icon / 配置钳制 / 黑名单匹配 / `_parse_version` / advisor / `build_menu` 等，全 PASS 才说明导入链与基本逻辑 OK。非管理员环境下 `do_clean` 走「需管理员」早返回分支，不会真正清理。
 - **CI 顺序**：安装 `requirements-dev.txt` → `pytest -q` → `--selftest` → PyInstaller 打包 → 对**冻结版 exe** 再跑一次 `--selftest` 冒烟。
 
@@ -187,6 +187,13 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
      - 测试：`python -X utf8 -m pytest tests -q` 全量 144 项通过。
    - 收尾顺序：任务栏按钮**实际外观**仍只能由用户在本机 console 会话目视（RDP `CopyFromScreen` 全黑抓不到），本机取证已覆盖到「类图标像素一致 + AUMID 一致 + .lnk 参数正确 + 醒窗还原」。**已发布（2026-09-30）**：commit `3db1235`、tag `v1.4.4` 已推送，CI run 36672928545 success，Release 附件 `mem_guard.exe`(18.9MB) + `MemGuard-Setup-1.4.4.exe`(20.6MB) 已就位。发布 exe 从 Release 下载后直播复验：字节数与附件一致；窗口按「bootloader→子进程」父子链确认归属（launcher pid ≠ 窗口 pid，find_window 按标题找即可，别按 Popen 的 pid 找）；类图标 GCLP_HICON/GCLP_HICONSM 非零，BIG(32)/SMALL(16) 与 `app_icon()` 比分别 475/100 对不透明像素 max_delta=0；最小化后二次启动（**须带 `--show`**，否则 `show_on_start=False`，只弹「已在运行」提示不醒窗）3s 内窗口还原（iconic=False、visible=True）。残留：任务栏按钮**实际外观**仍只能由用户在本机 console 会话目视（RDP `CopyFromScreen` 全黑抓不到）。
 
+9. **v1.4.5 CLI 参数健壮性（代码已完成，尚未 commit/tag）**：`python mem_guard.py --help` 原先不解析 `--help`，直接落到 GUI 分支——控制台被 `_hide_console()` 藏掉、shell 看着像卡住，GUI 却常驻并持有 `Local\MemGuard_SingleInstance` 互斥体，之后所有启动都被判成「已有实例」秒退（exit 0、无窗口），本轮直播取证一度误判成 exe 坏了。现 `cli.main()` 在流重配置之后、`_hide_console()` 与单实例锁之前分流：
+   - `--help` / `-h` / `/?`：打印 `_USAGE` 到 stdout，退出码 0；
+   - 任何不在 `_KNOWN_ARGS`（`--once` / `--selftest` / `--show` + 帮助旗标）里的参数：用法走 stderr 并附「未知参数: xxx（可用 --help 查看用法）」，退出码 2，绝不再静默起隐藏托盘；
+   - `--help` 优先级高于 `--once` / `--selftest`，同时出现时只打印用法、不执行清理。
+   取证（源码实测）：`--help` 输出 8 行用法 rc=0；`--bogus` 输出用法 + 「未知参数: --bogus（可用 --help 查看用法）」rc=2；两者跑完数 `python.exe` 且命令行含 `mem_guard.py` 的进程 = 0（无幽灵实例、无互斥体残留）；`--selftest` 仍全 PASS。测试：`tests/test_cli.py` 补 5 项（help 打印且不启托盘、help 压过 `once`、未知参数 rc=2 且不启托盘），全量 149 项全绿，`pyflakes` 干净。
+   - 兼容面核查：`.lnk`（`pin_taskbar.ps1`）只传 `--show`、安装器快捷方式无 `Parameters`、`install_autostart.ps1` 无参、CI 只跑 `--selftest`，没有调用方会撞上「未知参数退出 2」。
+
 ## 9. 其他踩坑索引（详见 `.codebuddy/memory` 的 `MEMORY.md`）
 
 - 含中文的 `.ps1` 必须 **UTF-8 with BOM**，否则 PowerShell 5.1 按 GBK 解中文引号破坏语法。
@@ -203,7 +210,7 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 - **Win11 右键已无「固定到任务栏」verb**：Shell 里只剩「固定到开始」，`.lnk` 的 `Verbs()` 拿不到；兜底是把快捷方式直接拷进任务栏固定目录 `%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar`，资源管理器会自动显示成任务栏按钮。
   `.lnk` 的「以管理员身份运行」在老的兼容性选项 / verb 上已不生效，只能直接翻文件头 LinkFlags（偏移 20）的 `SLDF_RUNAS_USER`(0x2000) 位；且必须在写 AUMID **之后**翻——`IPersistFile.Commit` 会整存一遍 `.lnk`，可能把先翻好的位冲掉。
 - **RDP 会话里 `Graphics.CopyFromScreen` 抓不到任务栏**：截出来全黑，是会话限制不是 bug。要验证任务栏按钮只能让用户在本机 console 会话目视（必要时注销重登）；替代办法是渲染对比图——把 `ui.app_icon` 的输出与 `make_icon.py` / `mem_guard.ico` 并排像素比对。
-- **`python mem_guard.py --help` 不解析 `--help`**：CLI 只认 `--once`/`--selftest`/`--show`，`--help` 会落到 GUI 分支，控制台被 `_hide_console()` 藏掉、shell 看着像「卡住没输出」，实际 GUI 已常驻并持有 `Local\MemGuard_SingleInstance` 互斥体——之后再启动任何实例都「检测到已有实例」秒退（exit 0、无窗口），直播取证会误判成 exe 坏了。排障：`Get-CimInstance Win32_Process | ? CommandLine -like "*mem_guard*"` 找宿主（进程名是 python.exe，按镜像名过滤会漏）。附带坑：计数/清理 shell 自身命令行含 `mem_guard` 字样会**自匹配**，统计数字永远 ≥1，判断真残留要靠镜像名精确匹配。
+- **`python mem_guard.py --help` 不解析 `--help`**：CLI 只认 `--once`/`--selftest`/`--show`，`--help` 会落到 GUI 分支，控制台被 `_hide_console()` 藏掉、shell 看着像「卡住没输出」，实际 GUI 已常驻并持有 `Local\MemGuard_SingleInstance` 互斥体——之后再启动任何实例都「检测到已有实例」秒退（exit 0、无窗口），直播取证会误判成 exe 坏了。排障：`Get-CimInstance Win32_Process | ? CommandLine -like "*mem_guard*"` 找宿主（进程名是 python.exe，按镜像名过滤会漏）。附带坑：计数/清理 shell 自身命令行含 `mem_guard` 字样会**自匹配**，统计数字永远 ≥1，判断真残留要靠镜像名精确匹配。**v1.4.5 已修**：见 §8 第 9 项，`--help`/未知参数现在在 `_hide_console()` 之前就分流掉了。
 - **exec_command 跑超过约 10s 会静默丢输出**（返回「Script completed」但 output 为空）：长命令一律 `> 文件 2>&1` 再 `Get-Content`，或给 exec 传更长的 `yield_time_ms`。
 - **`apply_patch` 往 `.py` 插新行容易把缩进弄丢**：新增行若只带 LF 行尾、与文件里既有的 CRLF 混用，按行读回来时多个逻辑行会被拼成一整行（例如 `tray.py` 里 7 空格缩进的函数体塌成一行）。凡是给 `.py` 插行，插完立刻 `python -X utf8 -m pyflakes <file>` + 查 lone LF。
 

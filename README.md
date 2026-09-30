@@ -77,6 +77,7 @@ python mem_guard.py
 ```powershell
 python mem_guard.py --once       # 打印一次内存状态并执行一次清理
 python mem_guard.py --selftest   # 运行内置自检
+python mem_guard.py --help       # 打印用法；写错的参数会直接报错退出，不会静默启动托盘
 python -m pytest -q              # 运行单元测试（先 pip install -r requirements-dev.txt）
 ```
 
@@ -234,7 +235,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 
 ## 版本
 
-当前版本 `1.4.4`。
+当前版本 `1.4.5`。
 
 ## 源码结构
 
