@@ -18,9 +18,17 @@ Set-Location $PSScriptRoot
 # 清理旧产物，避免残留干扰
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 
-# 1) 生成程序图标（仅当不存在时）
-if (-not (Test-Path mem_guard.ico)) {
+# 1) 重新生成程序图标：真源是 memguard\ui.py 的 _render_app_icon，make_icon.py
+#    按 16/24/32/48/64 逐个尺寸出图后打成 ico。不能"仅当不存在时生成"——那样
+#    mem_guard.ico 是 gitignore 的本地产物，改过设计的老 checkout 会一直吃旧图标，
+#    打完的 exe 里和窗口标题栏/任务栏按钮不是同一张脸。生成是确定性的（同一份
+#    源码字节级一致），反复生成不会让构建结果漂移。
+try {
     python make_icon.py
+    if (-not (Test-Path mem_guard.ico)) { throw 'make_icon.py 没产出 mem_guard.ico' }
+} catch {
+    Write-Host '[!] 图标生成失败，沿用现有 mem_guard.ico：' $_.Exception.Message
+    if (-not (Test-Path mem_guard.ico)) { throw }
 }
 
 # 2) 组装 PyInstaller 参数
