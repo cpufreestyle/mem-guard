@@ -30,6 +30,8 @@ from .winapi import (
     is_admin,
     kernel32,
     privilege_state,
+    request_show_overview,
+    set_app_user_model_id,
     user32,
 )
 
@@ -137,9 +139,18 @@ def main() -> None:
             sys.stderr = open(os.devnull, "w", encoding="utf-8")
         # 隐藏 python.exe 自带的控制台窗口，托盘程序不停留在前台
         _hide_console()
+        # 任务栏分组：MemGuard 的概览 / Top / 趋势 / 建议窗口在任务栏并成一个按钮，
+        # 并用 System.AppUserModel.ID 与固定到任务栏的快捷方式对上号（两边要一致）。
+        set_app_user_model_id()
+        show_on_start = "--show" in sys.argv
         if not acquire_single_instance():
             log("检测到已有 MemGuard 实例在运行，本次启动已取消")
+            if show_on_start and request_show_overview():
+                # 二次启动（任务栏 / 桌面快捷方式又点了一次）：只负责把概览窗唤出来，
+                # 静默退场，不再重复弹「已在运行」的提示框。
+                log("已通知运行中的实例打开内存概览窗")
+                sys.exit(0)
             # 用守护线程弹提示，主线程立即退出，避免互斥体句柄被卡死的进程长期持有
             message_box("MemGuard", "MemGuard 已在运行（请查看系统托盘），本次不再重复启动。")
             sys.exit(0)
-        Guard().run()
+        Guard().run(show_on_start=show_on_start)

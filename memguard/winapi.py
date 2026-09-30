@@ -58,6 +58,215 @@ SW_HIDE = 0
 # 小图标（托盘用）像素边长，Windows 已按当前 DPI 折算
 SM_CXSMICON = 49
 
+# ---------------------------------------------------------------- 任务栏分组与唤窗
+
+# 任务栏分组标识：MemGuard 的概览 / Top / 趋势 / 建议窗口都归到同一个任务栏按钮下，
+# 而不是散落成四五个「Python 的 Tk 锤子」按钮。固定到任务栏的快捷方式要写同一个值
+# （快捷方式的 System.AppUserModel.ID），两边一致才会并到一个按钮上。
+APP_USER_MODEL_ID = "MemGuard.MemoryGuard"
+
+# 二次启动的「唤窗信号」。从任务栏（或桌面）再点一次图标时，已在运行的实例要能弹出
+# 概览窗，否则用户的感觉就是「点了没反应」。用命名事件而不是写文件/弹窗：零文件依赖。
+# 名字带 Local\ 前缀，只在本会话内可见，同机其它用户收不到。
+SHOW_EVENT_NAME = "Local\\MemGuard_ShowRequest"
+
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
+shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+
+kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateEventW.restype = wintypes.HANDLE
+kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.OpenEventW.restype = wintypes.HANDLE
+kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+kernel32.SetEvent.restype = wintypes.BOOL
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+
+_EVENT_ALL_ACCESS = 0x001F0003
+_WAIT_OBJECT_0 = 0x00000000
+
+
+def set_app_user_model_id(aumid: str = APP_USER_MODEL_ID) -> bool:
+    """给当前进程指定任务栏 AppUserModelID；失败只是分组不正常，托盘照常工作。"""
+    try:
+        return shell32.SetCurrentProcessExplicitAppUserModelID(aumid) >= 0
+    except Exception:
+        return False
+
+
+def create_show_event():
+    """主实例创建唤窗事件；返回句柄，失败返回 None。"""
+    handle = kernel32.CreateEventW(None, False, False, SHOW_EVENT_NAME)
+    return handle or None
+
+
+def open_show_event():
+    """打开运行中实例的唤窗事件；打不开（没在跑 / 老版本）返回 None。"""
+    handle = kernel32.OpenEventW(_EVENT_ALL_ACCESS, False, SHOW_EVENT_NAME)
+    return handle or None
+
+
+def close_show_event(handle) -> None:
+    """释放唤窗事件句柄（进程退出时调用，否则句柄泄漏到内核对象表）。"""
+    if handle:
+        kernel32.CloseHandle(handle)
+
+
+def request_show_overview() -> bool:
+    """通知已在运行的实例打开内存概览窗；返回信号是否送达。"""
+    handle = open_show_event()
+    if not handle:
+        return False
+    try:
+        return bool(kernel32.SetEvent(handle))
+    finally:
+        close_show_event(handle)
+
+
+def wait_show_request(handle, timeout_ms: int = 500) -> bool:
+    """等一次唤窗信号；超时返回 False，供守护线程轮询式等待。"""
+    try:
+        return kernel32.WaitForSingleObject(handle, timeout_ms) == _WAIT_OBJECT_0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- 窗口类图标（HICON）
+
+
+# Tk 的 iconphoto 会自己填类图标（GCLP_HICON / GCLP_HICONSM）：大图直接转 HICON，
+# 小图是从大图重采样得来的，且全程是预乘 alpha——标题栏那枚 16px 会明显发灰
+# （实测红通道比原图低约 20%）。这里按 .ico 32bpp 帧的布局就地造单帧资源字节，
+# 交 CreateIconFromResourceEx 生成 HICON 再覆盖类图标：颜色不经预乘往返。
+GCLP_HICON = -14
+GCLP_HICONSM = -34
+# Tk 顶层窗口的类名：winfo_id() 拿到的是 TkChild（类图标 0），父窗口才是它
+_TK_TOPLEVEL_CLASS = "TkTopLevel"
+# .ico 资源格式版本，CreateIconFromResourceEx 的 dwVersion 必须填这个值
+_ICON_RESOURCE_VERSION = 0x00030000
+LR_DEFAULTCOLOR = 0x00000000
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+# 图标相关 Win32 函数的参数/返回类型在此一次声明（同样是为了 64 位下手动截断句柄）
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.GetParent.argtypes = [wintypes.HWND]
+user32.GetParent.restype = wintypes.HWND
+user32.CreateIconFromResourceEx.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte), wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, wintypes.UINT,
+]
+user32.CreateIconFromResourceEx.restype = wintypes.HANDLE
+user32.SetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+user32.SetClassLongPtrW.restype = ctypes.c_ssize_t
+
+# CreateIconFromResourceEx 不保证调用返回后资源字节就可以丢，按句柄留住缓冲区
+_ICON_RES_KEEPALIVE: list = []
+
+
+def window_class_name(hwnd: int) -> str:
+    """窗口类名；拿不到（句柄失效等）返回空串。"""
+    buf = ctypes.create_unicode_buffer(256)
+    if not user32.GetClassNameW(wintypes.HWND(hwnd), buf, 256):
+        return ""
+    return buf.value
+
+
+def toplevel_hwnd(root) -> int:
+    """tkinter 窗口对应的真·顶层窗口句柄（TkTopLevel）。"""
+    try:
+        child = int(root.winfo_id())
+    except Exception:
+        return 0
+    if not child:
+        return 0
+    try:
+        hwnd = int(user32.GetParent(wintypes.HWND(child)) or 0)
+    except Exception:
+        return 0
+    if not hwnd or window_class_name(hwnd) != _TK_TOPLEVEL_CLASS:
+        return 0
+    return hwnd
+
+
+def _icon_resource_bytes(img) -> bytes:
+    """把 RGBA 图像编成 CreateIconFromResourceEx 吃的单帧 .ico 资源字节。
+
+    布局 = BITMAPINFOHEADER（biHeight 取 2h：XOR 彩色位图与 AND 掩码上下摞）
+    + XOR 彩色位图（BGRA、自底向上）+ AND 掩码（1bpp、行按 4 字节对齐、全零）。
+    alpha 走彩色位图第四通道，与 .ico 32bpp 帧一致，不做任何预乘。
+    """
+    im = img.convert("RGBA")
+    w, h = im.size
+    rgba = im.tobytes("raw", "BGRA")
+    stride = w * 4
+    # DIB 在 biHeight > 0 时自底向上，PIL 给的行是自顶向下，逐行倒序拼回
+    xor = b"".join(rgba[y * stride:(y + 1) * stride] for y in range(h - 1, -1, -1))
+    and_row = (w + 31) // 32 * 4     # 1bpp 行宽按 DWORD 对齐
+    header = BITMAPINFOHEADER(
+        biSize=ctypes.sizeof(BITMAPINFOHEADER), biWidth=w, biHeight=h * 2,
+        biPlanes=1, biBitCount=32, biCompression=0, biSizeImage=len(xor),
+        biXPelsPerMeter=0, biYPelsPerMeter=0, biClrUsed=0, biClrImportant=0,
+    )
+    return bytes(header) + xor + bytes(and_row * h)
+
+
+def icon_handle(img) -> int:
+    """把 PIL RGBA 图像造成单帧 HICON；失败返回 0。"""
+    try:
+        w, h = img.size
+        if not w or not h or w > 256 or h > 256:
+            return 0
+        blob = _icon_resource_bytes(img)
+        buf = ctypes.create_string_buffer(blob)
+        _ICON_RES_KEEPALIVE.append(buf)
+        handle = user32.CreateIconFromResourceEx(
+            ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)),
+            len(blob), True, _ICON_RESOURCE_VERSION, w, h, LR_DEFAULTCOLOR,
+        )
+        return int(handle or 0)
+    except Exception:
+        return 0
+
+
+def set_window_class_icons(hwnd: int, big: int, small: int) -> bool:
+    """给窗口类装大/小两枚类图标（标题栏、Alt-Tab、任务栏按钮都从这里取）。
+
+    类图标按窗口类而不是按窗口生效：同进程的 TkTopLevel 共享一份，所以每个窗口
+    挂完 iconphoto 都要再覆盖一次（Tk 建窗时会重设类图标）。句柄为 0 跳过。
+    SetClassLongPtr 返回的是旧值（旧值本身可能就是 0），成败看 GetLastError。
+    """
+    if not hwnd:
+        return False
+    ok = True
+    try:
+        for index, handle in ((GCLP_HICON, big), (GCLP_HICONSM, small)):
+            if not handle:
+                continue
+            ctypes.set_last_error(0)
+            user32.SetClassLongPtrW(wintypes.HWND(hwnd), index, handle)
+            ok = ctypes.get_last_error() == 0 and ok
+    except Exception:
+        return False
+    return ok
+
 
 # ---------------------------------------------------------------- Win32 内存查询
 

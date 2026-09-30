@@ -10,6 +10,8 @@ import time
 
 import pytest
 
+from PIL import ImageTk
+
 from memguard import ui
 from memguard.ui import (_fmt_bytes, _group_rows, _icon_color, _overview_text,
                           _table_rows, _top_grouped, make_icon,
@@ -280,3 +282,174 @@ def test_trend_returns_silently_without_tkinter(monkeypatch):
     # show_trend_window 先把开关置 True 再起 worker；import 失败由 worker 复位，需轮询等它
     assert _wait(lambda: ui._trend_window_open is False), "无 tkinter 时应复位开关"
     assert boxes == [], "趋势无文本回退，不应弹任何窗口"
+
+
+class _FakePhoto:
+    """顶替 PIL.ImageTk.PhotoImage：测试里不建真 Tk 根窗口也能走完整挂载流程。"""
+
+    def __init__(self, image):
+        self.image = image
+
+
+class _FakeRoot:
+    """记录 iconphoto 调用的假窗口，用来验证图标真的挂上去了。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def iconphoto(self, default, *photos):
+        self.calls.append((default, photos))
+
+    def update_idletasks(self):
+        pass
+
+
+class _BoomRoot(_FakeRoot):
+
+    def iconphoto(self, default, *photos):
+        raise RuntimeError("窗口炸了")
+
+
+def test_app_icon_sizes_are_cached(monkeypatch):
+    """按尺寸取图、按尺寸缓存：同一尺寸拿同一张，避免每次挂窗口重绘。"""
+    monkeypatch.setattr(ui, "_ICON_SS", 4)
+    ui._APP_ICON_CACHE.clear()
+    first = ui.app_icon(16)
+    assert first.size == (16, 16)
+    assert first.mode == "RGBA"
+    assert ui.app_icon(16) is first, "同尺寸应命中缓存"
+    assert ui.app_icon(32).size == (32, 32)
+    assert [ui.app_icon(s).size for s in ui._APP_ICON_SIZES] == [(16, 16), (32, 32), (64, 64)]
+    ui._APP_ICON_CACHE.clear()
+
+
+def test_app_icon_looks_like_the_brand_icon():
+    """圆角方 + 蓝底 + 透明四角：画成方块或纯色就说明比例抄错了。"""
+    img = ui.app_icon(16)
+    assert img.getpixel((0, 0)) == (0, 0, 0, 0), "四角必须透明（圆角）"
+    body = img.getpixel((2, 8))
+    assert body[3] == 255
+    assert body[2] > body[0] and body[2] > 200, f"底色应为品牌蓝，实际 {body}"
+
+
+def test_apply_window_icon_installs_all_sizes(monkeypatch):
+    """三个尺寸一起交给 iconphoto，且 Python 侧留引用——否则 GC 后任务栏按钮变空白。"""
+    monkeypatch.setattr(ImageTk, "PhotoImage", _FakePhoto)
+    root = _FakeRoot()
+    ui.apply_window_icon(root)
+    (default, photos), = root.calls
+    assert default is True, "default=True 让已打开的窗口也立刻换图标"
+    assert [p.image.size for p in photos] == [(16, 16), (32, 32), (64, 64)]
+    # iconphoto 的 *photos 收成元组，ui 侧存的是 list：比内容同一性即可
+    assert list(root._memguard_icon_photos) == list(photos)
+    assert root._memguard_icon_photos[0] is photos[0]
+
+
+def test_apply_window_icon_never_breaks_the_window(monkeypatch):
+    """挂图标失败（老 Tk / 无 PIL）必须静默跳过，不能连带窗口打不开。"""
+    monkeypatch.setattr(ImageTk, "PhotoImage", _FakePhoto)
+    ui.apply_window_icon(_BoomRoot())          # 不应抛出
+    monkeypatch.setattr(ImageTk, "PhotoImage", _boom_photo())
+    ui.apply_window_icon(_FakeRoot())          # PhotoImage 构造失败也不应抛出
+
+
+def _boom_photo():
+    def make(image):
+        raise RuntimeError("no Tk")
+    return make
+
+
+class _RaiseRoot:
+    """记录 deiconify / lift / focus_force 的假窗口：验证唤窗真的会亮出来。"""
+
+    def __init__(self, exists=True):
+        self.calls = []
+        self._exists = exists
+
+    def deiconify(self):
+        self.calls.append("deiconify")
+
+    def update_idletasks(self):
+        self.calls.append("update_idletasks")
+
+    def lift(self):
+        self.calls.append("lift")
+
+    def focus_force(self):
+        self.calls.append("focus_force")
+
+    def winfo_exists(self):
+        return self._exists
+
+
+def test_raise_window_restores_and_focuses():
+    """最小化、被压住的窗口要三件套救回来：deiconify + lift + focus_force。"""
+    root = _RaiseRoot()
+    ui._raise_window(root)
+    assert root.calls == ["deiconify", "update_idletasks", "lift", "focus_force"]
+
+
+def test_raise_window_never_raises_on_dead_window():
+    """窗口刚关掉时 deiconify 会抛：唤窗失败不能把托盘线程带崩。"""
+
+    class _DeadRoot(_RaiseRoot):
+
+        def deiconify(self):
+            raise RuntimeError("bad window path name")
+
+    ui._raise_window(_DeadRoot())          # 不应抛出
+
+
+def test_show_overview_window_raises_existing_window(monkeypatch):
+    """概览窗已开着时再点（托盘左键 / 任务栏二次启动）：不再静默返回，而是发唤窗请求。"""
+    monkeypatch.setattr(ui, "_overview_window_open", True)
+    ui._overview_raise.clear()
+    ui.show_overview_window({})
+    assert ui._overview_raise.is_set(), "已开着的窗口应被要求亮出来"
+    ui._overview_raise.clear()
+
+
+# ---------------------------------------------------------------- 窗口类图标覆盖
+
+
+def test_apply_window_icon_overrides_class_icons(monkeypatch):
+    """iconphoto 之后必须自造 HICON 覆盖类图标（Tk 的重采样小图标发灰）。"""
+    seen = {}
+    monkeypatch.setattr(ImageTk, "PhotoImage", _FakePhoto)
+    monkeypatch.setattr(ui, "toplevel_hwnd", lambda root: 4321)
+    monkeypatch.setattr(
+        ui, "set_window_class_icons",
+        lambda hwnd, big, small: seen.update(hwnd=hwnd, big=big, small=small) or True)
+    ui.apply_window_icon(_FakeRoot())
+    assert seen["hwnd"] == 4321
+    assert isinstance(seen["big"], int) and seen["big"] > 0
+    assert isinstance(seen["small"], int) and seen["small"] > 0
+
+
+def test_override_icons_are_cached_per_size(monkeypatch):
+    """同尺寸 HICON 只造一次：四个 Tk 窗口共享同一个类，重复造没意义。"""
+    built = []
+    monkeypatch.setattr(ImageTk, "PhotoImage", _FakePhoto)
+    monkeypatch.setattr(ui, "toplevel_hwnd", lambda root: 4321)
+    monkeypatch.setattr(ui, "set_window_class_icons", lambda *args: True)
+    monkeypatch.setattr(ui, "icon_handle",
+                        lambda img: built.append(img.size[0]) or 1000 + img.size[0])
+    ui._CLASS_ICON_CACHE.clear()
+    ui.apply_window_icon(_FakeRoot())
+    ui.apply_window_icon(_FakeRoot())
+    assert built == [32, 16]
+    assert ui._CLASS_ICON_CACHE == {32: 1032, 16: 1016}
+    ui._CLASS_ICON_CACHE.clear()
+
+
+def test_override_failure_keeps_tk_icons(monkeypatch):
+    """覆盖失败（SetClassLongPtr 炸）必须静默：Tk 那份图标依旧在，窗口照常。"""
+    monkeypatch.setattr(ImageTk, "PhotoImage", _FakePhoto)
+    monkeypatch.setattr(ui, "toplevel_hwnd", lambda root: 4321)
+    monkeypatch.setattr(ui, "icon_handle", lambda img: 1)
+
+    def boom(*args):
+        raise RuntimeError("SetClassLongPtr failed")
+
+    monkeypatch.setattr(ui, "set_window_class_icons", boom)
+    ui.apply_window_icon(_FakeRoot())          # 不应抛出

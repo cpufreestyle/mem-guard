@@ -37,6 +37,7 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - **托盘自愈**：托盘后端异常退出（如 Explorer 重启）后自动重建图标，避免「程序在跑但图标不见了」
 - **检查更新**：托盘菜单可查询 GitHub 最新 Release，发现新版本会自动打开下载页
 - **优化建议**：托盘菜单「优化建议」一键分析当前内存状态与配置，给出分级可操作项（页面文件/虚拟内存、权限、阈值合理性、进程高占用与白名单、健康态），无 tkinter 时回退为气泡文本
+- **任务栏按钮有图标**：四个 tkinter 窗口都挂了 MemGuard 自己的品牌图标（蓝底内存颗粒），标题栏 / 任务栏按钮 / Alt-Tab 不再显示 Tk 或 Python 的默认图标；配合 `pin_taskbar.ps1` 可固定到任务栏并建桌面快捷方式，见「任务栏图标与桌面快捷方式」
 
 ## 界面预览
 
@@ -137,6 +138,33 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 （绿色版/本地 `dist\mem_guard.exe` 同理：托盘菜单勾选即把 **exe 绝对路径** 注册为登录计划任务。
 搬家或重新打包后，exe 路径变了，重新勾选一次即可；桌面图标重新「发送到 → 桌面快捷方式」即可。）
 
+## 任务栏图标与桌面快捷方式
+
+```powershell
+.\pin_taskbar.ps1 -Where both                   # 任务栏 + 桌面各放一枚（幂等，可反复执行）
+.\pin_taskbar.ps1                              # 只固定到任务栏
+.\pin_taskbar.ps1 -Where desktop               # 只建桌面快捷方式，不动任务栏
+.\pin_taskbar.ps1 -Where both -Mode unpin      # 两处都撤掉
+.\pin_taskbar.ps1 -ExePath dist\mem_guard\mem_guard.exe   # 指定目录版产物
+```
+
+- 目标 exe 默认取 `dist\mem_guard.exe`（单文件版），其次 `dist\mem_guard\mem_guard.exe`（目录版），
+  与 `build.ps1` 的两种产物对应；找不到会明确报错，不会静默失败。
+- **不需要管理员权限**：只往当前用户的任务栏固定目录和桌面写 `.lnk`。
+- 快捷方式带 `--show`：程序没在跑时点它，启动后直接把「内存概览」窗带出来（否则用户的感觉就是「点了没反应」）；
+  程序已经在跑时点它，新进程只发一个唤窗信号然后静默退出——不会变成双实例，也不会再弹一次「已在运行」。
+- 快捷方式写入了 `System.AppUserModel.ID`（`MemGuard.MemoryGuard`），与运行进程里 `SetCurrentProcessExplicitAppUserModelID` 的值一致，
+  任务栏上「固定的一枚」和「运行中的一枚」才会并成一个按钮。两边由 `tests\test_pin.py` 自动对账，改一边记得改另一边。
+- 快捷方式同时带「以管理员身份运行」（清理要动其它进程的工作集，与 `启动 MemGuard（管理员）.bat` / 开机自启计划任务同一权限口径）。
+  **首次点击会弹一次 UAC，这是 Windows 的正常行为**，不是出错。
+- 图标取 exe 自带的那一枚（打包时 `--icon mem_guard.ico` 写进去的），任务栏按钮、窗口标题栏、托盘图标是同一张脸；
+  四个 tkinter 窗口（概览 / Top10 / 趋势 / 优化建议）也都挂了同一枚窗口图标，不会出现「Python 的 Tk 锤子」。
+
+> Windows 11 的 `.lnk` 右键菜单已移除「固定到任务栏」（只剩「固定到开始」），所以脚本走兜底路径——
+> 把快捷方式放进任务栏固定目录 `%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar`，
+> 资源管理器会自动把它显示成任务栏按钮。
+> 若任务栏没立即出现按钮，注销重登一次，或重启资源管理器（`explorer.exe`）。
+
 ## 配置文件
 
 首次运行会在同目录生成 `mem_guard.json`：
@@ -193,6 +221,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 
 - `set_pagefile.ps1` / `启动页面文件配置（管理员）.bat`：在 D 盘创建固定大小页面文件（缓解提交内存上限过低导致的"内存不足"）
 - `install_autostart.ps1`：计划任务注册 / 卸载
+- `pin_taskbar.ps1`：固定到任务栏 / 建桌面快捷方式（幂等，不需要管理员权限，可用 `-Mode unpin` 撤掉）
 
 ## 常见问题
 
@@ -205,7 +234,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 
 ## 版本
 
-当前版本 `1.4.3`。
+当前版本 `1.4.4`。
 
 ## 源码结构
 

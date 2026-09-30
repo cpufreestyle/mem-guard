@@ -21,7 +21,8 @@ from .config import CONFIG_PATH, __version__, gb, load_config, log
 from .menu import build_menu
 from .ui import (make_icon, show_advice_window, show_overview_window,
                 show_top_window, show_trend_window)
-from .winapi import get_mem, is_admin
+from .winapi import (close_show_event, create_show_event, get_mem, is_admin,
+                    wait_show_request)
 
 # ---------------------------------------------------------------- 主程序
 
@@ -41,6 +42,7 @@ class Guard:
         self.last_scheduled = time.time()  # 定时清理计时起点（启动后先等一个完整周期）
         self.stop = threading.Event()
         self.icon: pystray.Icon | None = None
+        self._show_event = None       # 唤窗事件句柄：给二次启动的信号用
 
     # -- 循环 ----------------------------------------------------
 
@@ -60,6 +62,33 @@ class Guard:
             "trend": lambda: show_trend_window(lambda: list(self.history)),
             "advice": lambda: show_advice_window(self.cfg),
         })
+
+    # -- 唤窗信号（从任务栏再点一次图标时用）-------------------------------------
+
+    def _start_show_waiter(self) -> None:
+        """监听「唤窗信号」，让二次启动能把概览窗唤出来。
+
+        信号是命名事件（见 winapi），等待放在守护线程里轮询，不占托盘主循环的精力。
+        开机自启默认不带 --show，也就没人往里发信号，登录时不会弹窗。
+        """
+        if self._show_event is not None:
+            return
+        self._show_event = create_show_event()
+        if self._show_event is None:
+            log("唤窗事件创建失败：任务栏图标再次点击时无法唤出概览窗")
+            return
+        threading.Thread(target=self._show_waiter, daemon=True).start()
+
+    def _show_waiter(self) -> None:
+        handle = self._show_event
+        while handle and not self.stop.is_set():
+            try:
+                if wait_show_request(handle):
+                    self.open_overview()
+            except Exception as e:
+                log(f"唤窗等待异常: {e!r}")
+                break
+
 
     def _auto_clean(self, now: float, reason: str, s: dict) -> None:
         """执行一次自动清理并弹通知（各触发源共用；reason 用于日志与通知标题）。"""
@@ -202,7 +231,7 @@ class Guard:
                 log(f"监控异常: {e}")
             self.stop.wait(self.cfg["interval"])
 
-    def run(self) -> None:
+    def run(self, show_on_start: bool = False) -> None:
         s = get_mem()
         log(f"MemGuard v{__version__} 启动 | 管理员={is_admin()} | 物理 {s['phys_pct']:.0f}% | "
             f"提交 {s['commit_pct']:.0f}% | 档位={self.cfg.get('clean_level')}")
@@ -211,12 +240,19 @@ class Guard:
         # 监控线程只启动一次；托盘图标在循环内可被重建，实现"托盘自愈"
         threading.Thread(target=self.monitor, daemon=True).start()
 
+        self._start_show_waiter()
         while not self.stop.is_set():
             try:
                 self.icon = _GuardIcon(
                     "MemGuard", make_icon(self.state["phys_pct"], self.cfg["phys_threshold"]),
                     "MemGuard 运行中", build_menu(self), on_left_click=self.open_overview,
                 )
+                if show_on_start:
+                    # 从任务栏/桌面快捷方式主动启动：把概览窗一起带出来。
+                    # 开机自启不带 --show，不会走到这里，登录时不会弹窗。
+                    # 托盘自愈重建后不重复弹，所以这里当一次性开关用。
+                    show_on_start = False
+                    threading.Thread(target=self.open_overview, daemon=True).start()
                 self.icon.run()
             except Exception as e:
                 log(f"托盘异常退出: {e!r}")
@@ -227,6 +263,8 @@ class Guard:
             log("托盘未正常退出，1 秒后重建图标（自愈）")
             time.sleep(1.0)
         log("MemGuard 已退出")
+
+        close_show_event(self._show_event)
 
 
 class _GuardIcon(pystray.Icon):
