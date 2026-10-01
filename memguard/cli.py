@@ -29,6 +29,7 @@ from .winapi import (
     get_mem,
     is_admin,
     kernel32,
+    pin_tray_to_corner,
     privilege_state,
     request_show_overview,
     set_app_user_model_id,
@@ -111,17 +112,50 @@ def selftest() -> int:
     return 0 if ok_all else 1
 
 
+def pin_tray_cli() -> int:
+    """--pin-tray：把托盘图标固定到任务栏角区。
+
+    IsPromoted 写进注册表后，只有重启 Explorer 才会重新排布托盘，重启会让任务栏
+    闪一下、已打开的资源管理器窗口全部关闭，所以先向用户说明再动手。条目不存在时
+    （程序还没起过）会先用 NIM_ADD 补一枚占位图标把条目逼出来——2026-10-01 实测：
+    当前 Windows 构建上 Explorer 已不再为 NIM_ADD 建条目，首装真正可行的做法是
+    让用户在系统托盘设置里手动把图标拖出折叠区一次。
+    """
+    print("将把 MemGuard 托盘图标固定到任务栏角区。")
+    print("生效需要重启 Explorer：任务栏会闪一下，已打开的资源管理器窗口会关闭。")
+    state = pin_tray_to_corner()
+    if state == "pinned":
+        print("完成：注册表已写入常驻标记，Explorer 已重启。")
+        print("启动 MemGuard 后若图标仍在折叠区，请在任务栏托盘设置里手动拖出一次；")
+        print("拖出后注册表条目生成，之后再运行本命令即可长期保持。")
+        return 0
+    if state == "already":
+        print("无需处理：注册表已是常驻（IsPromoted=1）。")
+        print("若图标仍在折叠区：首装需在托盘设置里手动拖出一次；之后重启 Explorer 即生效。")
+        return 1
+    if state == "missing":
+        print("失败：注册表里没有本程序的托盘条目，NIM_ADD 也没能让 Explorer 建出来。")
+        print("请先在系统托盘设置里手动拖出 MemGuard 图标一次，再运行本命令。")
+        return 1
+    if state == "restart_failed":
+        print("注册表已写入，但 Explorer 重启失败或超时；请手动重启 Explorer。")
+        return 1
+    print("失败：当前平台不支持（仅 Windows）。")
+    return 1
+
+
 _USAGE = """MemGuard 用法: mem_guard [选项]
 
 （无参数）   启动托盘常驻程序
 --once      打印一次内存状态并执行一次清理，不进托盘
 --selftest  运行内置自检
 --show      已有实例时静默唤出内存概览窗
+--pin-tray   写 IsPromoted 注册表并重启 Explorer（首装需先手动拖出图标一次，任务栏会闪一下）
 --help/-h   打印本说明
 """
 
 _HELP_FLAGS = ("--help", "-h", "/?")
-_KNOWN_ARGS = ("--once", "--selftest", "--show") + _HELP_FLAGS
+_KNOWN_ARGS = ("--once", "--selftest", "--show", "--pin-tray") + _HELP_FLAGS
 
 
 def _print_usage(stream=None) -> None:
@@ -166,6 +200,8 @@ def main() -> None:
             except Exception:
                 pass
         sys.exit(selftest())
+    elif "--pin-tray" in sys.argv:
+        sys.exit(pin_tray_cli())
     else:
         # pythonw.exe 启动时没有标准输出流，兜底到空设备，避免任何 print 抛异常
         if sys.stdout is None:

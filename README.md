@@ -34,6 +34,7 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - 配置热重载（改 `mem_guard.json` 无需重启）、内存趋势窗口、一键导出诊断
 - 超阈值自动清理支持**防抖**（`debounce_sec`），避免内存边缘抖动误触发
 - **配置校验**：越界 / 脏配置会被自动钳制回合法范围，不会让程序跑飞
+- **托盘常驻**：启动时写 `IsPromoted=1` 尝试把图标留在任务栏可见区；`--pin-tray` 会重启 Explorer 立即生效。**实测限制（2026-10-01）**：当前 Windows 构建上 Explorer 不再为程序化登记的图标建注册表条目，首装须在系统托盘设置里手动拖出一次，之后本机制才有着落
 - **托盘自愈**：托盘后端异常退出（如 Explorer 重启）后自动重建图标，避免「程序在跑但图标不见了」
 - **检查更新**：托盘菜单可查询 GitHub 最新 Release，发现新版本会自动打开下载页
 - **优化建议**：托盘菜单「优化建议」一键分析当前内存状态与配置，给出分级可操作项（页面文件/虚拟内存、权限、阈值合理性、进程高占用与白名单、健康态），无 tkinter 时回退为气泡文本
@@ -78,6 +79,7 @@ python mem_guard.py
 python mem_guard.py --once       # 打印一次内存状态并执行一次清理
 python mem_guard.py --selftest   # 运行内置自检
 python mem_guard.py --help       # 打印用法；写错的参数会直接报错退出，不会静默启动托盘
+python mem_guard.py --pin-tray   # 写 IsPromoted 注册表 + 重启 Explorer（首装仍需按下方「托盘常驻」手动拖出一次）
 python -m pytest -q              # 运行单元测试（先 pip install -r requirements-dev.txt）
 ```
 
@@ -166,6 +168,28 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 > 资源管理器会自动把它显示成任务栏按钮。
 > 若任务栏没立即出现按钮，注销重登一次，或重启资源管理器（`explorer.exe`）。
 
+### 托盘常驻（图标固定在任务栏角区）
+
+Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区（任务栏角区那个 ^ 里面）。Explorer
+判断要不要常驻一个图标，只看注册表 `HKCU\Control Panel\NotifyIconSettings\<条目>\IsPromoted`，
+而这个值**只在 Explorer 启动时读一次**：只写注册表、不重启外壳是无效的——对已存在的条目补发
+`NIM_ADD` 也不会让外壳重排（它按内存里已有的排布结果走），必须重启外壳才生效。所以常驻 =
+「条目存在」+「IsPromoted=1」+「Explorer 重启外壳」，三样缺一不可。
+
+- 启动时：托盘图标登记完成后顺手把 `IsPromoted=1` 写进注册表，**只写注册表，绝不擅自重启你的外壳**；
+  任何失败只记日志，托盘本身照常工作。
+- 首装补条目：注册表条目只能由 Explorer 在图标首次登记时创建，程序一次都没起过时条目不存在。
+- **实测限制（2026-10-01）**：当前 Windows 构建上，Explorer 不再响应 `NIM_ADD`/`NIM_DELETE`
+  自动建条目（探针全程查不到条目），条目的 key 算法也不是 path/uid 哈希。因此**首装时请先在
+  系统托盘设置里把 MemGuard 图标手动拖出折叠区一次**，条目生成后 `IsPromoted=1` 才有写入目标；
+  拖出这一步无法由程序代劳（UIA / 注册表路线均已实测不可行）。
+- 立即生效：`python mem_guard.py --pin-tray`——先写注册表，再重启 Explorer。代价是任务栏会闪一下、
+  已打开的资源管理器窗口会关闭，所以命令动手前会先把这两件事说明白。退出码：成功 0，其余 1。
+- 条目标识：注册表按**可执行文件绝对路径**区分。dev 实例（`python.exe`）与冻结版
+  （`dist\mem_guard.exe`）各拿各的条目，互不干扰；换机器、换目录或重新打包后，重新跑一次该命令即可。
+- 判断是否成功：肉眼 / 截图是唯一可信判据。`Shell_NotifyIconGetRect` 会说谎——没有注册表条目的
+  活图标照样返回矩形却不渲染（2026-10-01 截图差分证实：slot 零变化），矩形存在不等于图标可见。
+
 ## 配置文件
 
 首次运行会在同目录生成 `mem_guard.json`：
@@ -232,6 +256,11 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 - **清理后浏览器 / IDE 短暂卡顿**：工作集被清空后需重新读盘所致。改用「清理力度 → 保守」，或把该程序名加入 `user_blacklist`。
 - **杀毒软件 / SmartScreen 报毒或拦截**：本工具会调用 `NtSetSystemInformation` 清理内存，行为与 ISLC / Mem Reduct 类似，容易被启发式规则误报。可将其加入杀软白名单；要根治需对 exe 做代码签名（本仓库未签名）。
 - **托盘图标偶尔消失**：v1.3.0 起托盘后端异常退出会自动重建；若仍消失，可查 `mem_guard.log` 里有无「托盘异常退出」记录。
+- **托盘图标被收进折叠区（要戳 ^ 才看得见）**：首装请在系统托盘设置里手动拖出一次；拖出后 `python mem_guard.py --pin-tray` 会写 `IsPromoted=1` 并重启 Explorer 让它保持，原理见「托盘常驻」。
+- **只写了注册表、图标却没动静**：启动时只写 `IsPromoted=1`、不重启外壳，Explorer 仍按内存里的旧排布走。
+  跑一次 `python mem_guard.py --pin-tray` 重启外壳即生效；日志里「托盘常驻已声明」说的就是这种状态。
+- **跑了 `--pin-tray` 仍在折叠区**：先确认命令作用的是**当前在跑的那份程序**——条目按可执行文件绝对路径各存一份
+  （dev 是 `python.exe`，绿色版是 `dist\mem_guard.exe`）；若条目压根没被 Explorer 建出来（首装未手动拖出），请在托盘设置里手动拖出一次再跑该命令。
 
 ## 版本
 
@@ -244,7 +273,7 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 | 文件 | 职责 |
 |---|---|
 | `memguard/config.py` | 版本/路径、默认配置、配置校验与钳制、落盘日志（`log`） |
-| `memguard/winapi.py` | ctypes 绑定：内存读取（`get_mem`）、进程快路径枚举（`process_working_sets`，Toolhelp32 + `GetProcessMemoryInfo`）、特权（启用/禁用/查询）、单实例互斥体、底层清理调用（`_purge_list` / `clear_file_cache`） |
+| `memguard/winapi.py` | ctypes 绑定：内存读取（`get_mem`）、进程快路径枚举（`process_working_sets`，Toolhelp32 + `GetProcessMemoryInfo`）、特权（启用/禁用/查询）、单实例互斥体、底层清理调用（`_purge_list` / `clear_file_cache`）、托盘常驻（`IsPromoted` 读写 / `Shell_NotifyIconGetRect` / 重启 Explorer） |
 | `memguard/privileges.py` | 清理所需高危特权的启用与「用完即恢复」（`clean_privileges` 上下文管理器） |
 | `memguard/actions.py` | 单步清理动作封装：工作集 / 修改页 / standby / 文件缓存，返回原始 NTSTATUS（`purge_working_sets` 等） |
 | `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets`）、Top 进程统计 |
@@ -253,8 +282,8 @@ ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss   # 产物 dist\MemGuard-
 | `memguard/diag.py` | 诊断导出：内存状态 / 进程 / 日志 / 配置打包为 zip（`export_diagnostics`） |
 | `memguard/update.py` | 更新检查：查询 GitHub 最新 Release 并比较版本（`fetch_latest_release` / `_parse_version`） |
 | `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（`build_menu(guard)`） |
-| `memguard/tray.py` | 主循环 `Guard`：运行状态、配置热重载、监控循环与托盘图标自愈 |
-| `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、控制台隐藏等启动流处理 |
+| `memguard/tray.py` | 主循环 `Guard`：运行状态、配置热重载、监控循环、托盘图标自愈与常驻声明 |
+| `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、`--pin-tray`、控制台隐藏等启动流处理 |
 | `memguard/advisor.py` | 优化建议引擎：基于内存状态与配置生成分级建议（`analyze` / `format_advice`） |
 | `mem_guard.py` | 薄启动器，仅 `from memguard.cli import main`，保持 `python mem_guard.py` 入口不变 |
 

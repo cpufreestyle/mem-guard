@@ -120,3 +120,55 @@ def test_guard_receives_show_flag(monkeypatch, argv, expected):
 
     assert guard.kwargs is expected
 
+
+
+@pytest.mark.parametrize("state,expected", [
+    ("pinned", 0),
+    ("already", 1),
+    ("missing", 1),
+    ("restart_failed", 1),
+    ("unsupported", 1),
+])
+def test_pin_tray_exit_codes(monkeypatch, capsys, state, expected):
+    """只有重启 Explorer 成功才是 0；其余情况都让调用方看见非零。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--pin-tray"])
+    monkeypatch.setattr(cli, "pin_tray_to_corner", lambda: state)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == expected
+    assert "Explorer" in capsys.readouterr().out
+
+
+def test_pin_tray_warns_before_restarting_shell(monkeypatch, capsys):
+    """重启外壳有代价，必须先打招呼再动手。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--pin-tray"])
+    order = []
+    monkeypatch.setattr(cli, "pin_tray_to_corner",
+                        lambda: order.append("act") or "already")
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    assert "任务栏" in capsys.readouterr().out, "提示里必须说清任务栏会闪"
+    assert order == ["act"]
+
+
+def test_pin_tray_does_not_start_guard(monkeypatch):
+    """--pin-tray 是维护命令，不该顺手常驻一个托盘实例。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--pin-tray"])
+    guard = _RecordingGuard()
+    monkeypatch.setattr(cli, "Guard", lambda: guard)
+    monkeypatch.setattr(cli, "pin_tray_to_corner", lambda: "already")
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    assert guard.kwargs is None
+
+
+def test_pin_tray_advertised_in_usage():
+    """漏进 _KNOWN_ARGS 会被当成未知参数拒掉，_USAGE 也要写明白。"""
+    assert "--pin-tray" in cli._KNOWN_ARGS
+    assert "--pin-tray" in cli._USAGE

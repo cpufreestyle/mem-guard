@@ -191,3 +191,102 @@ def test_guard_icon_left_click_swallows_errors(monkeypatch):
     icon = _GuardIcon("MemGuard", None, "tip", menu=None, on_left_click=boom)
     icon()                          # 不应抛出
     assert any("概览窗口打开失败" in m for m in logged)
+
+
+
+# ---------------------------------------------------------------- 托盘常驻声明
+
+class _RecordingThreading:
+    """顶替 tray.threading 里的 Thread：只拦起后台线程，其余全走真的。
+
+    Guard.__init__ 自己要用 threading.Event()，所以只覆盖 Thread。
+    inline=True 时 target 当场跑完，用来同步断言日志。
+    """
+
+    def __init__(self, inline=False):
+        import threading as _real
+        self._real = _real
+        self._inline = inline
+        self.started = 0 if inline else []
+
+    def Thread(self, target=None, **kw):
+        if self._inline:
+            target()
+            self.started += 1
+        else:
+            self.started.append(target)
+        return _NoopThread()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _NoopThread:
+    def start(self):
+        pass
+
+
+def test_declare_tray_pin_dispatches_background_worker_once(monkeypatch):
+    """托盘自愈重建后 run() 会再来一遍：注册表只该写一次，且不能卡住主循环。"""
+    threading_fake = _RecordingThreading()
+    monkeypatch.setattr(tray, "threading", threading_fake)
+    guard = Guard()
+    guard._declare_tray_pin()
+    guard._declare_tray_pin()
+    assert len(threading_fake.started) == 1, "重复调用只该起一个后台线程"
+    assert guard._tray_pin_done is True
+
+
+def test_tray_pin_worker_waits_for_the_entry(monkeypatch):
+    """pystray 的 NIM_ADD 还没发生，所以必须带 wait_sec 等条目出现。"""
+    calls, logs = [], []
+    monkeypatch.setattr(tray, "ensure_tray_promoted",
+                        lambda **kw: calls.append(kw) or "updated")
+    monkeypatch.setattr(tray, "log", logs.append)
+    Guard()._tray_pin_worker()
+    assert calls == [{"wait_sec": tray.TRAY_PIN_WAIT}]
+    assert "IsPromoted" in logs[0]
+
+
+def test_tray_pin_worker_never_registers_a_placeholder(monkeypatch):
+    """托盘进程自己就有图标，补占位只会多出个重复条目：allow_add 必须关着。"""
+    calls = []
+    monkeypatch.setattr(tray, "ensure_tray_promoted", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+    Guard()._tray_pin_worker()
+    assert calls[0].get("allow_add") is not True
+
+
+def test_declare_tray_pin_missing_entry_still_informs(monkeypatch):
+    """条目还没生成时给一句提示，让用户知道下次启动会补上。"""
+    logs = []
+    monkeypatch.setattr(tray, "ensure_tray_promoted", lambda **kw: "missing")
+    monkeypatch.setattr(tray, "log", logs.append)
+    Guard()._tray_pin_worker()
+    assert len(logs) == 1
+    assert "注册表" in logs[0]
+
+
+def test_declare_tray_pin_already_is_silent(monkeypatch):
+    """已经常驻：一句就够，不该反复刷。"""
+    logs = []
+    monkeypatch.setattr(tray, "ensure_tray_promoted", lambda **kw: "already")
+    monkeypatch.setattr(tray, "log", logs.append)
+    Guard()._tray_pin_worker()
+    assert len(logs) == 1
+    assert "IsPromoted" in logs[0]
+
+
+def test_declare_tray_pin_swallows_registry_errors(monkeypatch):
+    """注册表炸了也只记日志：托盘循环不能被声明动作带崩。"""
+    def boom(**kw):
+        raise OSError("registry denied")
+
+    logs = []
+    monkeypatch.setattr(tray, "ensure_tray_promoted", boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+    monkeypatch.setattr(tray, "threading", _RecordingThreading(inline=True))
+    guard = Guard()
+    guard._declare_tray_pin()          # 不应抛出
+    assert guard._tray_pin_done is True
+    assert any("失败" in m for m in logs)

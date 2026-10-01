@@ -21,10 +21,14 @@ from .config import CONFIG_PATH, __version__, gb, load_config, log
 from .menu import build_menu
 from .ui import (make_icon, show_advice_window, show_overview_window,
                 show_top_window, show_trend_window)
-from .winapi import (close_show_event, create_show_event, get_mem, is_admin,
-                    wait_show_request)
+from .winapi import (close_show_event, create_show_event, ensure_tray_promoted,
+                    get_mem, is_admin, wait_show_request)
 
 # ---------------------------------------------------------------- 主程序
+
+# pystray 的 NIM_ADD 发生在 icon.run() 里，而 _declare_tray_pin 抢在它前面跑，注册表
+# 条目多半还没影；最多等这么久让条目出现，等不到就交给日志说明。
+TRAY_PIN_WAIT = 15.0
 
 
 class Guard:
@@ -43,6 +47,8 @@ class Guard:
         self.stop = threading.Event()
         self.icon: pystray.Icon | None = None
         self._show_event = None       # 唤窗事件句柄：给二次启动的信号用
+        self._tray_pin_done = False   # 托盘常驻声明是否已尝试过（只试一次）
+
 
     # -- 循环 ----------------------------------------------------
 
@@ -231,6 +237,41 @@ class Guard:
                 log(f"监控异常: {e}")
             self.stop.wait(self.cfg["interval"])
 
+    def _declare_tray_pin(self) -> None:
+        """图标登记后顺手把「常驻托盘」写进注册表。
+
+        pystray 的 NIM_ADD 在 icon.run() 里才发生，本方法抢在它前面，条目多半还没影，
+        所以丢到后台线程里等（最多 TRAY_PIN_WAIT 秒），别卡住托盘主循环。Explorer 也
+        只在（重）启时读 IsPromoted，所以这里只写注册表；重启动作留给 --pin-tray，
+        绝不擅自重启用户的外壳。任何失败只记日志，托盘照常工作。
+
+        这里不补占位图标（allow_add=False）：托盘进程自己就有图标，再 NIM_ADD 一枚
+        只会多出个重复条目。占位图标是 --pin-tray 那条「程序还没起」的流的补法。
+        """
+        if self._tray_pin_done:
+            return
+        self._tray_pin_done = True
+        threading.Thread(target=self._tray_pin_worker, daemon=True).start()
+
+    def _tray_pin_worker(self) -> None:
+        """后台等条目出现并写 IsPromoted。"""
+        try:
+            result = ensure_tray_promoted(wait_sec=TRAY_PIN_WAIT)
+        except Exception as e:
+            log(f"托盘常驻声明失败: {e!r}")
+            return
+        if result == "updated":
+            log("托盘常驻已声明（注册表 IsPromoted=1）；重启 Explorer 后生效，"
+                "或运行 mem_guard --pin-tray 立即生效")
+        elif result == "missing":
+            log(f"托盘常驻：等 {TRAY_PIN_WAIT:.0f} 秒仍未在注册表见到本程序条目，"
+                "本次跳过（下次启动自动补）")
+        elif result == "unsupported":
+            log("托盘常驻：当前平台不支持（非 Windows）")
+        elif result == "already":
+            log("托盘常驻：注册表已是常驻（IsPromoted=1）")
+
+
     def run(self, show_on_start: bool = False) -> None:
         s = get_mem()
         log(f"MemGuard v{__version__} 启动 | 管理员={is_admin()} | 物理 {s['phys_pct']:.0f}% | "
@@ -247,6 +288,7 @@ class Guard:
                     "MemGuard", make_icon(self.state["phys_pct"], self.cfg["phys_threshold"]),
                     "MemGuard 运行中", build_menu(self), on_left_click=self.open_overview,
                 )
+                self._declare_tray_pin()
                 if show_on_start:
                     # 从任务栏/桌面快捷方式主动启动：把概览窗一起带出来。
                     # 开机自启不带 --show，不会走到这里，登录时不会弹窗。

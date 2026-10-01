@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wintypes
+import sys
+import time
 
 # ---------------------------------------------------------------- Win32 句柄
 
@@ -559,3 +561,503 @@ def _purge_list(cmd: int) -> int:
 def clear_file_cache() -> bool:
     """清空系统文件缓存工作集。传 -1 表示不限大小，效果为立即释放缓存。"""
     return bool(kernel32.SetSystemFileCacheSize(ctypes.c_size_t(-1), ctypes.c_size_t(-1), 0))
+
+
+# ---------------------------------------------------------------- 托盘常驻（NotifyIconSettings）
+
+# Win11 的任务栏托盘分两块：角区（常驻）与 chevron 飞out（折叠区）。新登记的图标一律进
+# 飞out，只有 HKCU\Control Panel\NotifyIconSettings 里对应条目带上 IsPromoted=1，
+# Explorer 才会把它排进角区。条目 key 名是「可执行路径 + UID」的哈希，没有现成算法、
+# 也预创建不出来，只能让 Explorer 自己建：进程里 NIM_ADD 一枚图标，Explorer 收到就建。
+#
+# v1.4.5 逐条实测取证后，机制是「三条同时满足」的组合，缺一不可：
+#   1) 条目存在（图标已登记；首装时先用 NIM_ADD 占位把条目逼出来）；
+#   2) 条目里 IsPromoted=1（DWORD，唯一权威开关）；
+#   3) Explorer 重启外壳：晋升状态由 Explorer 维护在内存里，只在启动时读一次注册表，
+#      整个生命周期内 PromotedIconCache / IconStreams / TrayNotify 都不随晋升变化
+#      （Compare-Object 零 diff），所以那三个值一个都不用写。
+# 拖拽图标进角区之所以生效，是它同时满足了 2+3：Explorer 自己写内存态、自己重排。
+# 只满足 2 不满足 3 时角区不动，只满足 1+3 时仍折叠 —— 两种都实测复现过。
+#
+# 判据：Shell_NotifyIconGetRect 对已登记图标返回它的格子矩形，未登记返回 E_FAIL；
+# 折叠中的图标返回 chevron 格，晋升后返回角区里的真实格子。
+#
+# 本节按这个流程分工：造条目（首装）-> 写 IsPromoted -> 重启外壳。
+try:
+    import winreg
+except ImportError:  # 非 Windows 平台兜底（本模块其余部分在非 Windows 上本就不可用）
+    winreg = None
+
+NOTIFY_ICON_SETTINGS_PATH = r"Control Panel\NotifyIconSettings"
+_TRAY_EXE = "ExecutablePath"
+_TRAY_UID = "UID"
+_TRAY_PROMOTED = "IsPromoted"
+TRAY_OWN_UID = 0  # pystray 对所有托盘图标都用 uID=0，注册表里的 UID 同值
+
+_S_OK = 0
+
+
+class NOTIFYICONIDENTIFIER(ctypes.Structure):
+    """Shell_NotifyIconGetRect 的标识结构；cbSize 必须打头，否则返回 E_INVALIDARG。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("guidItem", ctypes.c_byte * 16),
+    ]
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+shell32.Shell_NotifyIconGetRect.argtypes = [
+    ctypes.POINTER(NOTIFYICONIDENTIFIER),
+    ctypes.POINTER(RECT),
+]
+shell32.Shell_NotifyIconGetRect.restype = ctypes.c_long
+
+user32.EnumWindows.argtypes = [
+    ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+    wintypes.LPARAM,
+]
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+
+
+# ---------------------------------------------------------------- NIM_ADD（首装造条目）
+
+NIM_ADD = 0x00000000
+NIM_DELETE = 0x00000002
+
+NIF_MESSAGE = 0x00000001
+NIF_TIP = 0x00000004
+
+# 托盘回调消息编号：占位窗口不承接任何语义，WndProc 收到即丢。
+_TRAY_CALLBACK = 0x0400 + 0x0700
+
+_PROBE_CLASS = "MemGuardTrayProbe"
+_PROBE_CLASS_READY = False
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    """Shell_NotifyIconW 的数据结构；cbSize 必须打头，Windows 按它决定读哪些字段。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uTimeoutOrVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+    ]
+
+
+class WNDCLASSEXW(ctypes.Structure):
+    """RegisterClassExW 用；lpfnWndProc 必须持有 ctypes 回调对象，否则被 GC 掉。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND,
+                                          wintypes.UINT, wintypes.WPARAM,
+                                          wintypes.LPARAM)),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+        ("hIconSm", wintypes.HICON),
+    ]
+
+
+shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                  wintypes.WPARAM, wintypes.LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_ssize_t
+
+user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+user32.RegisterClassExW.restype = wintypes.ATOM
+user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+]
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.DestroyWindow.argtypes = [wintypes.HWND]
+user32.DestroyWindow.restype = wintypes.BOOL
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+
+def _probe_wndproc(hwnd, msg, wparam, lparam):
+    """探针窗口过程：全套默认处理，探针窗口不承接任何语义。"""
+    return int(user32.DefWindowProcW(hwnd, msg, wparam, lparam))
+
+
+# 模块级常驻：WndProc 回调对象一旦被回收，窗口类里的函数指针就成了野指针。
+_PROBE_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM)(_probe_wndproc)
+
+
+def _probe_hwnd() -> int:
+    """建一个不可见窗口当 NIM_ADD 的宿主；失败返回 0。
+
+    窗口类只注册一次；进程退出时 Windows 自动回收窗口与类，无需显式反注册。
+    """
+    global _PROBE_CLASS_READY
+    hinst = kernel32.GetModuleHandleW(None)
+    if not _PROBE_CLASS_READY:
+        wc = WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wc.style = 0
+        wc.lpfnWndProc = _PROBE_WNDPROC
+        wc.cbClsExtra = 0
+        wc.cbWndExtra = 0
+        wc.hInstance = hinst
+        wc.hbrBackground = None
+        wc.lpszMenuName = None
+        wc.lpszClassName = _PROBE_CLASS
+        wc.hIconSm = None
+        if not user32.RegisterClassExW(ctypes.byref(wc)):
+            if ctypes.get_last_error() != 1410:  # ERROR_CLASS_ALREADY_EXISTS
+                return 0
+        _PROBE_CLASS_READY = True
+    return int(user32.CreateWindowExW(0, _PROBE_CLASS, "MemGuard", 0, 0, 0, 0, 0,
+                                     None, None, hinst, None) or 0)
+
+
+def register_placeholder_icon(timeout_sec: float = 3.0) -> bool:
+    """首装补通路：NIM_ADD 一枚 uid=0 的占位图标，逼 Explorer 生成 NIS 条目。
+
+    只在条目缺失时用（--pin-tray 的常见场景：程序还没起，本进程没有可登记的托盘
+    图标）。
+
+    2026-10-01 实测结论（E9，58s 自毁探针 + with/without 宽区列差分）：本机
+    Explorer 对 NIM_ADD / NIM_DELETE / flyout 均不建 NIS 条目，探针全程
+    find_tray_entries() 为空；且该活图标任何情况下都不渲染（差分变化全在时钟区
+    秒跳动，探针 slot 零变化；Shell_NotifyIconGetRect 给的矩形是虚拟位置，与渲染
+    无关）。NIS key 算法也非 path/uid 哈希（手搓条目 Explorer 不绑定活图标）。
+    也就是说：在「Explorer 不建条目」的系统上，本函数大概率白跑。保留实现是因为
+    旧构建上补条目有效，且失败路径（missing）对调用方安全。
+    """
+    if winreg is None:
+        return False
+    path = (sys.executable or "").strip()
+    if not path:
+        return False
+    hwnd = 0
+    nid = None
+    try:
+        hwnd = _probe_hwnd()
+        if not hwnd:
+            return False
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = wintypes.HWND(hwnd)
+        nid.uID = TRAY_OWN_UID
+        nid.uFlags = NIF_MESSAGE | NIF_TIP
+        nid.uCallbackMessage = _TRAY_CALLBACK
+        nid.szTip = "MemGuard"
+        if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+            return False
+        deadline = time.time() + max(float(timeout_sec), 0.0)
+        while time.time() < deadline:
+            if find_tray_entries(path):
+                return True
+            time.sleep(0.05)
+        return False
+    except Exception:
+        return False
+    finally:
+        if nid is not None:
+            try:
+                shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+            except Exception:
+                pass
+        if hwnd:
+            try:
+                user32.DestroyWindow(hwnd)
+            except Exception:
+                pass
+
+
+def _tray_base_key(write: bool = False):
+    """打开 NotifyIconSettings（条目实际落在 64 位视图，32 位视图只作兜底）。"""
+    if winreg is None:
+        return None
+    for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        try:
+            return winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                NOTIFY_ICON_SETTINGS_PATH,
+                0,
+                winreg.KEY_READ | (winreg.KEY_SET_VALUE if write else 0) | view,
+            )
+        except OSError:
+            continue
+    return None
+
+
+def _entry_values(key: str, k) -> dict:
+    """读一条托盘条目的三个关键值；缺失即 None（新条目本来就没有 IsPromoted）。"""
+
+    def q(name):
+        try:
+            return winreg.QueryValueEx(k, name)[0]
+        except OSError:
+            return None
+
+    return {"key": key, "exe": q(_TRAY_EXE) or "", "uid": q(_TRAY_UID),
+            "promoted": q(_TRAY_PROMOTED)}
+
+
+def read_tray_entry(key_name: str) -> dict | None:
+    """按条目 key 名读一条托盘设置；key 不存在返回 None。"""
+    if winreg is None:
+        return None
+    base = _tray_base_key()
+    if base is None:
+        return None
+    try:
+        try:
+            k = winreg.OpenKey(base, key_name, 0, winreg.KEY_READ)
+        except OSError:
+            return None
+        try:
+            return _entry_values(key_name, k)
+        finally:
+            winreg.CloseKey(k)
+    finally:
+        winreg.CloseKey(base)
+
+
+def find_tray_entries(exe_path: str | None = None) -> list:
+    """列出属于某个可执行文件的托盘条目；默认匹配当前进程可执行文件。
+
+    路径按大小写不敏感精确匹配（注册表里存的是完整路径）。冻结版 exe 与源码 dev 实例
+    因此各拿各的条目，互不干扰。
+    """
+    if winreg is None:
+        return []
+    path = (exe_path or sys.executable or "").strip()
+    if not path:
+        return []
+    base = _tray_base_key()
+    if base is None:
+        return []
+    out = []
+    try:
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(base, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                k = winreg.OpenKey(base, sub, 0, winreg.KEY_READ)
+            except OSError:
+                continue
+            try:
+                entry = _entry_values(sub, k)
+            finally:
+                winreg.CloseKey(k)
+            if entry["exe"].strip().lower() == path.lower():
+                out.append(entry)
+    finally:
+        winreg.CloseKey(base)
+    return out
+
+
+def set_tray_promoted(key_name: str, promoted: bool = True) -> bool:
+    """写条目的 IsPromoted（DWORD）；key 不存在 / 无权限返回 False。"""
+    if winreg is None:
+        return False
+    base = _tray_base_key(write=True)
+    if base is None:
+        return False
+    try:
+        try:
+            k = winreg.OpenKey(base, key_name, 0, winreg.KEY_SET_VALUE)
+        except OSError:
+            return False
+        try:
+            winreg.SetValueEx(k, _TRAY_PROMOTED, 0, winreg.REG_DWORD, 1 if promoted else 0)
+            return True
+        finally:
+            winreg.CloseKey(k)
+    finally:
+        winreg.CloseKey(base)
+
+
+def ensure_tray_promoted(exe_path: str | None = None, allow_add: bool = False,
+                         wait_sec: float = 0.0) -> str:
+    """把自己的托盘图标声明为常驻（写 IsPromoted=1），返回处置结果。
+
+    只写注册表、不碰 Explorer：注册表要重启外壳才生效，重启交给 pin_tray_to_corner
+    / --pin-tray，运行中的实例不擅自重启用户的外壳。
+
+    allow_add：条目缺失时先用 NIM_ADD 补一枚占位图标，逼 Explorer 把条目建出来再写。
+    注意 2026-10-01 E9 实测：本机 Explorer 不再为 NIM_ADD 建条目，这一步在当前
+    系统上大概率拿不到 key（返回 missing）；首装请引导用户在托盘设置里手动拖出一次。
+    wait_sec：条目还没出现时最多等这么久。托盘进程里 _declare_tray_pin 抢在 pystray
+    的 NIM_ADD 之前跑，不等等不到自己的条目。同样按 E9 结论，条目若压根不会被建，
+    等再久也是 missing —— 等只是给「pystray 登记比本函数慢」的老场景兜底。
+    """
+    if winreg is None:
+        return "unsupported"
+    path = (exe_path or sys.executable or "").strip()
+    entries = find_tray_entries(path)
+    if not entries and wait_sec > 0:
+        deadline = time.time() + wait_sec
+        while not entries and time.time() < deadline:
+            time.sleep(0.05)
+            entries = find_tray_entries(path)
+    if not entries and allow_add:
+        if register_placeholder_icon():
+            entries = find_tray_entries(path)
+    if not entries:
+        return "missing"
+    own = [e for e in entries if e.get("uid") == TRAY_OWN_UID]
+    if not own:
+        # 一条 uid 都对不上（GUID 条目压根没有 UID 值）：退回全部，别把自己漏掉
+        own = entries
+    pending = [e["key"] for e in own if not e.get("promoted")]
+    if not pending:
+        return "already"
+    for key in pending:
+        set_tray_promoted(key, True)
+    return "updated"
+
+
+def _notify_rect_for_hwnd(hwnd: int, uid: int = TRAY_OWN_UID):
+    """查一个已登记托盘图标的屏幕矩形；未登记（E_FAIL）返回 None。"""
+    nii = NOTIFYICONIDENTIFIER()
+    nii.cbSize = ctypes.sizeof(NOTIFYICONIDENTIFIER)
+    nii.hWnd = wintypes.HWND(hwnd)
+    nii.uID = uid
+    rect = RECT()
+    if shell32.Shell_NotifyIconGetRect(ctypes.byref(nii), ctypes.byref(rect)) != _S_OK:
+        return None
+    return (rect.left, rect.top, rect.right, rect.bottom)
+
+
+def _tray_windows(pid: int) -> list:
+    """列 pid 旗下 pystray 的托盘窗口 hwnd。
+
+    pystray 的窗口是 WS_POPUP 且不带 WS_VISIBLE，枚举时不能按可见性过滤，否则一个
+    都枚举不到。进程可能残留多张旧窗口（图标未登记的），由调用方逐个探测剔除。
+    """
+    out = []
+
+    def handler(hwnd, _lp):
+        p = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if int(p.value) != pid:
+            return True
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        if "SystemTrayIcon" in cls.value:
+            out.append(int(hwnd))
+        return True
+
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(proto(handler), 0)
+    return out
+
+
+def notify_icon_rect(pid: int, uid: int = TRAY_OWN_UID):
+    """找 pid 的托盘图标并返回 (hwnd, rect)；没找到返回 None。
+
+    角区与飞out 都会给矩形，位置不同：角区是任务栏里真实的一小格，飞out 是 chevron
+    的展开键。用来一眼判断图标到底常驻了没有。
+
+    2026-10-01 E9 实测修正：Shell_NotifyIconGetRect 会说谎 —— 没有 NIS 注册表
+    条目的活图标照样拿到矩形，但截图差分证明 slot 零渲染。矩形存在不等于图标可见，
+    本函数不能单独作为「常驻成功」的判据；唯一可信判据是截图差分。
+    """
+    for hwnd in _tray_windows(pid):
+        rect = _notify_rect_for_hwnd(hwnd, uid)
+        if rect:
+            return (hwnd, rect)
+    return None
+
+
+_PROCESS_TERMINATE = 0x0001
+
+kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+kernel32.TerminateProcess.restype = wintypes.BOOL
+
+
+def _explorer_pids() -> list:
+    """外壳进程 pid 列表（_snapshot_processes 返回 [(进程名, PID)]）。"""
+    return [pid for name, pid in _snapshot_processes() if name.lower() == "explorer.exe"]
+
+
+def restart_explorer(timeout_sec: float = 10.0) -> int | None:
+    """重启 Explorer（外壳），让它按注册表重新排布托盘图标；返回新外壳 pid。
+
+    IsPromoted 只在 Explorer 启动时读一次，热写注册表 + 补发 NIM_ADD 都无效，
+    必须重启外壳。代价：任务栏会闪一下、已打开的资源管理器窗口会关闭，
+    调用方（--pin-tray）应先向用户说明。杀外壳后系统通常会自动重拉一个，
+    这里只负责等待新 pid 出现。
+    """
+    pids = _explorer_pids()
+    if not pids:
+        return None
+    for pid in pids:
+        handle = kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
+        if handle:
+            kernel32.TerminateProcess(handle, 0)
+            kernel32.CloseHandle(handle)
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        fresh = _explorer_pids()
+        if fresh:
+            return fresh[0]
+        time.sleep(0.2)
+    return None
+
+
+def pin_tray_to_corner(exe_path: str | None = None, restart: bool = True,
+                       allow_add: bool = True) -> str:
+    """完整「固定到角区」流程：先写注册表，再重启外壳让它生效。
+
+    返回 "pinned" / "already" / "missing" / "restart_failed" / "unsupported"。
+    restart=False 时只写注册表并返回 "updated"，等下一次 Explorer 重启自己生效。
+
+    allow_add 默认 True：--pin-tray 常在「程序还没起、本进程没有托盘图标」的独立
+    进程里跑，这时要靠 NIM_ADD 补一枚占位图标才拿得到条目 key；托盘实例自己跑时
+    条目已经在，这个参数自然不触发。
+
+    2026-10-01 E9 结论：没有 NIS 注册表条目的活图标，任何情况下都不渲染 ——
+    IsPromoted=1 写得再对，没条目也是白写。首装路径上用户仍需在系统托盘设置里
+    手动把图标拖出折叠区一次；此后条目常在，IsPromoted 才有依附。
+    """
+    if winreg is None:
+        return "unsupported"
+    state = ensure_tray_promoted(exe_path, allow_add=allow_add)
+    if state != "updated":
+        return state
+    if not restart:
+        return "updated"
+    return "pinned" if restart_explorer() else "restart_failed"
