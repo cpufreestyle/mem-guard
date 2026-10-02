@@ -160,3 +160,24 @@ def test_update_config_normalizes_values(monkeypatch, tmp_path):
 
     assert merged["phys_threshold"] == 99
     assert merged["clean_level"] == "conservative"
+
+
+def test_load_config_tolerates_utf8_bom(monkeypatch, tmp_path):
+    """BOM config file (Set-Content artifact) must still load."""
+    cfg_file = tmp_path / "mem_guard.json"
+    body = json.dumps({"clean_level": "aggressive"}, ensure_ascii=False)
+    cfg_file.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    cfg = config.load_config()
+
+    assert cfg["clean_level"] == "aggressive", "BOM must not fall back"
+
+
+def test_load_config_reads_plain_utf8(monkeypatch, tmp_path):
+    """Plain UTF-8 (no BOM) config still loads with utf-8-sig reader."""
+    cfg_file = tmp_path / "mem_guard.json"
+    _write_cfg(cfg_file, {"clean_level": "conservative"})
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    assert config.load_config()["clean_level"] == "conservative"
