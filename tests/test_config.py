@@ -282,6 +282,24 @@ def test_normalize_config_stats_targeted_roundtrip():
     assert plain["stats"] == {"count": 3, "freed": 100}
 
 
+def test_bg_trim_default_and_toggle():
+    """后台进程工作集清理：默认开（打扰小、覆盖面比定向大户全），显式关要认。"""
+    assert normalize_config({})["bg_trim"] is True
+    assert DEFAULT_CONFIG["bg_trim"] is True
+    assert normalize_config({"bg_trim": 0})["bg_trim"] is False
+    assert normalize_config({"bg_trim": "no"})["bg_trim"] is True
+
+
+def test_normalize_config_stats_bg_trimmed_roundtrip():
+    """后台清理计数只持久化非 0 值：0/缺失都不落键，统计行按有无决定显示。"""
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "bg_trimmed": 2}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "bg_trimmed": 2}
+    zero = normalize_config({"stats": {"count": 3, "freed": 100, "bg_trimmed": 0}})
+    assert zero["stats"] == {"count": 3, "freed": 100}
+    plain = normalize_config({"stats": {"count": 3, "freed": 100}})
+    assert plain["stats"] == {"count": 3, "freed": 100}
+
+
 def test_default_config_predict_clean_keys_present():
     """趋势预防式清理（v1.8.0）两个键必须有默认值，否则老配置行为漂移。"""
     for key in ("predict_clean", "predict_window_min"):

@@ -265,3 +265,22 @@ def test_analyze_silent_when_short_relief_rare():
     cfg = normalize_config({"stats": {"count": 100, "short_relief": 2}})
     items = advisor.analyze(cfg, _mem())
     assert all("清理效果不佳" not in i["title"] for i in items)
+
+
+def test_analyze_flags_suspected_leak_processes():
+    """疑似泄漏进程要单独点名：给出名字、当前占用，并说明会优先被定向清理。"""
+    leaks = [("leaky.exe", 2 * GB, 7)]
+    items = advisor.analyze(normalize_config({}), _mem(), [], leaks=leaks)
+    hit = [i for i in items if "疑似泄漏" in i["title"]]
+    assert hit
+    assert "leaky.exe" in hit[0]["text"]
+    assert "2.0GB" in hit[0]["text"]
+    assert hit[0]["level"] == advisor.LEVEL_TIP
+
+
+def test_analyze_silent_when_no_leak_candidates():
+    """不传 leaks（CLI / 一次性自检拿不到历史）时不该凭空报泄漏。"""
+    items = advisor.analyze(normalize_config({}), _mem(), [])
+    assert all("疑似泄漏" not in i["title"] for i in items)
+    assert all("疑似泄漏" not in i["title"]
+               for i in advisor.analyze(normalize_config({}), _mem(), [], leaks=[]))

@@ -404,6 +404,38 @@ def process_working_sets() -> list:
     return [(name, _working_set(pid), pid) for name, pid in _snapshot_processes()]
 
 
+_WINDOW_ENUM_MAX = 4096
+
+
+def visible_window_pids() -> set | None:
+    """返回「有可见顶层窗口」的进程 PID 集合；枚举不可信时返回 None。
+
+    后台进程工作集清理用它排除用户正在看的进程：带可见顶层窗口的一律跳过
+    （最小化到任务栏的窗口 IsWindowVisible 仍为真，不会误伤）。
+
+    返回 None 表示枚举失败或触顶，调用方必须跳过后台清理，绝不能当成「没有窗口」。
+    """
+    pids: set = set()
+
+    def handler(hwnd, _lparam):
+        if len(pids) >= _WINDOW_ENUM_MAX:
+            return False
+        if user32.IsWindowVisible(hwnd):
+            p = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value:
+                pids.add(int(p.value))
+        return True
+
+    try:
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        if not user32.EnumWindows(proto(handler), 0):
+            return None
+    except Exception:
+        return None
+    return pids
+
+
 # ---------------------------------------------------------------- 权限 / 单实例
 
 # 管理员身份在进程生命周期内不变，缓存一次即可（菜单/建议/清理/自检都会反复调用）
@@ -629,6 +661,8 @@ user32.EnumWindows.argtypes = [
 ]
 user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
 
 
 # ---------------------------------------------------------------- NIM_ADD（首装造条目）

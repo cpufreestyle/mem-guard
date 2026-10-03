@@ -37,7 +37,7 @@ def build_menu(guard) -> pystray.Menu:
 
     def on_clean_now(icon=None, item=None) -> None:
         try:
-            r = do_clean("手动")
+            r = do_clean("手动", growth_rows=guard.leaks)
         except Exception as e:
             log(f"手动清理异常: {e!r}")
             if icon:
@@ -60,6 +60,8 @@ def build_menu(guard) -> pystray.Menu:
                 f"当前占用 Top3:\n{top_txt}")
         if tgt:
             body += f"\n定向清理大户:\n{tgt_txt}"
+        if r.get("bg_trim"):
+            body += f"\n后台进程工作集: {r["bg_trim"]} 个"
         icon.notify(
             body,
             "MemGuard 清理完成",
@@ -178,6 +180,11 @@ def build_menu(guard) -> pystray.Menu:
             {"auto_level_adapt": not bool(guard.cfg.get("auto_level_adapt", True))})
         log(f"保守档不给力自动改激进 -> {'开' if guard.cfg['auto_level_adapt'] else '关'}")
 
+    def on_toggle_bg_trim(icon, item) -> None:
+        guard.cfg = update_config(
+            {"bg_trim": not bool(guard.cfg.get("bg_trim", True))})
+        log(f"后台进程工作集清理 -> {'开' if guard.cfg['bg_trim'] else '关'}")
+
     def on_toggle_predict_clean(icon, item) -> None:
         guard.cfg = update_config(
             {"predict_clean": not bool(guard.cfg.get("predict_clean", True))})
@@ -189,11 +196,13 @@ def build_menu(guard) -> pystray.Menu:
         tgt = int(st.get('targeted', 0))
         prev = int(st.get('preventive', 0))
         srt = int(st.get('short_relief', 0))
+        bgt = int(st.get('bg_trimmed', 0))
         base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
         return (base + (f"（升档 {esc} 次）" if esc else "")
                 + (f"（定向 {tgt} 次）" if tgt else "")
                 + (f"（预防 {prev} 次）" if prev else "")
-                + (f"（短效 {srt} 次）" if srt else ""))
+                + (f"（短效 {srt} 次）" if srt else "")
+                + (f"（后台 {bgt} 次）" if bgt else ""))
 
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
@@ -224,7 +233,8 @@ def build_menu(guard) -> pystray.Menu:
             guard.cfg = update_config(changes)
 
         try:
-            items = analyze(guard.cfg, guard.state, top_processes_list(15))
+            items = analyze(guard.cfg, guard.state, top_processes_list(15),
+                            leaks=guard.leaks)
             done = apply_advice_actions(items, _apply)
         except Exception as e:
             log(f"优化建议一键应用异常: {e!r}")
@@ -374,6 +384,8 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("escalate_clean", True))),
         pystray.MenuItem("定向清理内存大户", on_toggle_target_clean,
                          checked=lambda i: bool(guard.cfg.get("target_clean", True))),
+        pystray.MenuItem("后台进程工作集清理", on_toggle_bg_trim,
+                         checked=lambda i: bool(guard.cfg.get("bg_trim", True))),
         pystray.MenuItem("保守档不给力自动改激进", on_toggle_level_adapt,
                          checked=lambda i: bool(guard.cfg.get("auto_level_adapt", True))),
         pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,

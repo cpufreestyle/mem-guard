@@ -87,7 +87,7 @@ def test_advice_refresh_is_time_gated(monkeypatch):
                         lambda n=15: scans.append(n) or [("a.exe", 5 * GB, 1)])
     passed = {}
 
-    def fake_analyze(cfg, mem=None, top=None):
+    def fake_analyze(cfg, mem=None, top=None, leaks=None):
         passed["top"] = top
         return [{"level": "tip"}, {"level": "warn"}]
 
@@ -119,7 +119,7 @@ def test_advice_survives_scan_failure(monkeypatch):
 def test_advice_refresh_counts_applyable_actions(monkeypatch):
     """一次刷新同时给出「总条数」与「可一键应用条数」，后者供菜单项置灰。"""
     monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
-    monkeypatch.setattr(tray, "analyze", lambda cfg, mem=None, top=None: [
+    monkeypatch.setattr(tray, "analyze", lambda cfg, mem=None, top=None, leaks=None: [
         {"title": "自动清理已关闭",
          "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
         {"title": "未以管理员身份运行"},
@@ -140,7 +140,8 @@ def test_hot_reload_resets_advice_throttle(monkeypatch, tmp_path):
     scans = []
     monkeypatch.setattr(tray, "top_processes_list",
                         lambda n=15: scans.append(n) or [("a.exe", 5 * GB, 1)])
-    monkeypatch.setattr(tray, "analyze", lambda cfg, mem=None, top=None: [{"level": "tip"}])
+    monkeypatch.setattr(tray, "analyze",
+                        lambda cfg, mem=None, top=None, leaks=None: [{"level": "tip"}])
 
     guard = Guard()
     guard.cfg["advice_refresh_sec"] = 600          # 周期拉长到 10 分钟，方便验证清零
@@ -445,7 +446,7 @@ def test_auto_clean_notify_marks_escalation(monkeypatch):
     """自动清理补了激进一次：托盘通知要标「（自动升档）」；没升档时不误导（自动优化主链路）。"""
     switch = {"esc": True}
 
-    def _fake_do_clean(reason="自动", low_relief=False):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
         return {
             "ok": True,
             "freed": 3 * GB,
@@ -478,7 +479,7 @@ def test_auto_clean_notify_marks_targeted(monkeypatch):
     """定向清了大户：托盘通知要列出是哪几个；没定向时不出现该段。"""
     switch = {"tgt": True}
 
-    def _fake_do_clean(reason="自动", low_relief=False):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
         return {
             "ok": True,
             "freed": 3 * GB,
@@ -586,7 +587,7 @@ def test_auto_clean_marks_short_relief_when_last_clean_was_recent(monkeypatch):
     """距上次自动清理不足下限：本次记 low_relief，通知注明间隔多久（效果闭环）。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", low_relief=False):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
         seen["low_relief"] = low_relief
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 4},
@@ -613,7 +614,7 @@ def test_auto_clean_skips_effect_measure_without_prev_clean(monkeypatch):
     """上次清理来自手动/CLI（last_clean=0）：没有可对比基线，不测效果也不提间隔。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", low_relief=False):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
         seen["low_relief"] = low_relief
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 4},
@@ -638,7 +639,7 @@ def test_auto_clean_skips_effect_measure_when_disabled(monkeypatch):
     """effect_track 关掉：不度量间隔、不累计短效，通知里也不提这茬。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", low_relief=False):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
         seen["low_relief"] = low_relief
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 4},
@@ -664,7 +665,7 @@ def test_auto_clean_effect_boundary_is_strictly_below_threshold(monkeypatch):
     """边界口径：正好等于下限不算短效（判据是严格小于），差 1 秒才算。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", low_relief=False):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
         seen["low_relief"] = low_relief
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 4},
@@ -725,7 +726,7 @@ def test_maybe_predictive_clean_notifies_with_trend_note(monkeypatch):
     """趋势即将触阈：提前清一次，通知里带「斜率 / 预计分钟 / 阈值」解释。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", preventive=False, low_relief=False):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None):
         seen["reason"] = reason
         seen["preventive"] = preventive
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
@@ -753,7 +754,7 @@ def test_maybe_predictive_clean_respects_cooldown(monkeypatch):
     """冷却内不提前清理：预防式也不该比普通自动清理更频繁。"""
     calls = []
 
-    def _fake_do_clean(reason="自动", preventive=False, low_relief=False):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None):
         calls.append(reason)
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -775,7 +776,7 @@ def test_maybe_predictive_clean_skips_when_trend_flat(monkeypatch):
     """占用平稳：交给预警气泡和超阈值清理，别提前动。"""
     calls = []
 
-    def _fake_do_clean(reason="自动", preventive=False, low_relief=False):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None):
         calls.append(reason)
         return {"ok": True, "freed": 0, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -797,7 +798,7 @@ def test_maybe_predictive_clean_skips_when_disabled(monkeypatch):
     for kw in ({"predict_clean": False}, {"auto_clean": False}):
         calls = []
 
-        def _fake_do_clean(reason="自动", preventive=False, low_relief=False):
+        def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None):
             calls.append(reason)
             return {"ok": True, "freed": 0, "level": "conservative",
                     "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -993,7 +994,55 @@ def test_hot_reload_rearms_level_adapt_and_refreshes_mtime(monkeypatch, tmp_path
     assert any("重新武装" in m for m in logs)
     assert written == {"level_adapt_done": False}
     assert guard._cfg_mtime == os.path.getmtime(str(cfg_file))
-
     guard.maybe_reload_config()
     assert logs.count("配置已热重载（来自 mem_guard.json）") == 1, \
         "_cfg_mtime 已跟上写盘后的 mtime：不该再白重载一次"
+
+
+def test_advice_refresh_identifies_leak_processes(monkeypatch):
+    """v1.11.0：同一份 top15 采样顺手拟合斜率，连涨的进程进 leaks 并喂给 analyze。"""
+    t0 = 1000.0
+    step = 100.0
+    calls = {"n": 0}
+
+    def _top(n=15):
+        k = calls["n"]
+        return [("leaky.exe", 256 * 1024 ** 2 + k * 64 * 1024 ** 2, 42),
+                ("steady.exe", 512 * 1024 ** 2, 7)]
+
+    monkeypatch.setattr(tray, "top_processes_list", _top)
+    got = {}
+
+    def _analyze(cfg, mem=None, top=None, leaks=None):
+        got["leaks"] = leaks
+        return []
+
+    monkeypatch.setattr(tray, "analyze", _analyze)
+
+    g = Guard()
+    g.cfg["advice_refresh_sec"] = 0
+    g._advice_at = 0.0
+    for i in range(6):
+        calls["n"] = i
+        g._refresh_advice(t0 + i * step)
+
+    assert [n for n, _, _ in g.leaks] == ["leaky.exe"], "只该报连涨的那个"
+    assert got["leaks"] == g.leaks, "leaks 要作为快照传给 analyze"
+
+
+def test_auto_clean_passes_leak_rows_to_do_clean(monkeypatch):
+    """识别出的泄漏进程随自动清理带下去：growth_rows 透传给 do_clean。"""
+    seen = {}
+
+    def _fake_do_clean(reason="自动", growth_rows=None, **kw):
+        seen["rows"] = growth_rows
+        return {"ok": False, "freed": 0, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    g = _guard(_state(phys_pct=86.0))
+    g.leaks = [("leaky.exe", 2 * GB, 42)]
+    g._auto_clean(1000.0, "自动", g.state)
+
+    assert seen["rows"] == [("leaky.exe", 2 * GB, 42)]

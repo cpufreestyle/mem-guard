@@ -16,6 +16,7 @@ import psutil
 
 from .actions import (
     clear_system_file_cache,
+    empty_background_working_sets,
     empty_process_working_sets,
     empty_selected_working_sets,
     flush_modified_list,
@@ -25,7 +26,7 @@ from .actions import (
 )
 from .config import CLEAN_LEVELS, _CONFIG_LOCK, gb, load_config, log, save_config
 from .privileges import clean_privileges
-from .winapi import get_mem, is_admin, process_working_sets
+from .winapi import get_mem, is_admin, process_working_sets, visible_window_pids
 
 # 快路径句柄被拒的进程数超过该上限就不再用 psutil 补齐（见 top_processes_list）
 _FILL_MAX = 24
@@ -35,6 +36,14 @@ _PREDICT_MIN_SAMPLES = 6      # 至少这么多个采样点才谈「趋势」，
 _PREDICT_MIN_SPAN = 60.0      # 采样至少要覆盖这么长时间(秒)，否则一分钟的抖动也叫趋势
 _PREDICT_MAX_SAMPLES = 60     # 最多回看这么多个点（默认 10s 间隔约等于 10 分钟）
 _PREDICT_MIN_SLOPE = 0.02     # 最小有效斜率(%/秒，即 1.2%/分钟)：低于它视为平稳
+
+# 泄漏进程增长感知（v1.11.0）：按历史采样拟合每个进程的 RSS 上升斜率
+_LEAK_MIN_SAMPLES = 5        # 至少这么多采样点才拟合，避免进程刚启动的毛刺
+_LEAK_MIN_SPAN = 300.0       # 采样至少要覆盖这么长时间(秒)，五分钟内的抖动不算泄漏
+_LEAK_MIN_SLOPE = 128 * 1024  # 每秒至少涨这么多字节(≈7.5MB/分钟)才算异常
+_LEAK_MIN_GROWTH = 64 * 1024 ** 2  # 且净增长至少这么多(64MB)：排除高位平台期的正常占用
+_LEAK_MAX_ROWS = 5           # 最多报这么多个，别把通知/建议列表刷满
+GROWTH_MAX_SAMPLES = 40      # Guard.proc_history 采样上限（默认 10s 间隔≈6.5 分钟），tray 共用
 
 
 def _status(rc: int) -> str:
@@ -70,7 +79,8 @@ def _wait_avail_rise(before: dict) -> dict:
 
 
 def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
-                preventive: bool = False, short_relief: bool = False) -> dict:
+                preventive: bool = False, short_relief: bool = False,
+                bg_trimmed: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -84,6 +94,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
     提前清理的触发频次（normalize_config 只持久化非 0 值）。
     short_relief=True 时同步累计「清理效果偏短次数」：v1.9.0 起距上次自动清理
     不足 effect_min_relief_sec 说明上次清理没 hold 住、压力很快复发（口径同上）。
+    bg_trimmed=True 时同步累计「后台进程工作集清理次数」：v1.11.0 起清空后台
+    进程工作集的触发频次，供统计行与通知展示（normalize_config 只持久化非 0 值）。
     """
     with _CONFIG_LOCK:
         cfg = load_config()
@@ -98,6 +110,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
             st["preventive"] = int(st.get("preventive", 0)) + 1
         if short_relief:
             st["short_relief"] = int(st.get("short_relief", 0)) + 1
+        if bg_trimmed:
+            st["bg_trimmed"] = int(st.get("bg_trimmed", 0)) + 1
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
@@ -181,28 +195,46 @@ def _still_pressured(m: dict, cfg: dict) -> bool:
     return False
 
 
-def _target_clean_candidates(rows, cfg) -> list:
+def _target_clean_candidates(rows, cfg, extra_rows=None) -> list:
     """从 Top 进程采样里挑出「工作集大户」：≥ target_clean_min_mb，取前 target_clean_top 个。
 
     rows 是 top_processes_list 的返回 [(name, rss_bytes, pid), ...]（已按工作集降序）；
-    开关关闭或阈值/条数 ≤0 时返回 []（不打扰）。纯函数，便于单测。
+    extra_rows 是 leak_candidates() 的返回：疑似泄漏的进程排在最前且不受 min_mb
+    下限约束（泄漏初期可能还没到「大户」级别，但那正是最该掐的时候），仍受 top
+    截断并按 PID 去重。开关关闭或 top ≤0 时返回 []；min_mb ≤0 时只返回 extras。
+    纯函数，便于单测。
     """
     if not cfg.get("target_clean", True):
         return []
     min_bytes = int(cfg.get("target_clean_min_mb") or 0) * 1024 * 1024
     top = int(cfg.get("target_clean_top") or 0)
-    if min_bytes <= 0 or top <= 0:
+    if top <= 0:
         return []
     out = []
-    for row in rows or []:
+    seen = set()
+    for row in extra_rows or []:
         try:
             name, rss, pid = row
         except (TypeError, ValueError):
             continue
-        if int(rss) >= min_bytes:
-            out.append((name, rss, pid))
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append((name, rss, pid))
+        if len(out) >= top:
+            return out
+    if min_bytes <= 0:
+        return out
+    for row in rows or []:
         if len(out) >= top:
             break
+        try:
+            name, rss, pid = row
+        except (TypeError, ValueError):
+            continue
+        if int(rss) >= min_bytes and pid not in seen:
+            seen.add(pid)
+            out.append((name, rss, pid))
     return out
 
 
@@ -210,6 +242,12 @@ def _run_target_clean(cands, blacklist) -> tuple:
     """在特权窗口内只清空候选大户的工作集，返回 (已清理数, 跳过数)。"""
     with clean_privileges():
         return empty_selected_working_sets([pid for _, _, pid in cands], blacklist)
+
+
+def _run_bg_trim(exclude_pids, blacklist) -> tuple:
+    """在特权窗口内清空后台进程工作集，返回 (已清理数, 跳过数)。"""
+    with clean_privileges():
+        return empty_background_working_sets(exclude_pids, blacklist)
 
 
 def _slope_per_sec(samples, idx: int) -> float:
@@ -270,8 +308,78 @@ def predictive_due(history, cfg: dict):
     return best
 
 
+def _pid_series(history) -> dict:
+    """把 Guard.proc_history 的采样摊平成 {pid: (name, [(t, rss_bytes), ...])}。
+
+    只有每个采样点都出现的进程才进入结果——中途启动或退出的进程不是趋势，是噪声。
+    单条采样脏了(结构不符)只跳过那一层，别让一次读写异常掀翻整个识别。
+    """
+    total = len(history or [])
+    series = {}
+    for sample in history or []:
+        try:
+            t, snap = sample
+        except (TypeError, ValueError):
+            continue
+        for pid, item in (snap or {}).items():
+            try:
+                name, rss = item
+                pid = int(pid)
+            except (TypeError, ValueError):
+                continue
+            series.setdefault(pid, []).append((float(t), name, int(rss)))
+    out = {}
+    for pid, pts in series.items():
+        if len(pts) != total:
+            continue    # 中途启动或退出：不是趋势，是噪声
+        out[pid] = (pts[0][1], [(p[0], p[2]) for p in pts])
+    return out
+
+
+def growth_slopes(history) -> list:
+    """对全程在场的进程拟合 RSS 上升斜率，按斜率降序返回
+    [(pid, name, rss_bytes, slope_bytes_per_sec, net_growth_bytes), ...]。
+
+    history 是 (t, {pid: (name, rss_bytes)}) 采样列表（新在后，即 Guard.proc_history）。
+    沿用 /_slope_per_sec/ 的最小二乘；样本数、时间跨度不足或斜率 ≤0 的进程一律
+    剔除。纯函数，便于单测。
+    """
+    samples = list(history or [])
+    if len(samples) < _LEAK_MIN_SAMPLES:
+        return []
+    if samples[-1][0] - samples[0][0] < _LEAK_MIN_SPAN:
+        return []
+    rows = []
+    for pid, (name, pts) in _pid_series(samples).items():
+        slope = _slope_per_sec(pts, 1)
+        if slope <= 0:
+            continue
+        rows.append((pid, name, pts[-1][1], slope, pts[-1][1] - pts[0][1]))
+    rows.sort(key=lambda r: r[3], reverse=True)
+    return rows
+
+
+def leak_candidates(history) -> list:
+    """泄漏进程识别：斜率与净增长双双越线才算疑似泄漏，返回 [(name, rss, pid), ...]。
+
+    单看斜率会把「本来就大、只是偶发分配」误判，单看增量会把良性冷启动误判，
+    两个条件都要满足（详见 _LEAK_MIN_SLOPE / _LEAK_MIN_GROWTH）。结果按斜率
+    降序、最多 _LEAK_MAX_ROWS 条，供定向清理优先下刀与 advisor 提醒使用。
+    纯函数，便于单测。
+    """
+    out = []
+    for pid, name, rss, slope, growth in growth_slopes(history):
+        if slope < _LEAK_MIN_SLOPE or growth < _LEAK_MIN_GROWTH:
+            continue
+        out.append((name, rss, pid))
+        if len(out) >= _LEAK_MAX_ROWS:
+            break
+    return out
+
+
 def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None,
-            preventive: bool = False, low_relief: bool = False) -> dict:
+                preventive: bool = False, low_relief: bool = False,
+                growth_rows=None) -> dict:
     """执行一次清理，返回结果统计（特权在返回前恢复，用完即关）。
 
     level: "conservative"（默认，只清 standby/修改页/文件缓存）或
@@ -283,6 +391,8 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     low_relief=True 表示本次距上次自动清理不足 effect_min_relief_sec（v1.9.0
     效果闭环）：只多累计一个 stats.short_relief 计数供统计行、通知与 advisor
     自调优使用，清理动作本身完全一样。
+    growth_rows 是 leak_candidates() 的返回（疑似泄漏进程）：与大户采样合并后
+    作为定向清理的优先候选，泄漏初期还没长成大户也能第一时间掐住。
     """
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
@@ -315,7 +425,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             and _still_pressured(after, cfg)):
         cands = []
         try:
-            cands = _target_clean_candidates(top_processes_list(15), cfg)
+            cands = _target_clean_candidates(top_processes_list(15), cfg, growth_rows)
         except Exception:
             cands = []
         if cands:
@@ -329,6 +439,32 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
                               + (f"（跳过 {skipped}）" if skipped else ""))
             else:
                 detail.append(f"定向清理大户({names}): 未成功")
+
+    # 后台进程工作集清理（v1.11.0 阶梯第二级）：定向大户仍不达标时，清空「没有可见
+    # 顶层窗口」的后台进程工作集——比直接全量升档的打扰小（前台正在访问的页不动），
+    # 覆盖面又比定向大户全；枚举不到窗口时宁可不做，绝不能当成「都没有窗口」
+    bg_trimmed = 0
+    if (not aggressive and bool(cfg.get("bg_trim", True))
+            and _still_pressured(after, cfg)):
+        try:
+            exclude = visible_window_pids()
+        except Exception:
+            exclude = None
+        if exclude is None:
+            detail.append("后台进程工作集:跳过(无法枚举窗口)")
+            log(f"{reason}后台清理跳过 | 枚举窗口不可信(EnumWindows 失败或触顶)，宁可不做")
+        else:
+            try:
+                bg_trimmed, skipped = _run_bg_trim(exclude, bl)
+            except Exception:
+                bg_trimmed, skipped = 0, 0
+            if bg_trimmed:
+                # 采纳后台清理：再等一次把回补计入，供下面的升档判断复用最新 after
+                after = _wait_avail_rise(after)
+                detail.append(f"后台进程工作集:{bg_trimmed} 个"
+                              + (f"（跳过 {skipped}）" if skipped else ""))
+            else:
+                detail.append("后台进程工作集:未成功")
 
     # 自动升档：保守清理后若仍超阈值，立即补一次激进清理（最多一次、带开关、最小打扰）
     if (not aggressive and bool(cfg.get("escalate_clean", True))
@@ -359,12 +495,13 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         "level": lvl,
         "escalated": escalated,
         "targeted": targeted,
+        "bg_trim": bg_trimmed,
         "detail": ", ".join(detail),
     }
     # 累计统计：只统计真正成功的清理，随配置持久化；写盘失败不影响本次清理结果
     try:
         result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive,
-                                     low_relief)
+                                     low_relief, bool(bg_trimmed))
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

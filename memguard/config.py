@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -38,6 +38,8 @@ DEFAULT_CONFIG = {
     "target_clean": True,     # 开：仍超阈值时先精确清大户口，比直接全量升档打扰小；仍不达标才升档
     "target_clean_min_mb": 1024,  # 工作集达到该值(MB) 的进程才算「内存大户」
     "target_clean_top": 3,     # 单次最多精确清空前 N 个工作集最大的进程
+    # ---- 后台进程工作集清理（v1.11.0）：定向仍不达标时，清空没有可见窗口的后台进程 ----
+    "bg_trim": True,          # 开：仍超阈值时清空后台进程工作集，跳过有可见窗口的，前台零感知
     # ---- 趋势预防式清理（v1.8.0）：按历史采样拟合上升斜率，预判即将触阈就提前清 ----
     "predict_clean": True,     # 开：预计 predict_window_min 分钟内触及阈值，就提前清一次（仍走保守→定向→升档阶梯）
     "predict_window_min": 5,   # 预计触阈时间窗口(分钟)：只有窗口内会触阈才预防，越小平稳期越不打扰
@@ -145,6 +147,7 @@ def normalize_config(raw) -> dict:
         cfg.get("target_clean_min_mb"), 128, 32768, DEFAULT_CONFIG["target_clean_min_mb"])
     cfg["target_clean_top"] = _clamp_int(
         cfg.get("target_clean_top"), 1, 10, DEFAULT_CONFIG["target_clean_top"])
+    cfg["bg_trim"] = bool(cfg.get("bg_trim", True))
     cfg["predict_clean"] = bool(cfg.get("predict_clean", True))
     cfg["predict_window_min"] = _clamp_int(
         cfg.get("predict_window_min"), 1, 60, DEFAULT_CONFIG["predict_window_min"])
@@ -202,6 +205,9 @@ def normalize_config(raw) -> dict:
     # 说明上次清理没 hold 住、内存压力很快复发，非 0 才落键保持干净配置原形状
     if raw_stats.get("short_relief"):
         cfg["stats"]["short_relief"] = _clamp_int(raw_stats.get("short_relief"), 0, 10 ** 9, 0)
+    # bg_trimmed（后台进程工作集清理次数）口径同上：非 0 才落键，没 trim 过的配置保持原形状
+    if raw_stats.get("bg_trimmed"):
+        cfg["stats"]["bg_trimmed"] = _clamp_int(raw_stats.get("bg_trimmed"), 0, 10 ** 9, 0)
     return cfg
 
 

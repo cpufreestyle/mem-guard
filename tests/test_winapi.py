@@ -690,3 +690,52 @@ def test_notify_icon_rect_none_without_registered_icon(monkeypatch):
     monkeypatch.setattr(winapi, "_notify_rect_for_hwnd",
                         lambda hwnd, uid=winapi.TRAY_OWN_UID: None)
     assert winapi.notify_icon_rect(4242) is None
+
+
+# --------------------------------------------- 后台进程工作集清理的窗口枚举（v1.11.0）
+
+class _FakeUser32:
+    """只回放 visible_window_pids 用到的三个入口，按 (hwnd, 可见, pid) 表回放。"""
+
+    def __init__(self, windows):
+        self._w = {hwnd: (vis, pid) for hwnd, vis, pid in windows}
+        self.enum_calls = 0
+
+    def EnumWindows(self, callback, lparam):
+        self.enum_calls += 1
+        for hwnd in self._w:
+            # 回调返回 False = 中止枚举，Windows 语义下 EnumWindows 也返回 0
+            if not callback(hwnd, lparam):
+                return False
+        return True
+
+    def IsWindowVisible(self, hwnd):
+        return bool(self._w[hwnd][0])
+
+    def GetWindowThreadProcessId(self, hwnd, out):
+        out._obj.value = self._w[hwnd][1]
+        return 1
+
+
+def test_visible_window_pids_skips_hidden_and_zero_pid(monkeypatch):
+    """只有带可见顶层窗口的进程才进集合：不可见窗口与 PID 0 都排除。"""
+    fake = _FakeUser32([(11, True, 100), (12, False, 200), (13, True, 0)])
+    monkeypatch.setattr(winapi, "user32", fake)
+    assert winapi.visible_window_pids() == {100}
+
+
+def test_visible_window_pids_returns_none_when_enum_fails(monkeypatch):
+    """枚举失败必须返回 None：调用方据此跳过后台清理，绝不能当成「都没有窗口」。"""
+    monkeypatch.setattr(winapi, "user32", types.SimpleNamespace(
+        EnumWindows=lambda cb, lp: False,
+        IsWindowVisible=lambda hwnd: True,
+        GetWindowThreadProcessId=lambda hwnd, out: None))
+    assert winapi.visible_window_pids() is None
+
+
+def test_visible_window_pids_returns_none_when_capped(monkeypatch):
+    """触顶（说明枚举数量不可信）同样返回 None，不拿半个集合去清后台。"""
+    fake = _FakeUser32(
+        [(hwnd, True, hwnd) for hwnd in range(1, winapi._WINDOW_ENUM_MAX + 64)])
+    monkeypatch.setattr(winapi, "user32", fake)
+    assert winapi.visible_window_pids() is None

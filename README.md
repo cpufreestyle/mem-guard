@@ -20,7 +20,7 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - **清理区域可勾选**（`clean_areas`，对标 WinMemoryCleaner）：standby / 低优先级 standby / 修改页 / 文件缓存 /
   系统工作集逐项开关，托盘菜单「清理区域」即可调整
 - **多种触发方式**（对标 Mem Reduct）：超阈值百分比、可用内存低于绝对值（`min_avail_mb`）、
-  定时清理（`scheduled_minutes`）、启动时清理（`clean_on_start`）；菜单顶部可看**累计清理次数、释放量与升档 / 定向 / 预防 / 短效次数**
+  定时清理（`scheduled_minutes`）、启动时清理（`clean_on_start`）；菜单顶部可看**累计清理次数、释放量与升档 / 定向 / 后台 / 预防 / 短效次数**
 - **进程白名单**（`user_blacklist`）：指定进程在激进档下跳过工作集清空，避免浏览器 / IDE / 游戏被清后卡顿
 - **定向清理内存大户**（`target_clean`，默认开）：保守清理后若仍超阈值，不直接全量升档，而是先按工作集挑最大的几个进程精确清空——默认 ≥1GB 的前 3 个，`user_blacklist` 白名单同样生效（逐 PID 重新核对，防 PID 复用）；清完仍不达标才按 `escalate_clean` 补一次激进档。阶梯为「保守 → 定向大户 → 全量激进」，每级最多一次；托盘通知与手动清理通知标注「定向清理大户」并列出入选进程，`--once` 标注「（定向大户）」，`stats.targeted` 累计次数
 - **趋势预防式清理**（`predict_clean`，默认开）：把「超阈值才清」的反应式升级为按趋势预判——监控每次采样都把
@@ -40,6 +40,14 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
   `effect_min_relief_sec`（效果偏短）时，把下次自动清理的最小间隔压到 `max(cooldown * 0.5, floor)`，
   连续 2 次间隔达标再恢复完整 `cooldown`。四处冷却判定（趋势预防 / 超阈值 / 低内存 / 定时）都走
   同一口径；压缩只减不增（`floor` 高于 `cooldown` 也不放大），纯内存态、不写盘，关掉即恒为用户值
+- **后台进程工作集自动清理**（`bg_trim`，默认开）：定向大户仍不达标时，先清空「没有可见顶层窗口」的
+  后台进程工作集，再考虑全量激进——比直接升档打扰小（前台正在访问的页一概不动），覆盖面又比只清
+  前几个大户全。窗口枚举不可信（`EnumWindows` 失败或触顶）时宁可不做，绝不把「枚举不到」当成「都
+  没有窗口」；托盘通知标注「后台进程工作集: N 个」，`stats.bg_trimmed` 累计次数
+- **泄漏进程增长感知**（无开关，复用同一份 top15 采样）：监控每次采样顺手按进程拟合 RSS 上升斜率，
+  连续 5 分钟、每分钟涨 ≥7.5MB 且净增长 ≥64MB 的进程判为疑似泄漏——它们会被优先塞进定向清理候选
+  （不受「大户」下限约束，泄漏初期正是最该掐的时候），advisor 也会点一条「N 个进程内存持续上涨
+  （疑似泄漏）」提醒重启。零额外成本：不额外扫盘，只在既有的 top15 采样上做最小二乘
 - **左键点托盘图标**打开「内存概览」主窗口（对标 WinMemoryCleaner / Mem Reduct）：物理 / 提交两条
   进度条 + 当前占用 Top5（同名多开自动合并为一行）+ 立即清理 / 刷新 / Top10 / 趋势 / 优化建议 快捷按钮
 - 右键菜单：内存概览（左键）/ 立即清理 / 内存占用 Top10（可刷新窗口）/ 内存趋势 / 优化建议 / 一键应用优化建议 /
@@ -256,6 +264,7 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
 | `target_clean` | 保守清理后仍超阈值时，先按工作集精确清空最大的几个进程（比直接全量升档打扰小），清完仍不达标才走 `escalate_clean`；触发时托盘通知、手动清理通知标注「定向清理大户」，`--once` 标注「（定向大户）」 | true |
 | `target_clean_min_mb` | 工作集达到该值(MB)的进程才算「内存大户」，限 128–32768 | 1024 |
 | `target_clean_top` | 单次最多精确清空前 N 个工作集最大的进程，限 1–10 | 3 |
+| `bg_trim` | 定向大户之后、全量激进之前：清空没有可见顶层窗口的后台进程工作集（比直接升档打扰小、覆盖面比定向大户全）；窗口枚举不可信时跳过后台清理，`stats.bg_trimmed` 累计次数 | true |
 | `auto_level_adapt` | 档位自调优：保守档累计清理中升档占比过半且 ≥3 次时，自动把 `clean_level` 改为 `aggressive`（一次性，切换后发一次托盘通知，菜单「保守频繁升档自动改激进」可提前关） | true |
 | `predict_clean` | 趋势预防式清理：未超阈值、但按历史采样拟合的上升斜率预计在预测窗口内触阈时，提前清一次（阶梯仍是「保守 → 定向大户 → 全量激进」）；触发时托盘通知标注「趋势 +1.5%/分钟，预计 4.0 分钟后触及物理阈值，已提前清理」，`stats.preventive` 累计次数，菜单「趋势预防式清理」可关 | true |
 | `predict_window_min` | 预防判定的预测窗口(分钟)：预计触阈时间落在该窗口内才提前清理，限 1–60 | 5 |
@@ -276,7 +285,7 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
 | `auto_install` | 检查到新版本是否直接下载并自动安装（否则只提醒，由你点「立即更新」） | false |
 | `last_update_check` | 上次检查更新的时间戳(秒)，程序自动维护 | 0 |
 | `update_notified_tag` | 已气泡提醒过的最新版本号，用于每版本只提醒一次 | "" |
-| `stats` | 累计统计（清理次数 / 释放量 / 升档次数 / 定向次数 / 预防次数 / 短效次数），程序自动维护，菜单顶部可见 | {"count": 0, "freed": 0} |
+| `stats` | 累计统计（清理次数 / 释放量 / 升档次数 / 定向次数 / 后台清理次数 / 预防次数 / 短效次数），程序自动维护，菜单顶部可见 | {"count": 0, "freed": 0} |
 
 > 以上数值都会做合法性钳制（如阈值限 50–99、`interval` 限 2–3600 秒），手误写超范围会自动修正，无需担心配置写坏。
 
@@ -348,7 +357,7 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
   时把最小间隔压到 `max(cooldown * 0.5, 30)`，连续 2 次间隔达标再恢复完整 `cooldown`。只想固定节奏可在 `mem_guard.json` 里
   把 `adaptive_cooldown` 改为 `false`。
 
-当前版本 `1.10.0`。本版新增自适应冷却（`adaptive_cooldown`，默认开）：静态 `cooldown` 是最大缺口——清理效果偏短时不会更快复查，连续 hold 住后也不放松。现在让冷却跟着效果走：本次自动清理距上次不足 `effect_min_relief_sec`（效果偏短）时，把下次自动清理的最小间隔压到 `max(cooldown * 0.5, adaptive_cooldown_floor)`，连续 `_COOLDOWN_OK_STREAK`（2）次间隔达标再恢复完整 `cooldown`。四处冷却判定（趋势预防 / 超阈值 / 低内存 / 定时）共用 `Guard._cooldown_gap()` 一个口径；压缩只减不增——clamp(0, cooldown)，floor 高于 cooldown 也不放大；纯内存态、不落盘，关掉即恒为用户值。上一版 `1.9.0`：清理效果闭环（`effect_track`，默认开）：把「清完就完」补上效果度量——每次自动清理前先算距上次自动清理多久（上次清理来自手动 / `--once` 时不测，开关关掉也不测），间隔不足 `effect_min_relief_sec`（默认 600 秒）即判「效果偏短」：上次清理没 hold 住、内存压力很快复发。短效累计进 `stats.short_relief`（非 0 才落键，不污染干净配置），托盘通知追加「距上次自动清理 5.0 分钟（偏短）」、菜单统计行追加「（短效 N 次）」；短效次数过半且 ≥3 次时（与频繁升档、频繁预防同源同口径）advisor 出一条「保守清理效果不佳，建议直接改用激进」并可一键应用，同时作为档位自调优的第二条判据自动切一次激进档（一次性、落闩、只发一条通知、可提前关）。纯度量、不新增清理动作，打扰只多在通知里一行。
+当前版本 `1.11.0`。本版新增后台进程工作集清理（`bg_trim`，默认开）与泄漏进程增长感知：定向大户只清工作集榜上前几名，那些没有可见顶层窗口的后台进程同样在顶阈值却长期排不上号——`do_clean` 阶梯在「定向大户」之后、「自动升档」之前新增一级：先用 `EnumWindows` + `IsWindowVisible` 拿到可见窗口进程集合，再清空其余进程的工作集（前台零感知），枚举失败或触上限时 `visible_window_pids()` 返回 None、宁可不做；同版把监控里已有的 Top15 采样顺手拟合每个进程的 RSS 上升斜率（`growth_slopes`），斜率 ≥128KB/s 且净增长 ≥64MB 判疑似泄漏（`leak_candidates`，最多 5 条）：这些进程即便没进大户榜，也照样作为定向清理的优先候选（不受 `target_clean_min_mb` 下限），advisor 另出一条「N 个进程内存持续上涨（疑似泄漏）」提醒。菜单「后台进程工作集清理」`on_toggle_bg_trim` 可关，统计行新增「（后台 N 次）」（`menu.py:199` 读 `bg_trimmed`），`stats.bg_trimmed` 非 0 才落键。上一版 `1.10.0`：自适应冷却（`adaptive_cooldown`，默认开）：静态 `cooldown` 是最大缺口——清理效果偏短时不会更快复查，连续 hold 住后也不放松。现在让冷却跟着效果走：本次自动清理距上次不足 `effect_min_relief_sec`（效果偏短）时，把下次自动清理的最小间隔压到 `max(cooldown * 0.5, adaptive_cooldown_floor)`，连续 `_COOLDOWN_OK_STREAK`（2）次间隔达标再恢复完整 `cooldown`。四处冷却判定（趋势预防 / 超阈值 / 低内存 / 定时）共用 `Guard._cooldown_gap()` 一个口径；压缩只减不增——clamp(0, cooldown)，floor 高于 cooldown 也不放大；纯内存态、不落盘，关掉即恒为用户值。上一版 `1.9.0`：清理效果闭环（`effect_track`，默认开）：把「清完就完」补上效果度量——每次自动清理前先算距上次自动清理多久（上次清理来自手动 / `--once` 时不测，开关关掉也不测），间隔不足 `effect_min_relief_sec`（默认 600 秒）即判「效果偏短」：上次清理没 hold 住、内存压力很快复发。短效累计进 `stats.short_relief`（非 0 才落键，不污染干净配置），托盘通知追加「距上次自动清理 5.0 分钟（偏短）」、菜单统计行追加「（短效 N 次）」；短效次数过半且 ≥3 次时（与频繁升档、频繁预防同源同口径）advisor 出一条「保守清理效果不佳，建议直接改用激进」并可一键应用，同时作为档位自调优的第二条判据自动切一次激进档（一次性、落闩、只发一条通知、可提前关）。纯度量、不新增清理动作，打扰只多在通知里一行。
 上一版 `1.8.0`：趋势预防式清理（`predict_clean`，默认开）：趋势预防式清理（`predict_clean`，默认开）：监控循环每次采样都把 `(时刻, 物理%, 提交%)` 攒进 history，用最小二乘拟合上升斜率，预计在 `predict_window_min`（默认 5 分钟）内触及阈值，就在真越线之前提前清一次——从「超阈值才清」的反应式升级为按趋势预判的预防式。门：采样够多（默认 ≥6 个点且跨度 ≥60 秒）、斜率 ≥约 1.2%/分钟、ETA 落在窗口内、且当前未越线；任一不满足都不提前打扰，也不抢超阈值清理的活。阶梯仍走「保守 → 定向大户 → 全量激进」（每级最多一次）；清理通知标注「趋势 +1.5%/分钟，预计 4.0 分钟后触及物理阈值，已提前清理」，同一次 tick 不再重复弹接近阈值预警；`stats.preventive` 累计次数并在菜单统计行显示「（预防 N 次）」；预防次数过半且 ≥3 次时 advisor 建议直接改用激进档（与频繁升档同源同口径）；菜单「趋势预防式清理」可关。上一版 `1.7.0`：定向清理内存大户（`target_clean`，默认开）：保守清理后若仍超阈值，先按工作集挑最大的几个进程精确清空（默认 ≥1GB 的前 3 个，`user_blacklist` 白名单生效、逐 PID 重新核对防 PID 复用），清完仍不达标才按 `escalate_clean` 补一次激进档——阶梯「保守 → 定向大户 → 全量激进」，每级最多一次、最小打扰；托盘通知与手动清理通知标注「定向清理大户」并列出入选进程与工作集，`--once` 档位行加「（定向大户）」，`stats.targeted` 累计次数并在菜单统计行显示「（定向 N 次）」，菜单「定向清理内存大户」可关。上一版 `1.6.0`：档位自调优（v1.5.1 起升档次数计入 `stats.escalated`；保守档累计清理中升档占比过半且 ≥3 次，说明「先温和再彻底」每次都在白跑一遍，遂自动把 `clean_level` 切成 `aggressive` 并落闩 `level_adapt_done`——一次性、切换只发一条托盘通知、用户手动切回保守也不再自动评估、菜单「保守频繁升档自动改激进」可提前关；判据与 advisor「保守档频繁升档，建议直接改用激进」同源）。同版新增「优化建议一键应用」：advisor 为可操作建议附带 `action`（自动清理已关→开启、预警未开→设 15%、冷却过短→调为 300s、保守频繁升档→改激进、升档关闭且超阈值→开启），建议窗口据此渲染「一键应用」按钮，点击即增量合并写入配置并热生效（写入沿用同一把配置锁，单条失败只跳过该条，无 tkinter 时退化为普通文本）。同版再把同一套动作搬上右键菜单：「一键应用优化建议（N 项）」的计数由后台按 `advice_refresh_sec` 低频刷新，点下的那一刻按当前配置重新分析后逐条增量写配置、即时生效（单条失败只跳过该条），无可应用项时菜单项置灰，成功只写日志不弹气泡。上一版 `1.5.1` 为自动升档清理（保守清理后仍超阈值、或可用物理仍低于 `min_avail_mb` 下限，即补一次激进清理；最多一次、菜单可关、升档时通知与 `--once` 标注「（自动升档）」、最小打扰）。
 
 ## 源码结构
@@ -358,18 +367,18 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
 | 文件 | 职责 |
 |---|---|
 | `memguard/config.py` | 版本/路径、默认配置、配置校验与钳制、落盘日志（`log`） |
-| `memguard/winapi.py` | ctypes 绑定：内存读取（`get_mem`）、进程快路径枚举（`process_working_sets`，Toolhelp32 + `GetProcessMemoryInfo`）、特权（启用/禁用/查询）、单实例互斥体、底层清理调用（`_purge_list` / `clear_file_cache`）、托盘常驻（`IsPromoted` 读写 / `Shell_NotifyIconGetRect` / 重启 Explorer） |
-| `memguard/privileges.py` | 清理所需高危特权的启用与「用完即恢复」（`clean_privileges` 上下文管理器） |
+| `memguard/winapi.py` | ctypes 绑定：内存读取（`get_mem`）、进程快路径枚举（`process_working_sets`，Toolhelp32 + `GetProcessMemoryInfo`）、特权（启用/禁用/查询）、单实例互斥体、底层清理调用（`_purge_list` / `clear_file_cache`）、托盘常驻（`IsPromoted` 读写 / `Shell_NotifyIconGetRect` / 重启 Explorer）、可见顶层窗口进程枚举（`visible_window_pids`，枚举失败返回 None，调用方据此跳过）  |
+|  `memguard/privileges.py` | 清理所需高危特权的启用与「用完即恢复」（`clean_privileges` 上下文管理器） |
 | `memguard/actions.py` | 单步清理动作封装：工作集 / 修改页 / standby / 文件缓存，返回原始 NTSTATUS（`purge_working_sets` / `empty_selected_working_sets` 等） |
-| `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets` / `empty_selected_working_sets`）、定向大户挑选与清理（`_target_clean_candidates` / `_run_target_clean`）、趋势斜率拟合与预防判定（`_slope_per_sec` / `predictive_due`）、Top 进程统计 |
-| `memguard/ui.py` | 界面层：抗锯齿托盘图标绘制（`make_icon`，4× 超采样）、气泡提示（`message_box`）、内存概览（`show_overview_window`）/ Top10 / 趋势 / 优化建议窗口（`apply_advice_actions` 支持「一键应用」/「全部应用」） |
+| `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets` / `empty_selected_working_sets`）、定向大户挑选与清理（`_target_clean_candidates` / `_run_target_clean`）、趋势斜率拟合与预防判定（`_slope_per_sec` / `predictive_due`）、进程 RSS 增长感知（`growth_slopes` / `leak_candidates`）、后台进程工作集清理（`_run_bg_trim`）、Top 进程统计  |
+|  `memguard/ui.py` | 界面层：抗锯齿托盘图标绘制（`make_icon`，4× 超采样）、气泡提示（`message_box`）、内存概览（`show_overview_window`）/ Top10 / 趋势 / 优化建议窗口（`apply_advice_actions` 支持「一键应用」/「全部应用」） |
 | `memguard/autostart.py` | 开机自启：计划任务注册 / 查询 / 卸载（`autostart_enabled` / `install_autostart` / `remove_autostart`） |
 | `memguard/diag.py` | 诊断导出：内存状态 / 进程 / 日志 / 配置打包为 zip（`export_diagnostics`） |
 | `memguard/update.py` | 自动更新：查询 GitHub 最新 Release、版本比较、资产挑选、下载与静默安装 / 自替换（`check_and_notify` / `install_latest` / `pick_asset`） |
-| `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（`build_menu(guard)`，含「一键应用优化建议」`on_apply_advice`——现场重新分析后逐条增量写配置；「定向清理内存大户」`on_toggle_target_clean`；「趋势预防式清理」`on_toggle_predict_clean`） |
-| `memguard/tray.py` | 主循环 `Guard`：运行状态、配置热重载、监控循环、趋势预防式清理等触发源的自动清理、托盘图标自愈与常驻声明 |
+| `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（`build_menu(guard)`，含「一键应用优化建议」`on_apply_advice`——现场重新分析后逐条增量写配置；「定向清理内存大户」`on_toggle_target_clean`；「趋势预防式清理」`on_toggle_predict_clean`；「后台进程工作集清理」`on_toggle_bg_trim`）  |
+|  `memguard/tray.py` | 主循环 `Guard`：运行状态、配置热重载、监控循环、趋势预防式清理等触发源的自动清理、托盘图标自愈与常驻声明 |
 | `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、`--check-update`、`--update`、`--pin-tray`、控制台隐藏等启动流处理 |
-| `memguard/advisor.py` | 优化建议引擎：基于内存状态与配置生成分级建议（`analyze` / `format_advice` / `advice_actions`——把可操作建议映射成可一键应用的配置改动；`frequent_prevention`——预防式清理过半时建议直接改激进） |
-| `mem_guard.py` | 薄启动器，仅 `from memguard.cli import main`，保持 `python mem_guard.py` 入口不变 |
+| `memguard/advisor.py` | 优化建议引擎：基于内存状态与配置生成分级建议（`analyze` / `format_advice` / `advice_actions`——把可操作建议映射成可一键应用的配置改动；`frequent_prevention`——预防式清理过半时建议直接改激进；`analyze(..., leaks=...)`——疑似泄漏进程提醒）  |
+|  `mem_guard.py` | 薄启动器，仅 `from memguard.cli import main`，保持 `python mem_guard.py` 入口不变 |
 
 模块依赖为单向无环：`config` ← `winapi` ← `privileges` / `actions` ← `clean` ← `advisor` ← `ui` ← `autostart` ← `diag` ← `menu` ← `tray` ← `cli`（`update` 仅依赖 `config`）。

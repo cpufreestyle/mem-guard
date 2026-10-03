@@ -209,7 +209,7 @@ from contextlib import contextmanager
 def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
                escalate=None, wait_after=None, base_avail=None, base_commit=50.0,
                calls=None, min_avail=None, cfg_over=None, top_rows=None,
-               esw_result=(1, 0)):
+               esw_result=(1, 0), bg_trim=False, bg_result=(2, 0)):
     """把 do_clean 的外部依赖全部换成假的，只留编排逻辑本身。
 
     escalate=None 沿用 normalize_config 的默认（True）；wait_after 支持单个 dict
@@ -220,9 +220,13 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     cfg_over 直接覆盖归一化后的单项配置（如 {"target_clean": False}）；top_rows
     假造 Top 进程采样（默认全是小个进程，跑不到定向清理）；esw_result 是
     empty_selected_working_sets 的假返回值 (已清理数, 跳过数)。
+    bg_trim 显式覆盖配置里的 bg_trim（默认 False：让不关心后台清理的旧阶梯测试
+    保持原来的调用序列）；bg_result 是 empty_background_working_sets 的假返回值。
     """
     monkeypatch.setattr(clean, "is_admin", lambda: True)
     raw_cfg = {"clean_level": level}
+    if bg_trim is not None:
+        raw_cfg["bg_trim"] = bool(bg_trim)
     if areas is not None:
         raw_cfg["clean_areas"] = dict(areas)
     if escalate is not None:
@@ -259,6 +263,10 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     monkeypatch.setattr(clean, "top_processes_list", lambda n=15: list(rows))
     monkeypatch.setattr(clean, "empty_selected_working_sets",
                         lambda pids, bl: _rec("esw", esw_result))
+    # 后台进程工作集清理（v1.11.0）：窗口枚举与逐进程清空全部造假
+    monkeypatch.setattr(clean, "visible_window_pids", lambda: {4242, 99})
+    monkeypatch.setattr(clean, "empty_background_working_sets",
+                        lambda exclude, bl: _rec("ebw", bg_result))
     av0 = 8 * 1024 ** 3 if base_avail is None else base_avail
     monkeypatch.setattr(clean, "get_mem",
                         lambda: {"avail_phys": av0, "commit_pct": base_commit})
@@ -285,7 +293,7 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     monkeypatch.setattr(clean, "_wait_avail_rise", _wait)
     monkeypatch.setattr(clean, "_bump_stats",
                         lambda freed, escalated=False, targeted=False, preventive=False,
-                        short_relief=False:
+                        short_relief=False, bg_trimmed=False:
                             {"count": 9, "freed": freed})
     monkeypatch.setattr(clean, "log", lambda msg: None)   # 别往真实日志文件里写测试噪声
 
@@ -460,7 +468,7 @@ def test_do_clean_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False:
+               short_relief=False, bg_trimmed=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -477,7 +485,7 @@ def test_do_clean_no_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False:
+               short_relief=False, bg_trimmed=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -600,7 +608,7 @@ def test_do_clean_target_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False):
+                   short_relief=False, bg_trimmed=False):
         seen.append(targeted)
         return {"count": 9, "freed": freed}
 
@@ -820,7 +828,7 @@ def test_do_clean_passes_preventive_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False):
+                   short_relief=False, bg_trimmed=False):
         seen.append(preventive)
         return {"count": 9, "freed": freed}
 
@@ -850,7 +858,7 @@ def test_do_clean_passes_low_relief_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False):
+                   short_relief=False, bg_trimmed=False):
         seen.append(short_relief)
         return {"count": 9, "freed": freed}
 
@@ -860,3 +868,218 @@ def test_do_clean_passes_low_relief_to_stats(monkeypatch):
 
     assert r["ok"] is True
     assert seen == [True]
+
+# ------------------------------------ 后台进程工作集清理 / 泄漏识别（v1.11.0）
+
+
+def test_do_clean_bg_trim_runs_between_targeted_and_escalate(monkeypatch):
+    """定向大户仍不达标：清后台进程工作集，顺序在 targeted 之后、升档之前。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},  # 保守后仍受压
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},  # 定向后仍受压
+        {"avail_phys": base + 3072, "phys_pct": 92.0, "commit_pct": 40.0},  # 后台清理后仍受压
+        {"avail_phys": base + 4096, "phys_pct": 60.0, "commit_pct": 40.0},  # 升档后回落
+    ]
+    calls = []
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_big_rows(),
+               bg_trim=True, bg_result=(2, 0))
+    r = clean.do_clean("测试")
+
+    assert calls.index("ebw") > calls.index("esw"), "后台清理排在定向大户之后"
+    assert calls.index("ebw") < calls.index("epw"), "后台清理排在升档之前"
+    assert calls.count("ebw") == 1
+    assert calls.count("wait") == 4
+    assert r["bg_trim"] == 2
+    assert "后台进程工作集:2 个" in r["detail"]
+
+
+def test_do_clean_bg_trim_skipped_when_disabled(monkeypatch):
+    """bg_trim 关掉：定向之后直接考虑升档，不碰后台进程。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 4096, "phys_pct": 60.0, "commit_pct": 40.0},
+    ]
+    calls = []
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_big_rows(),
+               bg_trim=False)
+    r = clean.do_clean("测试")
+
+    assert "ebw" not in calls
+    assert r["bg_trim"] == 0
+    assert "后台进程工作集" not in r["detail"]
+
+
+def test_do_clean_bg_trim_skips_when_window_enum_untrustworthy(monkeypatch):
+    """枚举不到窗口时宁可不做：绝不能把「枚举失败」当成「都没有窗口」全清。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 4096, "phys_pct": 60.0, "commit_pct": 40.0},
+    ]
+    calls = []
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_big_rows(),
+               bg_trim=True)
+    monkeypatch.setattr(clean, "visible_window_pids", lambda: None)
+    r = clean.do_clean("测试")
+
+    assert "ebw" not in calls
+    assert "后台进程工作集:跳过(无法枚举窗口)" in r["detail"]
+    assert r["bg_trim"] == 0
+
+
+def test_do_clean_bg_trim_skipped_in_aggressive(monkeypatch):
+    """激进档本来就全清进程工作集：后台清理这一级没有存在意义。"""
+    calls = []
+    _admin_env(monkeypatch, level="aggressive", calls=calls, top_rows=_big_rows(),
+               bg_trim=True)
+    clean.do_clean("测试")
+
+    assert "ebw" not in calls
+
+
+def test_do_clean_bg_trim_skipped_when_first_round_relieves(monkeypatch):
+    """保守清理一轮就到位：后续阶梯一级都不该触发。"""
+    base = 8 * 1024 ** 3
+    wait_after = [{"avail_phys": base + 2048, "phys_pct": 60.0, "commit_pct": 40.0}]
+    calls = []
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_big_rows(),
+               bg_trim=True)
+    r = clean.do_clean("测试")
+
+    assert "ebw" not in calls
+    assert r["bg_trim"] == 0
+
+
+def test_do_clean_passes_bg_trimmed_to_stats(monkeypatch):
+    """bg_trimmed=True 要一路透传到 _bump_stats：统计行与通知都靠它。"""
+    seen = []
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 3072, "phys_pct": 60.0, "commit_pct": 40.0},
+    ]
+
+    def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
+                   short_relief=False, bg_trimmed=False):
+        seen.append(bg_trimmed)
+        return {"count": 9, "freed": freed}
+
+    _admin_env(monkeypatch, wait_after=wait_after, top_rows=_big_rows(), bg_trim=True)
+    monkeypatch.setattr(clean, "_bump_stats", _fake_bump)
+    r = clean.do_clean("测试")
+
+    assert r["bg_trim"] == 2
+    assert seen == [True]
+
+
+def test_do_clean_targets_leaks_even_below_min_mb(monkeypatch):
+    """泄漏进程不受大户下限约束：还没长成就得优先下刀（定向候选第一顺位）。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 4096, "phys_pct": 60.0, "commit_pct": 40.0},
+    ]
+    esw_pids = []
+    _admin_env(monkeypatch, wait_after=wait_after, calls=[])
+    monkeypatch.setattr(clean, "empty_selected_working_sets",
+                        lambda pids, bl: (esw_pids.extend(pids), (1, 0))[1])
+    # Top 采样默认全是 100MB 小进程，够不到 1024MB 大户线
+    r = clean.do_clean("测试", growth_rows=[("leaky.exe", 200 * 1024 ** 2, 7)])
+
+    assert esw_pids == [7]
+    assert [n for n, _, _ in r["targeted"]] == ["leaky.exe"]
+    assert "定向清理大户(leaky.exe" in r["detail"]
+
+
+def _growth_history(n=6, step=100.0, t0=1000.0):
+    """假造 Guard.proc_history：leaky 每次采样涨 128MB，creeper 涨 8MB，other 不动。"""
+    hist = []
+    for i in range(n):
+        hist.append((t0 + i * step, {
+            7: ("leaky.exe", (900 + 128 * i) * 1024 ** 2),
+            8: ("other.exe", 200 * 1024 ** 2),
+            9: ("creeper.exe", (300 + 8 * i) * 1024 ** 2),
+        }))
+    return hist
+
+
+def test_growth_slopes_fits_only_rising_processes():
+    """斜率拟合只认持续上涨的进程；平稳进程直接剔除，结果按斜率降序。"""
+    rows = clean.growth_slopes(_growth_history())
+    by_name = {name: (rss, slope, growth) for _, name, rss, slope, growth in rows}
+    assert "other.exe" not in by_name, "平稳进程没有上升斜率"
+    assert "leaky.exe" in by_name and "creeper.exe" in by_name
+    _, _, growth = by_name["leaky.exe"]
+    assert growth == 5 * 128 * 1024 ** 2, "净增长取末次减首次"
+    assert rows[0][1] == "leaky.exe", "斜率最大的排最前"
+    slopes = [r[3] for r in rows]
+    assert slopes == sorted(slopes, reverse=True)
+
+
+def test_growth_slopes_needs_enough_samples_and_span():
+    """采样点数不够或时间跨度太短：一律不拟合（抖动不是趋势）。"""
+    assert clean.growth_slopes(_growth_history(n=4)) == []
+    assert clean.growth_slopes(_growth_history(step=10.0)) == []
+
+
+def test_growth_slopes_ignores_processes_not_present_throughout():
+    """中途启动或退出的进程不是趋势，是噪声：不进入拟合。"""
+    hist = _growth_history()
+    snap = dict(hist[-1][1])
+    del snap[8]
+    hist[-1] = (hist[-1][0], snap)
+    names = {name for _, name, _, _, _ in clean.growth_slopes(hist)}
+    assert "other.exe" not in names
+    assert {"leaky.exe", "creeper.exe"} <= names
+
+
+def test_leak_candidates_requires_slope_and_growth():
+    """斜率与净增长双越线才算疑似泄漏：只沾一条边的（creeper）不算。"""
+    got = clean.leak_candidates(_growth_history())
+    assert got == [("leaky.exe", (900 + 5 * 128) * 1024 ** 2, 7)]
+
+
+def test_leak_candidates_truncates_and_orders_by_slope():
+    """最多报 _LEAK_MAX_ROWS 个、按斜率降序：别把通知/建议列表刷满。"""
+    hist = []
+    for i in range(6):
+        hist.append((1000.0 + i * 100.0, {
+           100 + k: ("p%d.exe" % k, (500 + (16 + 4 * k) * i) * 1024 ** 2)
+            for k in range(7)
+        }))
+    got = clean.leak_candidates(hist)
+    slopes = {name: slope for _, name, _, slope, _ in clean.growth_slopes(hist)}
+    names = [n for n, _, _ in got]
+    assert len(got) == clean._LEAK_MAX_ROWS == 5
+    assert names == sorted(names, key=lambda n: slopes[n], reverse=True)
+    assert names[0] == "p6.exe", "斜率最大的排最前"
+
+
+def test_target_clean_candidates_prioritizes_leaks_and_dedupes():
+    """泄漏进程排最前、不受大户下限约束，并按 PID 去重。"""
+    rows = [("big.exe", 4 * 1024 ** 3, 1), ("mid.exe", 2 * 1024 ** 3, 2)]
+    extras = [("leaky.exe", 300 * 1024 ** 2, 3), ("big.exe", 4 * 1024 ** 3, 1)]
+    got = [n for n, _, _ in clean._target_clean_candidates(rows, normalize_config({}), extras)]
+    assert got == ["leaky.exe", "big.exe", "mid.exe"]
+
+
+def test_target_clean_candidates_extras_respect_top_truncation():
+    """extras 也受 top 截断：候选列表不会被泄漏进程撑爆。"""
+    got = clean._target_clean_candidates(
+        [("big.exe", 4 * 1024 ** 3, 1)], {"target_clean": True, "target_clean_top": 1},
+        [("leaky.exe", 300 * 1024 ** 2, 3)])
+    assert [n for n, _, _ in got] == ["leaky.exe"]
+
+
+def test_target_clean_candidates_extras_only_when_min_mb_zero():
+    """大户下限关成 0：只返回 extras，不再从 Top 采样里挑。"""
+    got = clean._target_clean_candidates(
+        [("big.exe", 4 * 1024 ** 3, 1)], {"target_clean": True, "target_clean_min_mb": 0,
+                                        "target_clean_top": 2},
+        [("leaky.exe", 10 * 1024 ** 2, 3)])
+    assert [n for n, _, _ in got] == ["leaky.exe"]

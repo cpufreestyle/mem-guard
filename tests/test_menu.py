@@ -29,6 +29,7 @@ class _FakeGuard:
         self.advice_count = 3
         self.advice_apply_count = 1
         self.history = []
+        self.leaks = []
         self.icon = None
         self.stop = threading.Event()
 
@@ -302,7 +303,7 @@ class _FakeIcon:
 
 def test_clean_now_notify_marks_escalation(monkeypatch):
     """手动清理若补了激进一次，通知要标「（自动升档）」：与托盘自动清理、--once 同口径。"""
-    def _fake_do_clean(reason="手动"):
+    def _fake_do_clean(reason="手动", growth_rows=None):
         return {
             "ok": True,
             "freed": 3 * 1024 ** 3,
@@ -329,7 +330,7 @@ def test_clean_now_notify_marks_escalation(monkeypatch):
 
 def test_clean_now_notify_marks_targeted(monkeypatch):
     """手动清理精确清过大户：通知要单列「定向清理大户」段，与托盘自动清理同口径。"""
-    def _fake_do_clean(reason="手动"):
+    def _fake_do_clean(reason="手动", growth_rows=None):
         return {
             "ok": True,
             "freed": 3 * 1024 ** 3,
@@ -362,7 +363,8 @@ def test_menu_one_click_apply_writes_increment_and_logs(monkeypatch):
     merged, logged = [], []
     monkeypatch.setattr(menu, "log", logged.append)
     monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
-    monkeypatch.setattr(menu, "analyze", lambda cfg, mem=None, top=None: [
+    monkeypatch.setattr(menu, "analyze",
+                        lambda cfg, mem=None, top=None, leaks=None: [
         {"title": "自动清理已关闭",
          "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
         {"title": "预警未开启",
@@ -409,7 +411,8 @@ def test_menu_apply_advice_skips_failing_single_action(monkeypatch):
     merged, logged = [], []
     monkeypatch.setattr(menu, "log", logged.append)
     monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
-    monkeypatch.setattr(menu, "analyze", lambda cfg, mem=None, top=None: [
+    monkeypatch.setattr(menu, "analyze",
+                        lambda cfg, mem=None, top=None, leaks=None: [
         {"title": "自动清理已关闭",
          "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
         {"title": "预警未开启",
@@ -479,3 +482,36 @@ def test_stats_line_shows_short_relief_count():
     line = next(i.text for i in build_menu(guard).items
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "短效" not in line
+
+# ------------------------------------------------ 后台进程工作集清理菜单项（v1.11.0）
+
+
+def test_menu_toggle_bg_trim_writes_current_config(monkeypatch):
+    """「后台进程工作集清理」勾选只提交增量 bg_trim，并即时回填（读写当前配置）。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"bg_trim": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "后台进程工作集清理")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"bg_trim": False}], "只提交本次勾选，不带旧快照里的其它字段"
+    assert guard.cfg["bg_trim"] is False, "合并结果要立刻回填，勾选态实时生效"
+
+
+def test_stats_line_shows_bg_trim_count():
+    """统计行：有后台工作集清理次数时追加「（后台 N 次）」，没清理过时不出现该字样。"""
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "bg_trimmed": 2}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "累计清理 5 次" in line
+    assert "（后台 2 次）" in line
+
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "后台" not in line

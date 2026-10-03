@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import psutil
 
 from .config import CLEAN_BLACKLIST_STEMS, _blacklist_stems, _norm_proc_name
@@ -74,6 +76,41 @@ def empty_process_working_sets(extra_blacklist=()) -> tuple:
                 continue
             h = kernel32.OpenProcess(
                 PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, p.info["pid"]
+            )
+            if h:
+                try:
+                    if psapi.EmptyWorkingSet(h):
+                        count += 1
+                finally:
+                    kernel32.CloseHandle(h)
+        except Exception:
+            continue
+    return count, skipped
+
+
+def empty_background_working_sets(exclude_pids=(), extra_blacklist=()) -> tuple:
+    """清空「没有可见顶层窗口」的后台进程工作集（定向与升档之间的第三级阶梯）。
+
+    与 empty_process_working_sets 的差别是排除用户正在看的进程：exclude_pids 由
+    调用方用 winapi.visible_window_pids() 现算，再叠加自身与黑名单，只对真正后台
+    的进程下手——前台零感知，覆盖面又比定向大户全。返回 (已清理数, 跳过数)。
+    """
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_SET_QUOTA = 0x0100
+    # psapi.EmptyWorkingSet / kernel32.OpenProcess 的类型声明见 winapi.py
+
+    blocked = CLEAN_BLACKLIST_STEMS | _blacklist_stems(extra_blacklist)
+    exclude = {os.getpid()} | {int(pid) for pid in exclude_pids}
+    count = 0
+    skipped = 0
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            pid = p.info["pid"]
+            if pid in (0, 4) or pid in exclude or _norm_proc_name(p.info.get("name")) in blocked:
+                skipped += 1
+                continue
+            h = kernel32.OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid
             )
             if h:
                 try:

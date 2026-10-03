@@ -128,11 +128,14 @@ def advice_actions(items: list) -> list:
     return out
 
 
-def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list:
+def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
+            leaks: list | None = None) -> list:
     """返回建议列表，每条为 {"level", "title", "text"}。
 
     mem / top 可外部传入（便于测试，或让监控线程复用同一份采样，避免每轮刷新都扫全进程）；
     省略时现场取值。任何单条建议计算失败都不应阻断其它建议，故逐段 try 容错。
+    leaks 是 clean.leak_candidates() 的返回（疑似泄漏进程），传入时多一条泄漏
+    提醒；省略（cli / 一次性自检）时不出这条建议。
     """
     items: list = []
     try:
@@ -305,6 +308,16 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list
                              " 等程序在运行；激进档会清空其工作集导致卡顿，"
                              "建议把常用程序加入 user_blacklist。"),
                 })
+
+    # ---- 4b. 泄漏进程识别（v1.11.0）：按历史上升斜率点名疑似泄漏的进程 ----
+    if leaks:
+        names = "、".join(f"{n}（{gb(r)}）" for n, r, _ in leaks[:3])
+        items.append({
+            "level": LEVEL_TIP,
+            "title": f"{len(leaks)} 个进程内存持续上涨（疑似泄漏）",
+            "text": (f"{names} 的占用仍在持续走高。若是常驻后台服务或已关掉的窗口，"
+                     f"重启该进程最直接；内存吃紧时 MemGuard 也会优先定向清理其工作集。"),
+        })
 
     # ---- 5. 健康正向 ----
     if phys_pct < 55 and commit_pct < 70 and is_admin():

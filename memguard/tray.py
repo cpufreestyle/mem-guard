@@ -18,7 +18,8 @@ import pystray
 from . import update
 from .advisor import (advice_actions, analyze, frequent_escalation,
                       frequent_short_relief)
-from .clean import do_clean, predictive_due, top_processes_list
+from .clean import (GROWTH_MAX_SAMPLES, do_clean, leak_candidates,
+                    predictive_due, top_processes_list)
 from .config import CONFIG_PATH, __version__, gb, load_config, log, update_config
 from .menu import build_menu
 from .ui import (make_icon, show_advice_window, show_overview_window,
@@ -44,6 +45,8 @@ class Guard:
         self.last_clean = 0.0
         self.over_since = None       # 内存超阈值起始时刻（防抖用）
         self.history = collections.deque(maxlen=120)  # 内存使用率采样历史
+        self.proc_history = collections.deque(maxlen=GROWTH_MAX_SAMPLES)  # 逐进程采样历史
+        self.leaks = []              # 疑似泄漏进程 [(name, rss, pid), ...]
         self._cfg_mtime = None       # 配置热重载：记录上次 mtime
         self._warned = False         # 是否已就本次接近阈值发过预警（避免反复弹）
         self.advice_count = 0        # 后台低频刷新的「优化建议条数」，供菜单标签零成本读取
@@ -75,7 +78,7 @@ class Guard:
         用 hooks 把窗口里的按钮接回 Guard，ui 层因此不需要反向依赖 tray。
         """
         show_overview_window({
-            "clean": lambda: do_clean("手动"),
+            "clean": lambda: do_clean("手动", growth_rows=self.leaks),
             "top": show_top_window,
             "trend": lambda: show_trend_window(lambda: list(self.history)),
             # 传 callable 而非 dict：窗口内「一键应用」会经 update_config 换掉
@@ -133,14 +136,13 @@ class Guard:
         self.last_clean = now
         self._note_relief(relief, low_relief)
         self.over_since = None
-        if preventive and low_relief:
-            r = do_clean(reason, preventive=True, low_relief=True)
-        elif preventive:
-            r = do_clean(reason, preventive=True)
-        elif low_relief:
-            r = do_clean(reason, low_relief=True)
-        else:
-            r = do_clean(reason)
+        kw = {}
+        if preventive:
+            kw["preventive"] = True
+        if low_relief:
+            kw["low_relief"] = True
+        # 泄漏进程一起带下去：定向清理会优先清它们（见 do_clean 的 growth_rows）
+        r = do_clean(reason, growth_rows=self.leaks, **kw)
         if r["ok"]:
             # 统计已在 do_clean 里落盘：顺手同步回内存，否则菜单顶部那行累计统计要等
             # 下一次热重载（间隔由 interval 决定，最长可能等很久）才刷新
@@ -159,6 +161,8 @@ class Guard:
                 tgt_txt = "\n".join(
                     f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in r["targeted"])
                 body += f"\n定向清理大户:\n{tgt_txt}"
+            if r.get("bg_trim"):
+                body += f"\n后台进程工作集: {r['bg_trim']} 个"
             if relief is not None and self.cfg.get("effect_track", True):
                 body += f"\n距上次自动清理 {relief / 60:.1f} 分钟"
                 if low_relief:
@@ -260,12 +264,18 @@ class Guard:
 
         菜单标签只读 advice_count / advice_apply_count，所以这里可以放心低频；扫描
         失败保留上次的值，且时间戳已前移，不会在监控线程里对失败项发起热重试。
+        顺手把这次扫描存进 proc_history：v1.11.0 起同一份 top15 采样还用来拟合
+        各进程的 RSS 上升斜率，零额外成本（不额外扫盘）就能识别疑似泄漏进程。
         """
         if now - self._advice_at < self.cfg.get("advice_refresh_sec", 60):
             return
         self._advice_at = now
         try:
-            items = analyze(self.cfg, self.state, top_processes_list(15))
+            top = top_processes_list(15)
+            self.proc_history.append(
+                (now, {int(pid): (name, int(rss)) for name, rss, pid in top}))
+            self.leaks = leak_candidates(self.proc_history)
+            items = analyze(self.cfg, self.state, top, leaks=self.leaks)
             self.advice_count = len(items)
             self.advice_apply_count = len(advice_actions(items))
         except Exception:
@@ -435,7 +445,7 @@ class Guard:
         if self.cfg.get("clean_on_start"):
             try:
                 log("启动时清理：按配置执行一次")
-                do_clean("启动")
+                do_clean("启动", growth_rows=self.leaks)
                 self.last_clean = time.time()
             except Exception as e:
                 log(f"启动清理异常: {e!r}")
