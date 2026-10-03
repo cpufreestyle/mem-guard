@@ -45,6 +45,22 @@ _LEAK_MIN_GROWTH = 64 * 1024 ** 2  # 且净增长至少这么多(64MB)：排除�
 _LEAK_MAX_ROWS = 5           # 最多报这么多个，别把通知/建议列表刷满
 GROWTH_MAX_SAMPLES = 40      # Guard.proc_history 采样上限（默认 10s 间隔≈6.5 分钟），tray 共用
 
+# 定向加深（v1.13.0）：定向清理确实释放到了东西、但压力没完全按住时，把同一张网撒宽
+# 一轮再清一次——大户数翻倍、大户下限减半，且只挑上一轮还没碰过的进程。仍不达标才
+# 轮到后台级与升档全清：能用小幅加深按住，就不必把每个进程的工作集都清空。
+# v1.14.0 起可多轮：stage_deepen_rounds 给轮数上限（默认 1 轮，即 v1.13.0 行为），
+# 每轮在上一轮的基础上再翻一倍候选、再减一版下限，仍只挑还没碰过的进程。加深是
+# 度量式的补刀，不是加码竞赛：真按住或没清动就停，绝不为撒宽而撒宽。
+_DEEPEN_TOP_FACTOR = 2      # 加深轮的候选数倍率（在 target_clean_top 之上翻倍）
+_DEEPEN_MIN_MB_DIV = 2      # 加深轮的大户下限除数（下限越宽，纳入的中等进程越多）
+_DEEPEN_MIN_MB_FLOOR = 1024 ** 2   # 加深后的大户下限(字节)：别为加深清到几百 KB 的进程
+_DEEPEN_MAX_ROUNDS = 3      # 加深轮数上限：normalize 把 stage_deepen_rounds clamp 到这里
+
+# 降压余量（v1.14.0）：判定「仍受压」时先把两条百分比阈值让出 target_headroom_pct
+# 那么多，清到留有余量才算按住——贴着 85% 线办事，前台一波小高峰就又把 Guard 叫起来，
+# 反而更打扰。min_avail_mb 是绝对量，让不出「百分之几」，原样不动。
+_HEADROOM_MAX = 20          # 降压余量上限(百分点)：余量再大等于永久激进化，别给
+
 
 def _status(rc: int) -> str:
     """把 NTSTATUS 渲染为可读文案。"""
@@ -80,7 +96,8 @@ def _wait_avail_rise(before: dict) -> dict:
 
 def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
                 preventive: bool = False, short_relief: bool = False,
-                bg_trimmed: bool = False, sticky: bool = False) -> dict:
+                bg_trimmed: bool = False, sticky: bool = False,
+                deepen_rounds: int = 0) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -98,6 +115,9 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
     进程工作集的触发频次，供统计行与通知展示（normalize_config 只持久化非 0 值）。
     sticky=True 时同步累计「粘滞激进次数」：v1.12.0 起持续高压时按激进执行的
     触发频次，供统计行与通知展示（normalize_config 同样只持久化非 0 值）。
+    deepen_rounds=N 时同步累计 N 次「定向加深」：v1.13.0 起定向清理释放到了东西但
+    压力没完全按住、把挑选网撒宽再清的触发频次；v1.14.0 起加深可多轮，按实际跑过
+    的轮数累加（一次加深 2 轮就 +2），口径同上。
     """
     with _CONFIG_LOCK:
         cfg = load_config()
@@ -116,6 +136,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
             st["bg_trimmed"] = int(st.get("bg_trimmed", 0)) + 1
         if sticky:
             st["sticky"] = int(st.get("sticky", 0)) + 1
+        if deepen_rounds:
+            st["deepen"] = int(st.get("deepen", 0)) + int(deepen_rounds)
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
@@ -177,15 +199,61 @@ def _run_clean_actions(aggressive: bool, areas: dict, blacklist) -> tuple:
         return detail, core, failed_privs
 
 
+def _headroom_pct(cfg: dict) -> int:
+    """降压余量(百分点)：判定「仍受压」时两条百分比阈值先让出这么多（v1.14.0）。
+
+    读 target_headroom_pct（clamp 0.._HEADROOM_MAX），脏值/缺省一律视为 0=关。
+    只让百分比阈值：min_avail_mb 是绝对量，让不出「百分之几」，原样不动。
+    """
+    try:
+        hr = int(cfg.get("target_headroom_pct") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(hr, _HEADROOM_MAX))
+
+
+def _effective_threshold(cfg: dict, key: str):
+    """套上降压余量后的百分点阈值：threshold - target_headroom_pct。
+
+    阈值缺失(None)或减不动(非数字)时原样返回，让调用方照旧跳过对应判断；余量为 0
+    时与阈值相同，行为与旧版完全一致。_still_pressured 与 predictive_due 共用这
+    一个口径：两处的「触线」标准必须一致，否则会出现「预防说还早、清理说已经晚
+    了」的自相矛盾。
+    """
+    threshold = cfg.get(key)
+    if threshold is None:
+        return None
+    try:
+        return threshold - _headroom_pct(cfg)
+    except TypeError:
+        return threshold
+
+
+def _deepen_rounds(cfg: dict) -> int:
+    """定向加深轮数上限：stage_deepen_rounds，clamp 1.._DEEPEN_MAX_ROUNDS（v1.14.0）。
+
+    默认 1 即 v1.13.0 的单轮加深；脏值/缺省取 1。这里只是天花板：真正跑几轮还看
+    每轮实战——没有还没碰过的候选、这一轮没清动、或已经按住，都会提前收尾。
+    """
+    try:
+        rounds = int(cfg.get("stage_deepen_rounds") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(rounds, _DEEPEN_MAX_ROUNDS))
+
+
 def _still_pressured(m: dict, cfg: dict) -> bool:
     """清理后是否仍超阈值：物理或提交使用率任一仍越线、或可用物理仍低于
     「低内存触发」下限（min_avail_mb，0=关闭），就算没清到位。
 
+    v1.14.0 起两条百分比线都先让出降压余量（_effective_threshold）：清到留有余量
+    才算按住；min_avail_mb 是绝对量，不参与让余量。
+
     用 .get 老老实实取值——部分采样桩/回退路径不含 phys_pct，缺项视为未越线，
     别在这里 KeyError。阈值缺失同样跳过对应判断（配置总是 normalize 过的，多为兜底）。
     """
-    pt = cfg.get("phys_threshold")
-    ct = cfg.get("commit_threshold")
+    pt = _effective_threshold(cfg, "phys_threshold")
+    ct = _effective_threshold(cfg, "commit_threshold")
     phys = m.get("phys_pct")
     commit = m.get("commit_pct")
     if pt is not None and phys is not None and phys >= pt:
@@ -199,19 +267,30 @@ def _still_pressured(m: dict, cfg: dict) -> bool:
     return False
 
 
-def _target_clean_candidates(rows, cfg, extra_rows=None) -> list:
+def _target_clean_candidates(rows, cfg, extra_rows=None, widen=False, round_=1) -> list:
     """从 Top 进程采样里挑出「工作集大户」：≥ target_clean_min_mb，取前 target_clean_top 个。
 
     rows 是 top_processes_list 的返回 [(name, rss_bytes, pid), ...]（已按工作集降序）；
     extra_rows 是 leak_candidates() 的返回：疑似泄漏的进程排在最前且不受 min_mb
     下限约束（泄漏初期可能还没到「大户」级别，但那正是最该掐的时候），仍受 top
     截断并按 PID 去重。开关关闭或 top ≤0 时返回 []；min_mb ≤0 时只返回 extras。
+    widen=True（v1.13.0 定向加深，v1.14.0 起可多轮）：round_ 是第几轮加深（从 1 起），
+    候选数按 _DEEPEN_TOP_FACTOR**round_ 翻倍、大户下限按 _DEEPEN_MIN_MB_DIV**round_
+    逐轮减半（仍不低于 _DEEPEN_MIN_MB_FLOOR）。上一轮已经证明「清大户有效」但压力没
+    完全按住时，把网撒向还没碰过的中等进程，而不是直接升级成全清；下限 <=0 时不是
+    「全都算大户」，只翻倍 extras 的截断，不回退成扫整个进程表。
     纯函数，便于单测。
     """
     if not cfg.get("target_clean", True):
         return []
     min_bytes = int(cfg.get("target_clean_min_mb") or 0) * 1024 * 1024
     top = int(cfg.get("target_clean_top") or 0)
+    if widen:
+        rounds = max(1, int(round_ or 1))
+        if min_bytes > 0:
+            min_bytes = max(min_bytes // _DEEPEN_MIN_MB_DIV ** rounds,
+                            _DEEPEN_MIN_MB_FLOOR)
+        top *= _DEEPEN_TOP_FACTOR ** rounds
     if top <= 0:
         return []
     out = []
@@ -277,7 +356,8 @@ def predictive_due(history, cfg: dict):
     """趋势预防判定：预计窗口内触及阈值就返回触阈倒计时，否则 None（纯函数）。
 
     history 是 (t, phys_pct, commit_pct) 采样列表（新在后，即 Guard.history）；
-    cfg 读 predict_clean / predict_window_min / 两个阈值。采样不足、跨度太短、
+    cfg 读 predict_clean / predict_window_min / 两个阈值（v1.14.0 起先套降压余量
+    _effective_threshold，与 _still_pressured 同一口径）。采样不足、跨度太短、
     读数为平稳(斜率低于 _PREDICT_MIN_SLOPE)、已越线(那是超阈值清理的活)、
     或预计触阈时间超出窗口，一律 None——任何一条不满足都不该提前打扰。
     返回 {"eta": 秒, "slope_pm": %/分钟, "metric": "物理"|"提交"}，eta 取两者较小。
@@ -296,8 +376,9 @@ def predictive_due(history, cfg: dict):
     if window <= 0:
         return None
     best = None
-    for idx, threshold, metric in ((1, cfg.get("phys_threshold"), "物理"),
-                                   (2, cfg.get("commit_threshold"), "提交")):
+    for idx, key, metric in ((1, "phys_threshold", "物理"),
+                             (2, "commit_threshold", "提交")):
+        threshold = _effective_threshold(cfg, key)
         if threshold is None:
             continue
         slope = _slope_per_sec(samples, idx)
@@ -402,6 +483,12 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     进入/退出粘滞态；阶梯各级本就只在 not aggressive 时跑，粘滞即天然跳过整条阶梯。
     skip 是本轮跳过的阶段名集合（「targeted」「bg」 的子集），来源托盘的阶段自
     学习：某一级连续多次没释放出东西就跳过它，只影响阶梯阶段、不影响升档本身。
+    v1.13.0 起定向清理证明有效（释放到了东西）但压力没完全按住时，会按 stage_deepen
+    把挑选网撒宽再清一次「定向加深」，仍不达标才轮到后台级与升档全清；v1.14.0 起
+    加深可多轮（stage_deepen_rounds，默认 1 轮即 v1.13.0 行为），每轮只挑还没碰过
+    的进程，没候选/没清动/已按住都会提前收尾。加深的释放量计入 targeted_freed，另
+    以回传键 deepened（加深清掉的进程数）/ deepen_freed / deepen_rounds（实际跑了几
+    轮）报给通知与统计（stats.deepen 按轮累计）。
     """
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
@@ -438,9 +525,12 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     targeted_freed = 0
     bg_freed = 0
     escalated_freed = 0
+    deepen_rounds = 0            # v1.14.0：实际跑过的加深轮数（stats 按轮累计）
 
     # 定向清理（v1.7.0 阶梯第一级）：保守清理后仍超阈值时，先只对工作集最大的几个
     # 进程精确清空——比直接全量升档的打扰小；仍不达标才轮到升档的「全清」
+    deepened = 0
+    deepen_freed = 0
     if (not aggressive and "targeted" not in skip
             and bool(cfg.get("target_clean", True))
             and _still_pressured(after, cfg)):
@@ -463,6 +553,49 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             else:
                 detail.append(f"定向清理大户({names}): 未成功")
 
+    # 定向加深（v1.13.0 阶梯第一级半，v1.14.0 起可多轮）：定向清理确实释放到了东西、
+    # 但压力没完全按住时，把同一张网撒宽再清一轮——候选数翻倍、大户下限减半，且只挑
+    # 之前还没碰过的进程。仍不达标才轮到后面的后台级与升档全清：能用小幅加深按住，
+    # 就不必清空每个进程的工作集。stage_deepen_rounds 给轮数上限（默认 1 轮，即
+    # v1.13.0 行为）；每轮开头先确认「现在还压着、上轮真清出了东西」，任何一条不
+    # 成立就收尾——加深是度量式补刀，不是加码竞赛。
+    # 加深度量计入 targeted_freed：阶段自学习看到的仍是「定向这一级」的总战绩。
+    # 不排除有可见窗口的进程——那会让加深变成后台级的子集（bg 已全覆盖不可见进程），
+    # 加深的意义恰恰在于按工作集大小再往上数几个中等进程。
+    if (targeted and targeted_freed > 0 and not aggressive and "targeted" not in skip
+            and bool(cfg.get("stage_deepen", True))):
+        cap = _deepen_rounds(cfg)
+        for rnd in range(1, cap + 1):
+            if not _still_pressured(after, cfg):
+                break               # 上一轮已经按住：加深到此为止，别再多撒网
+            try:
+                wide = _target_clean_candidates(top_processes_list(15), cfg,
+                                                growth_rows, widen=True, round_=rnd)
+            except Exception:
+                wide = []
+            extra = [c for c in wide
+                     if int(c[2]) not in {int(p) for _, _, p in targeted}]
+            if not extra:
+                break               # 没有还没碰过的候选：再撒也是空转
+            pre = after["avail_phys"]
+            n, skipped = _run_target_clean(extra, bl)
+            if not n:
+                detail.append(f"定向加深(第 {rnd} 轮): 未成功")
+                break               # 清不动：照常走后面的后台级与升档
+            # 采纳加深：再等一次把回补计入，供后面的后台/升档判断复用最新 after
+            after = _wait_avail_rise(after)
+            targeted = list(targeted) + extra
+            round_freed = max(after["avail_phys"] - pre, 0)
+            deepen_freed += round_freed
+            targeted_freed += round_freed
+            deepened += n
+            deepen_rounds += 1
+            # 轮次只在真的跑了多轮时写进明细：默认 1 轮的配置里别多一行噪声
+            rnd_txt = f"第 {rnd} 轮, " if rnd > 1 else ""
+            names = "、".join(f"{name} {gb(rss)}" for name, rss, _ in extra)
+            detail.append(f"定向加深({rnd_txt}{names}): {n} 个"
+                          + (f"（跳过 {skipped}）" if skipped else ""))
+
     # 后台进程工作集清理（v1.11.0 阶梯第二级）：定向大户仍不达标时，清空「没有可见
     # 顶层窗口」的后台进程工作集——比直接全量升档的打扰小（前台正在访问的页不动），
     # 覆盖面又比定向大户全；枚举不到窗口时宁可不做，绝不能当成「都没有窗口」
@@ -478,6 +611,8 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             detail.append("后台进程工作集:跳过(无法枚举窗口)")
             log(f"{reason}后台清理跳过 | 枚举窗口不可信(EnumWindows 失败或触顶)，宁可不做")
         else:
+            # v1.14.0 后台级去重：定向/加深已经逐个清过的进程，后台这一级别再碰一遍
+            exclude = set(exclude) | {int(p) for _, _, p in targeted}
             pre = after["avail_phys"]
             try:
                 bg_trimmed, skipped = _run_bg_trim(exclude, bl)
@@ -528,6 +663,9 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         "targeted_freed": targeted_freed,
         "bg_freed": bg_freed,
         "escalated_freed": escalated_freed,
+        "deepened": deepened,
+        "deepen_freed": deepen_freed,
+        "deepen_rounds": deepen_rounds,
         "sticky": sticky,
         "still": still,
         "detail": ", ".join(detail),
@@ -535,7 +673,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     # 累计统计：只统计真正成功的清理，随配置持久化；写盘失败不影响本次清理结果
     try:
         result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive,
-                                     low_relief, bool(bg_trimmed), sticky)
+                                     low_relief, bool(bg_trimmed), sticky, deepen_rounds)
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

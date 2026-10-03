@@ -190,6 +190,12 @@ def build_menu(guard) -> pystray.Menu:
             {"stage_learn": not bool(guard.cfg.get("stage_learn", True))})
         log(f"阶段自学习(跳过无效阶段) -> {'开' if guard.cfg['stage_learn'] else '关'}")
 
+    def on_toggle_stage_deepen(icon, item) -> None:
+        guard.cfg = update_config(
+            {"stage_deepen": not bool(guard.cfg.get("stage_deepen", True))})
+        log(f"定向清理加深(不达标前再撒宽一轮) -> "
+            f"{'开' if guard.cfg['stage_deepen'] else '关'}")
+
     def on_toggle_bg_trim(icon, item) -> None:
         guard.cfg = update_config(
             {"bg_trim": not bool(guard.cfg.get("bg_trim", True))})
@@ -208,9 +214,11 @@ def build_menu(guard) -> pystray.Menu:
         srt = int(st.get('short_relief', 0))
         bgt = int(st.get('bg_trimmed', 0))
         stk = int(st.get('sticky', 0))
+        dpn = int(st.get('deepen', 0))
         base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
         return (base + (f"（升档 {esc} 次）" if esc else "")
                 + (f"（定向 {tgt} 次）" if tgt else "")
+                + (f"（加深 {dpn} 次）" if dpn else "")
                 + (f"（预防 {prev} 次）" if prev else "")
                 + (f"（短效 {srt} 次）" if srt else "")
                 + (f"（后台 {bgt} 次）" if bgt else "")
@@ -404,6 +412,8 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("sticky_aggressive", True))),
         pystray.MenuItem("阶段自学习(跳过无效阶段)", on_toggle_stage_learn,
                          checked=lambda i: bool(guard.cfg.get("stage_learn", True))),
+        pystray.MenuItem("定向清理加深(不达标前再撒宽一轮)", on_toggle_stage_deepen,
+                         checked=lambda i: bool(guard.cfg.get("stage_deepen", True))),
         pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
                          checked=lambda i: bool(guard.cfg.get("predict_clean", True))),
         pystray.MenuItem("开机自启", on_toggle_autostart,

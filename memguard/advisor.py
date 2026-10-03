@@ -77,6 +77,22 @@ def frequent_short_relief(cfg: dict) -> bool:
         return False
     return str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"
 
+def frequent_deepen(cfg: dict) -> bool:
+    """定向加深是否「频繁」：累计清理里 deepen 过半且至少 3 次。
+
+    v1.13.0 起 stats.deepen 记录「定向清理清到了东西、但压力没完全按住」从而把挑选网
+    撒宽一轮的次数；v1.14.0 起加深可多轮，这里记的是「轮数」（一次加深 2 轮 +2）。
+    加深是升档前的最后一道温和手段：若它频繁到过半，说明这台机器上「按工作集逐个挑」
+    每轮都得再撒宽才够，与前三个判据同源同口径；档位已是激进时返回 False——激进档
+    整条阶梯都被跳过，没有「再加深」的空间。
+    """
+    st = cfg.get("stats") or {}
+    clean_cnt = int(st.get("count", 0) or 0)
+    dpn_cnt = int(st.get("deepen", 0) or 0)
+    if clean_cnt <= 0 or dpn_cnt < 3 or dpn_cnt * 2 < clean_cnt:
+        return False
+    return str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"
+
 
 def aggressive_not_needed(cfg: dict, mem: dict | None = None) -> bool:
     """激进档是否「杀鸡用牛刀」：档位激进但内存长期宽裕，建议切回保守（v1.10.0）。
@@ -255,6 +271,18 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
                      f"效果下限（效果偏短）——上次清完没多久内存又被顶回去。"
                      f"「先温和再彻底」在这台机器上只是拖延，建议把「清理力度」改为激进，"
                      f"一次清到位（建议窗口可一键应用）。"),
+            "action": {"label": "改用激进档", "changes": {"clean_level": "aggressive"}},
+        })
+    dpn_cnt = int(st.get("deepen", 0) or 0)
+    if frequent_deepen(cfg):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "定向清理频繁加深，建议直接改用激进",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {dpn_cnt} 次定向清理确实清到了东西、"
+                     f"但压力没完全按住，于是把挑选网撒宽又清了一轮"
+                     f"（占 {dpn_cnt * 100 // max(clean_cnt, 1)}%）。"
+                     f"「先挑大户、再撒宽」在这台机器上每次都要走到第二轮；建议把「清理力度」"
+                     f"改为激进，一次清到位（建议窗口可一键应用）。"),
             "action": {"label": "改用激进档", "changes": {"clean_level": "aggressive"}},
         })
     # ---- 3c. 反向建议（v1.10.0）：激进档杀鸡用牛刀，内存宽裕时劝退 ----

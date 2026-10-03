@@ -133,6 +133,8 @@ class Guard:
         且 _sticky_allowed() 时以 sticky=True 调 do_clean 直接激进执行，并按
         _skip_stages() 跳过已被学习证明无效的阶梯阶段；清理后由
         _post_clean_learn 更新上述状态，返回的说明句追加到通知正文。
+        v1.13.0 起定向清理证明有效但压力没完全按住时，do_clean 会自行把挑选网撒宽
+        一轮再清（定向加深）：仍在阶梯内部逐级加重，不需要这里额外决策。
         """
         prev = self.last_clean
         relief = now - prev if prev > 0 else None
@@ -177,6 +179,12 @@ class Guard:
                 body += f"\n定向清理大户:\n{tgt_txt}"
             if r.get("bg_trim"):
                 body += f"\n后台进程工作集: {r['bg_trim']} 个"
+            if r.get("deepened"):
+                # v1.13.0 定向加深：同一张网撒宽又清到东西，别让用户以为定向白跑了；
+                # v1.14.0 起可多轮，只有真跑了多轮才补一句轮数，别把通知写长
+                rounds = r.get("deepen_rounds") or 0
+                more = f"（{rounds} 轮）" if rounds > 1 else ""
+                body += f"\n定向加深: {r['deepened']} 个{more}"
             # v1.12.0 分阶段释放量：只列真的清到了东西的阶段，别把通知刷长
             stage_lines = []
             for label, key in (("定向", "targeted_freed"), ("后台", "bg_freed"),
@@ -273,6 +281,8 @@ class Guard:
         压力解除（still 为假）：退出粘滞、阶段计数清零，回到「从保守档重跑».
         压力仍在且未粘滞：进入粘滞，下一轮直接激进；已粘滞则保持。阶段计数只在
         本轮真的跑了阶梯时更新——粘滞轮整条阶梯都被跳过，没什么可学的。
+         v1.13.0 起定向加深的释放量已计入 targeted_freed，这里看到的仍是「定向这
+         一级」的总战绩：加深也算这级有用，不会把它误判成该跳过的空转阶段。
         """
         if not r.get("still"):
             if self._sticky_aggr:

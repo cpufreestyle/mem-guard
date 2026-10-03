@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.12.0"
+__version__ = "1.14.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -56,6 +56,11 @@ DEFAULT_CONFIG = {
     "sticky_aggressive": True,  # 开：上一轮走完整条阶梯仍没压住，下一轮自动清理直接按激进档执行
     "stage_learn": True,        # 开：某阶梯阶段连续多次没释放出东西就跳过它，省一轮时间
     "stage_learn_strikes": 3,   # 连续几次该阶段释放量为 0 才跳过，clamp 2..10
+    # ---- 定向加深（v1.13.0）：定向清理释放到了东西但压力没完全按住时，把网撒宽一轮再清 ----
+    "stage_deepen": True,       # 开：定向清理有效但压力仍在时，把大户数翻倍、大户下限减半再清一轮；仍不达标才升档
+    # ---- 温和阶梯用尽（v1.14.0）：加深可多轮 + 降压余量，把升档前的温和手段用到极限 ----
+    "stage_deepen_rounds": 1,   # 定向加深最多撒宽几轮：每轮候选数再翻倍、大户下限再减半（仍只挑没清过的进程），clamp 1..3
+    "target_headroom_pct": 0,   # 降压余量(百分点)：判定「仍受压」时物理/提交阈值先让出这么多，清到留有余量才算按住；clamp 0..20，0=关
     "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
     # conservative=仅清 standby list/修改页/文件缓存（温和，对前台几乎无影响，默认）
     # aggressive  =额外清空各进程工作集（释放更多，但前台程序下次访问需重新读盘，可能卡顿）
@@ -168,6 +173,11 @@ def normalize_config(raw) -> dict:
     cfg["stage_learn"] = bool(cfg.get("stage_learn", True))
     cfg["stage_learn_strikes"] = _clamp_int(
         cfg.get("stage_learn_strikes"), 2, 10, DEFAULT_CONFIG["stage_learn_strikes"])
+    cfg["stage_deepen"] = bool(cfg.get("stage_deepen", True))
+    cfg["stage_deepen_rounds"] = _clamp_int(
+        cfg.get("stage_deepen_rounds"), 1, 3, DEFAULT_CONFIG["stage_deepen_rounds"])
+    cfg["target_headroom_pct"] = _clamp_int(
+        cfg.get("target_headroom_pct"), 0, 20, DEFAULT_CONFIG["target_headroom_pct"])
     cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
@@ -219,6 +229,9 @@ def normalize_config(raw) -> dict:
     # sticky（持续压力粘滞激进次数）口径同上：非 0 才落键，没粘滞过的配置保持原形状
     if raw_stats.get("sticky"):
         cfg["stats"]["sticky"] = _clamp_int(raw_stats.get("sticky"), 0, 10 ** 9, 0)
+    # deepen（定向加深次数）口径同上：非 0 才落键，没加深过的配置保持原形状
+    if raw_stats.get("deepen"):
+        cfg["stats"]["deepen"] = _clamp_int(raw_stats.get("deepen"), 0, 10 ** 9, 0)
     return cfg
 
 

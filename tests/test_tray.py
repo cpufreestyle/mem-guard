@@ -507,6 +507,44 @@ def test_auto_clean_notify_marks_targeted(monkeypatch):
     g._auto_clean(124.0, "自动", g.state)
     assert "定向清理大户" not in notes[1][1]
 
+def test_auto_clean_notify_marks_deepened(monkeypatch):
+    """定向后仍吃紧又撒宽一轮：托盘通知要说明加深了几个；只有多轮才补轮数。"""
+    switch = {"tgt": True, "dpn": 2, "rnd": 3}
+
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
+        return {
+            "ok": True,
+            "freed": 4 * GB,
+            "level": "conservative",
+            "escalated": False,
+            "detail": "-",
+            "stats": {"count": 12},
+            "targeted": ([("big.exe", 2 * GB, 4242)] if switch["tgt"] else []),
+            "deepened": switch["dpn"],
+            "deepen_rounds": switch["rnd"],
+            "before": {"avail_phys": 4 * GB, "commit_pct": 70.0},
+            "after": {"avail_phys": 8 * GB, "commit_pct": 60.0},
+        }
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+
+    g = _guard(_state(phys_pct=86.0))
+    notes = []
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._auto_clean(123.0, "自动", g.state)
+    assert "定向加深: 2 个（3 轮）" in notes[0][1]
+
+    switch["rnd"] = 1          # 只跑了一轮：别把「（N 轮）」写进通知刷长度
+    g._auto_clean(124.0, "自动", g.state)
+    assert "定向加深: 2 个" in notes[1][1]
+    assert "（3 轮）" not in notes[1][1]
+
+    switch["dpn"] = 0
+    g._auto_clean(125.0, "自动", g.state)
+    assert "定向加深" not in notes[2][1]
+
 
 # ---------------------------------------------------------------- 档位自调优（v1.6.0：自动优化主链路）
 

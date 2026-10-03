@@ -282,6 +282,50 @@ def test_normalize_config_stats_targeted_roundtrip():
     assert plain["stats"] == {"count": 3, "freed": 100}
 
 
+def test_default_config_stage_deepen_key_present():
+    """定向加深（v1.13.0）开关必须有默认值。"""
+    assert "stage_deepen" in DEFAULT_CONFIG
+    assert normalize_config({})["stage_deepen"] is True
+
+
+def test_normalize_config_stage_deepen_coercion():
+    """stage_deepen bool 强转，真值语义与其它开关一致。"""
+    assert normalize_config({"stage_deepen": 0})["stage_deepen"] is False
+    assert normalize_config({"stage_deepen": "off"})["stage_deepen"] is True
+
+
+def test_normalize_config_stage_deepen_rounds_clamped():
+    """加深轮数（v1.14.0）默认 1 = 单轮加深，钳在 [1, 3]，脏值回落默认。"""
+    assert "stage_deepen_rounds" in DEFAULT_CONFIG
+    assert normalize_config({})["stage_deepen_rounds"] == 1
+    assert normalize_config({"stage_deepen_rounds": 3})["stage_deepen_rounds"] == 3
+    assert normalize_config({"stage_deepen_rounds": 9})["stage_deepen_rounds"] == 3
+    assert normalize_config({"stage_deepen_rounds": 0})["stage_deepen_rounds"] == 1
+    assert normalize_config({"stage_deepen_rounds": -2})["stage_deepen_rounds"] == 1
+    assert normalize_config({"stage_deepen_rounds": None})["stage_deepen_rounds"] == 1
+    assert normalize_config({"stage_deepen_rounds": "x"})["stage_deepen_rounds"] == 1
+
+
+def test_normalize_config_target_headroom_pct_clamped():
+    """降压余量（v1.14.0）默认 0=关，钳在 [0, 20]，负值与脏值都回 0。"""
+    assert "target_headroom_pct" in DEFAULT_CONFIG
+    assert normalize_config({})["target_headroom_pct"] == 0
+    assert normalize_config({"target_headroom_pct": 5})["target_headroom_pct"] == 5
+    assert normalize_config({"target_headroom_pct": 99})["target_headroom_pct"] == 20
+    assert normalize_config({"target_headroom_pct": -5})["target_headroom_pct"] == 0
+    assert normalize_config({"target_headroom_pct": None})["target_headroom_pct"] == 0
+    assert normalize_config({"target_headroom_pct": "x"})["target_headroom_pct"] == 0
+
+
+def test_normalize_config_stats_deepen_roundtrip():
+    """加深计数只持久化非 0 值：0/缺失都不落键，统计行按有无决定显示。"""
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "deepen": 2}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "deepen": 2}
+    zero = normalize_config({"stats": {"count": 3, "freed": 100, "deepen": 0}})
+    assert zero["stats"] == {"count": 3, "freed": 100}
+    plain = normalize_config({"stats": {"count": 3, "freed": 100}})
+    assert plain["stats"] == {"count": 3, "freed": 100}
+
 def test_bg_trim_default_and_toggle():
     """后台进程工作集清理：默认开（打扰小、覆盖面比定向大户全），显式关要认。"""
     assert normalize_config({})["bg_trim"] is True

@@ -267,6 +267,39 @@ def test_analyze_silent_when_short_relief_rare():
     assert all("清理效果不佳" not in i["title"] for i in items)
 
 
+def test_frequent_deepen_requires_majority_and_floor():
+    """加深占比过半且至少 3 次才算「频繁」；档位已激进则无上升空间，返回 False。"""
+    base = {"clean_level": "conservative", "stats": {"count": 10, "deepen": 6}}
+    assert advisor.frequent_deepen(base) is True
+    fewer = {**base, "stats": {"count": 10, "deepen": 2}}
+    assert advisor.frequent_deepen(fewer) is False
+    under_half = {**base, "stats": {"count": 10, "deepen": 3}}
+    assert advisor.frequent_deepen(under_half) is False
+    minority = {**base, "stats": {"count": 7, "deepen": 3}}
+    assert advisor.frequent_deepen(minority) is False
+    assert advisor.frequent_deepen({**base, "stats": {"count": 6, "deepen": 3}}) is True
+    assert advisor.frequent_deepen({**base, "stats": {}}) is False
+    assert advisor.frequent_deepen({**base, "clean_level": "aggressive"}) is False
+
+
+def test_analyze_advises_aggressive_when_deepen_frequent():
+    """加深频繁触发：先挑大户再撒宽每次都要走第二轮，建议一次清到位。"""
+    cfg = normalize_config({"stats": {"count": 10, "deepen": 6}})
+    items = advisor.analyze(cfg, _mem())
+    hit = [i for i in items if "频繁加深" in i["title"]]
+    assert hit
+    assert hit[0]["action"] == {"label": "改用激进档",
+                                "changes": {"clean_level": "aggressive"}}
+    assert "6" in hit[0]["text"]
+
+
+def test_analyze_silent_when_deepen_rare():
+    """偶尔加深一次是正常现象（撒宽一轮就按住），不该制造配置调整噪音。"""
+    cfg = normalize_config({"stats": {"count": 100, "deepen": 2}})
+    items = advisor.analyze(cfg, _mem())
+    assert all("频繁加深" not in i["title"] for i in items)
+
+
 def test_analyze_flags_suspected_leak_processes():
     """疑似泄漏进程要单独点名：给出名字、当前占用，并说明会优先被定向清理。"""
     leaks = [("leaky.exe", 2 * GB, 7)]

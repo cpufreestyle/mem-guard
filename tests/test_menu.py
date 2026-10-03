@@ -550,6 +550,35 @@ def test_menu_toggle_stage_learn_writes_current_config(monkeypatch):
     assert merged == [{"stage_learn": False}], "只提交本次勾选，不带旧快照"
     assert guard.cfg["stage_learn"] is False
 
+def test_menu_toggle_stage_deepen_writes_current_config(monkeypatch):
+    """「定向清理加深」勾选只提交增量 stage_deepen，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"stage_deepen": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "定向清理加深(不达标前再撒宽一轮)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"stage_deepen": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["stage_deepen"] is False
+
+def test_stats_line_shows_deepen_count():
+    """统计行：有定向加深次数时追加「（加深 N 次）」，没走过时不出现该字样。"""
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "deepen": 2}})
+    line = next(i.text for i in build_menu(guard).items
+                 if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "累计清理 5 次" in line
+    assert "（加深 2 次）" in line
+
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
+    line = next(i.text for i in build_menu(guard).items
+                 if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "加深" not in line
+
 def test_stats_line_shows_sticky_count():
     """统计行：有粘滞激进次数时追加「（粘滞 N 次）」，没走过时不出现该字样。"""
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "sticky": 2}})
