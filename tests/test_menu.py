@@ -515,3 +515,50 @@ def test_stats_line_shows_bg_trim_count():
     line = next(i.text for i in build_menu(guard).items
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "后台" not in line
+
+# ------------------------------------ 持续压力粘滞激进 + 阶段自学习菜单项（v1.12.0）
+
+def test_menu_toggle_sticky_writes_current_config(monkeypatch):
+    """「持续高压粘滞激进」勾选只提交增量 sticky_aggressive，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"sticky_aggressive": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "持续高压粘滞激进")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"sticky_aggressive": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["sticky_aggressive"] is False
+
+def test_menu_toggle_stage_learn_writes_current_config(monkeypatch):
+    """「阶段自学习」勾选只提交增量 stage_learn，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"stage_learn": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "阶段自学习(跳过无效阶段)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"stage_learn": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["stage_learn"] is False
+
+def test_stats_line_shows_sticky_count():
+    """统计行：有粘滞激进次数时追加「（粘滞 N 次）」，没走过时不出现该字样。"""
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "sticky": 2}})
+    line = next(i.text for i in build_menu(guard).items
+                 if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "累计清理 5 次" in line
+    assert "（粘滞 2 次）" in line
+
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
+    line = next(i.text for i in build_menu(guard).items
+                 if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "粘滞" not in line

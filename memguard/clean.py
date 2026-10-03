@@ -80,7 +80,7 @@ def _wait_avail_rise(before: dict) -> dict:
 
 def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
                 preventive: bool = False, short_relief: bool = False,
-                bg_trimmed: bool = False) -> dict:
+                bg_trimmed: bool = False, sticky: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -96,6 +96,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
     不足 effect_min_relief_sec 说明上次清理没 hold 住、压力很快复发（口径同上）。
     bg_trimmed=True 时同步累计「后台进程工作集清理次数」：v1.11.0 起清空后台
     进程工作集的触发频次，供统计行与通知展示（normalize_config 只持久化非 0 值）。
+    sticky=True 时同步累计「粘滞激进次数」：v1.12.0 起持续高压时按激进执行的
+    触发频次，供统计行与通知展示（normalize_config 同样只持久化非 0 值）。
     """
     with _CONFIG_LOCK:
         cfg = load_config()
@@ -112,6 +114,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
             st["short_relief"] = int(st.get("short_relief", 0)) + 1
         if bg_trimmed:
             st["bg_trimmed"] = int(st.get("bg_trimmed", 0)) + 1
+        if sticky:
+            st["sticky"] = int(st.get("sticky", 0)) + 1
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
@@ -379,7 +383,7 @@ def leak_candidates(history) -> list:
 
 def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None,
                 preventive: bool = False, low_relief: bool = False,
-                growth_rows=None) -> dict:
+                growth_rows=None, sticky: bool = False, skip=()) -> dict:
     """执行一次清理，返回结果统计（特权在返回前恢复，用完即关）。
 
     level: "conservative"（默认，只清 standby/修改页/文件缓存）或
@@ -393,6 +397,11 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     自调优使用，清理动作本身完全一样。
     growth_rows 是 leak_candidates() 的返回（疑似泄漏进程）：与大户采样合并后
     作为定向清理的优先候选，泄漏初期还没长成大户也能第一时间掐住。
+    sticky=True 表示「持续压力粘滞激进」（v1.12.0）：上一轮走完整条阶梯仍没压住
+    内存压力，这轮不再从保守档重跑，直接按激进档执行并回传 sticky 标记，供托盘
+    进入/退出粘滞态；阶梯各级本就只在 not aggressive 时跑，粘滞即天然跳过整条阶梯。
+    skip 是本轮跳过的阶段名集合（「targeted」「bg」 的子集），来源托盘的阶段自
+    学习：某一级连续多次没释放出东西就跳过它，只影响阶梯阶段、不影响升档本身。
     """
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
@@ -402,12 +411,19 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     if lvl not in CLEAN_LEVELS:
         lvl = "conservative"
     aggressive = lvl == "aggressive"
+    if sticky:
+        # v1.12.0 持续压力粘滞激进：上一轮使完整条阶梯仍没压住，这轮直接上最强力度；
+        # 阶梯各级本就只在 not aggressive 时跑，粘滞即天然跳过整条阶梯
+        aggressive = True
+        lvl = "aggressive"
     bl = cfg.get("user_blacklist") if user_blacklist is None else user_blacklist
     areas = cfg.get("clean_areas") or {}
 
     # before 必须在动手前采样，否则"释放了多少"无从算起
     before = get_mem()
     detail, core, failed_privs = _run_clean_actions(aggressive, areas, bl)
+    if sticky:
+        detail.append("粘滞激进(持续高压)")
 
     # 核心 NT 操作全部失败 -> 视为整体失败，直接返回可读原因
     if core and all(rc != 0 for rc in core):
@@ -418,10 +434,15 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     after = _wait_avail_rise(before)
     escalated = False
     targeted = []
+    # v1.12.0 分阶段释放量：拆开报给阶段自学习（哪一级真的清到了东西）
+    targeted_freed = 0
+    bg_freed = 0
+    escalated_freed = 0
 
     # 定向清理（v1.7.0 阶梯第一级）：保守清理后仍超阈值时，先只对工作集最大的几个
     # 进程精确清空——比直接全量升档的打扰小；仍不达标才轮到升档的「全清」
-    if (not aggressive and bool(cfg.get("target_clean", True))
+    if (not aggressive and "targeted" not in skip
+            and bool(cfg.get("target_clean", True))
             and _still_pressured(after, cfg)):
         cands = []
         try:
@@ -429,12 +450,14 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         except Exception:
             cands = []
         if cands:
+            pre = after["avail_phys"]
             n, skipped = _run_target_clean(cands, bl)
             names = "、".join(f"{name} {gb(rss)}" for name, rss, _ in cands)
             if n:
                 # 采纳定向：再等一次把回补计入，供下面的升档判断复用最新 after
                 after = _wait_avail_rise(after)
                 targeted = list(cands)
+                targeted_freed = max(after["avail_phys"] - pre, 0)
                 detail.append(f"定向清理大户({names}): {n} 个"
                               + (f"（跳过 {skipped}）" if skipped else ""))
             else:
@@ -444,7 +467,8 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     # 顶层窗口」的后台进程工作集——比直接全量升档的打扰小（前台正在访问的页不动），
     # 覆盖面又比定向大户全；枚举不到窗口时宁可不做，绝不能当成「都没有窗口」
     bg_trimmed = 0
-    if (not aggressive and bool(cfg.get("bg_trim", True))
+    if (not aggressive and "bg" not in skip
+            and bool(cfg.get("bg_trim", True))
             and _still_pressured(after, cfg)):
         try:
             exclude = visible_window_pids()
@@ -454,6 +478,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             detail.append("后台进程工作集:跳过(无法枚举窗口)")
             log(f"{reason}后台清理跳过 | 枚举窗口不可信(EnumWindows 失败或触顶)，宁可不做")
         else:
+            pre = after["avail_phys"]
             try:
                 bg_trimmed, skipped = _run_bg_trim(exclude, bl)
             except Exception:
@@ -461,6 +486,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             if bg_trimmed:
                 # 采纳后台清理：再等一次把回补计入，供下面的升档判断复用最新 after
                 after = _wait_avail_rise(after)
+                bg_freed = max(after["avail_phys"] - pre, 0)
                 detail.append(f"后台进程工作集:{bg_trimmed} 个"
                               + (f"（跳过 {skipped}）" if skipped else ""))
             else:
@@ -476,7 +502,9 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         else:
             # 采纳升档：再等一次把激进清理的回补计入；整体释放量按 before->最终 after 合计
             after = _wait_avail_rise(after)
+            pre = after["avail_phys"]
             escalated = True
+            escalated_freed = max(after["avail_phys"] - pre, 0)
             lvl = "aggressive"
             detail.append("升档重效(激进)")
             detail.extend(detail2)
@@ -486,6 +514,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
                     f"可用物理 {gb(after['avail_phys'])} | "
                     f"物理 {after.get('phys_pct', '-')}% / 提交 {after.get('commit_pct', '-')}%")
 
+    still = _still_pressured(after, cfg)
     freed = after["avail_phys"] - before["avail_phys"]
     result = {
         "ok": True,
@@ -496,12 +525,17 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         "escalated": escalated,
         "targeted": targeted,
         "bg_trim": bg_trimmed,
+        "targeted_freed": targeted_freed,
+        "bg_freed": bg_freed,
+        "escalated_freed": escalated_freed,
+        "sticky": sticky,
+        "still": still,
         "detail": ", ".join(detail),
     }
     # 累计统计：只统计真正成功的清理，随配置持久化；写盘失败不影响本次清理结果
     try:
         result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive,
-                                     low_relief, bool(bg_trimmed))
+                                     low_relief, bool(bg_trimmed), sticky)
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

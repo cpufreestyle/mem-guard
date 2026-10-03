@@ -180,6 +180,16 @@ def build_menu(guard) -> pystray.Menu:
             {"auto_level_adapt": not bool(guard.cfg.get("auto_level_adapt", True))})
         log(f"保守档不给力自动改激进 -> {'开' if guard.cfg['auto_level_adapt'] else '关'}")
 
+    def on_toggle_sticky(icon, item) -> None:
+        guard.cfg = update_config(
+            {"sticky_aggressive": not bool(guard.cfg.get("sticky_aggressive", True))})
+        log(f"持续高压粘滞激进 -> {'开' if guard.cfg['sticky_aggressive'] else '关'}")
+
+    def on_toggle_stage_learn(icon, item) -> None:
+        guard.cfg = update_config(
+            {"stage_learn": not bool(guard.cfg.get("stage_learn", True))})
+        log(f"阶段自学习(跳过无效阶段) -> {'开' if guard.cfg['stage_learn'] else '关'}")
+
     def on_toggle_bg_trim(icon, item) -> None:
         guard.cfg = update_config(
             {"bg_trim": not bool(guard.cfg.get("bg_trim", True))})
@@ -197,12 +207,14 @@ def build_menu(guard) -> pystray.Menu:
         prev = int(st.get('preventive', 0))
         srt = int(st.get('short_relief', 0))
         bgt = int(st.get('bg_trimmed', 0))
+        stk = int(st.get('sticky', 0))
         base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
         return (base + (f"（升档 {esc} 次）" if esc else "")
                 + (f"（定向 {tgt} 次）" if tgt else "")
                 + (f"（预防 {prev} 次）" if prev else "")
                 + (f"（短效 {srt} 次）" if srt else "")
-                + (f"（后台 {bgt} 次）" if bgt else ""))
+                + (f"（后台 {bgt} 次）" if bgt else "")
+                + (f"（粘滞 {stk} 次）" if stk else ""))
 
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
@@ -388,6 +400,10 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("bg_trim", True))),
         pystray.MenuItem("保守档不给力自动改激进", on_toggle_level_adapt,
                          checked=lambda i: bool(guard.cfg.get("auto_level_adapt", True))),
+        pystray.MenuItem("持续高压粘滞激进", on_toggle_sticky,
+                         checked=lambda i: bool(guard.cfg.get("sticky_aggressive", True))),
+        pystray.MenuItem("阶段自学习(跳过无效阶段)", on_toggle_stage_learn,
+                         checked=lambda i: bool(guard.cfg.get("stage_learn", True))),
         pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
                          checked=lambda i: bool(guard.cfg.get("predict_clean", True))),
         pystray.MenuItem("开机自启", on_toggle_autostart,

@@ -293,7 +293,7 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     monkeypatch.setattr(clean, "_wait_avail_rise", _wait)
     monkeypatch.setattr(clean, "_bump_stats",
                         lambda freed, escalated=False, targeted=False, preventive=False,
-                        short_relief=False, bg_trimmed=False:
+                        short_relief=False, bg_trimmed=False, sticky=False:
                             {"count": 9, "freed": freed})
     monkeypatch.setattr(clean, "log", lambda msg: None)   # 别往真实日志文件里写测试噪声
 
@@ -468,7 +468,7 @@ def test_do_clean_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False:
+               short_relief=False, bg_trimmed=False, sticky=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -485,7 +485,7 @@ def test_do_clean_no_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False:
+               short_relief=False, bg_trimmed=False, sticky=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -608,7 +608,7 @@ def test_do_clean_target_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False):
         seen.append(targeted)
         return {"count": 9, "freed": freed}
 
@@ -828,7 +828,7 @@ def test_do_clean_passes_preventive_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False):
         seen.append(preventive)
         return {"count": 9, "freed": freed}
 
@@ -858,7 +858,7 @@ def test_do_clean_passes_low_relief_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False):
         seen.append(short_relief)
         return {"count": 9, "freed": freed}
 
@@ -965,7 +965,7 @@ def test_do_clean_passes_bg_trimmed_to_stats(monkeypatch):
     ]
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False):
         seen.append(bg_trimmed)
         return {"count": 9, "freed": freed}
 
@@ -1083,3 +1083,112 @@ def test_target_clean_candidates_extras_only_when_min_mb_zero():
                                         "target_clean_top": 2},
         [("leaky.exe", 10 * 1024 ** 2, 3)])
     assert [n for n, _, _ in got] == ["leaky.exe"]
+
+# ---------------------------------------- 持续压力粘滞激进 + 阶段跳过（v1.12.0）
+
+def test_do_clean_sticky_goes_aggressive_and_skips_ladder(monkeypatch):
+    """粘滞轮不再从保守档重跑：直接激进，整条阶梯一级都不跑。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0}
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls,
+               top_rows=_big_rows(), bg_trim=True)
+    r = clean.do_clean("测试", sticky=True)
+
+    assert r["sticky"] is True
+    assert r["level"] == "aggressive"
+    assert "粘滞激进(持续高压)" in r["detail"]
+    assert calls.count("epw") == 1        # 只激进第一遍清进程工作集
+    assert calls.count("esw") == 0        # 阶梯的定向级整级跳过
+    assert calls.count("ebw") == 0        # 阶梯的后台级整级跳过
+    assert calls.count("wait") == 1       # 不补第二遍、也不逐级再等
+    assert r["targeted"] == [] and r["bg_trim"] == 0
+    assert r["escalated"] is False and r["escalated_freed"] == 0
+
+def test_do_clean_sticky_reports_still_pressured(monkeypatch):
+    """粘滞轮清理完仍越线：still 回 True，托盘据此保持粘滞态。"""
+    base = 8 * 1024 ** 3
+    wait_after = {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0}
+    _admin_env(monkeypatch, wait_after=wait_after)
+    r = clean.do_clean("测试", sticky=True)
+
+    assert r["still"] is True
+
+def test_do_clean_sticky_reports_relieved(monkeypatch):
+    """粘滞轮清理完已回落：still 回 False，托盘据此退出粘滞、回到保守档起重。"""
+    base = 8 * 1024 ** 3
+    wait_after = {"avail_phys": base + 2048, "phys_pct": 60.0, "commit_pct": 40.0}
+    _admin_env(monkeypatch, wait_after=wait_after)
+    r = clean.do_clean("测试", sticky=True)
+
+    assert r["still"] is False
+
+def test_do_clean_sticky_feeds_stats_counter(monkeypatch):
+    """粘滞执行时 _bump_stats 收到 sticky=True：统计行「（粘滞 N 次）」靠它。"""
+    base = 8 * 1024 ** 3
+    seen = []
+
+    def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
+                   short_relief=False, bg_trimmed=False, sticky=False):
+        seen.append(sticky)
+        return {"count": 9, "freed": freed}
+
+    _admin_env(monkeypatch, wait_after={"avail_phys": base + 1024,
+                                             "phys_pct": 60.0, "commit_pct": 40.0})
+    monkeypatch.setattr(clean, "_bump_stats", _fake_bump)
+    clean.do_clean("测试", sticky=True)
+
+    assert seen == [True]
+
+def test_do_clean_skip_targeted_stage_still_trims_background(monkeypatch):
+    """阶段自学习跳过了定向级：后台清理照跑，升档兜底也不受影响。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},   # 仍受压
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},   # 后台后仍受压
+        {"avail_phys": base + 4096, "phys_pct": 60.0, "commit_pct": 40.0},   # 升档后回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls,
+               top_rows=_big_rows(), bg_trim=True, bg_result=(2, 0))
+    r = clean.do_clean("测试", skip={"targeted"})
+
+    assert r["targeted"] == [] and calls.count("esw") == 0
+    assert r["bg_trim"] == 2 and r["bg_freed"] == 1024
+    assert r["targeted_freed"] == 0
+    assert calls.count("ebw") == 1 and calls.count("epw") == 1
+    assert r["escalated"] is True
+
+def test_do_clean_skip_bg_stage_still_escalates(monkeypatch):
+    """阶段自学习跳过了后台级：定向大户照跑，仍不达标才升档。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},   # 仍受压
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},   # 定向后仍受压
+        {"avail_phys": base + 4096, "phys_pct": 60.0, "commit_pct": 40.0},   # 升档后回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls,
+               top_rows=_big_rows(), bg_trim=True)
+    r = clean.do_clean("测试", skip={"bg"})
+
+    assert "ebw" not in calls and r["bg_trim"] == 0 and r["bg_freed"] == 0
+    assert [n for n, _, _ in r["targeted"]] == ["big.exe", "mid.exe"]
+    assert calls.count("esw") == 1 and calls.count("epw") == 1
+    assert r["escalated"] is True
+
+def test_do_clean_reports_per_stage_release(monkeypatch):
+    """分阶段释放量按各级 before→after 拆开算：合计即「保守第一遍之后」的增量。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},   # 仍受压
+        {"avail_phys": base + 4096, "phys_pct": 60.0, "commit_pct": 40.0},   # 定向后回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, top_rows=_big_rows())
+    r = clean.do_clean("测试")
+
+    assert r["targeted_freed"] == 2048
+    assert r["bg_freed"] == 0 and r["escalated_freed"] == 0
+    assert r["freed"] == 4096
+    # 阶梯各级加起来就是「保守第一遍之后」又释放的部分，另 2048 来自第一遍本身
+    assert r["targeted_freed"] + r["bg_freed"] + r["escalated_freed"] == 2048

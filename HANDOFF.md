@@ -11,17 +11,18 @@ Windows 托盘小工具：实时监控**物理内存**与**提交内存(commit)*
 - `v1.5.1`（2026-10-03 已发布）：自动升档清理：保守清理后若仍超阈值或低于可用内存下限，立即补一次激进清理（最多一次、带开关 `escalate_clean`、最小打扰）；托盘通知标「激进（自动升档）」、菜单「清理未达标自动升档」可关；统计行展示升档次数、定时清理同样守冷却；advisor 依升档统计自调优（保守档频繁升档建议直接改激进、关闭升档且物理已超阈值建议开启），手动清理通知与 `--once` 也在档位行回显「（自动升档）」（发布验证见 §8 第 12 条）
 - **v1.6.0–v1.8.0 已 commit `0375528`（本地，tag/push 待用户确认）**：`v1.6.0`——档位自调优闭环：保守档累计清理中升档占比过半且 ≥3 次时（判据 `advisor.frequent_escalation`，与 advisor「保守档频繁升档，建议直接改用激进」同源），自动把 `clean_level` 切为 `aggressive` 并落闩 `level_adapt_done`（一次性、切换只发一条托盘通知、菜单「保守频繁升档自动改激进」可提前关、用户手动切回保守也不再自动评估）；动机来自 v1.5.1 真机提权升档实测——「先温和再彻底」等于每次多跑一遍、多打扰一次；同版新增「优化建议一键应用」：advisor 为可操作建议附带 `action`（自动清理已关→开启、预警未开→设 15%、冷却过短→调为 300s、保守频繁升档→改激进、升档关闭且超阈值→开启），`ui.show_advice_window` 据此渲染「一键应用」/「全部应用」按钮（`apply_advice_actions` 单条失败只跳过该条），tray advice hook 改传 `lambda: self.cfg` 让刷新读到一键应用后的实时配置；本轮增量把一键应用接到右键菜单：`tray._refresh_advice` 在总条数 `advice_count` 之外另数出「可一键应用」的条数 `advice_apply_count`（由 `advisor.advice_actions` 得出，供菜单项决定能否点击），`menu.on_apply_advice` 在点击这一刻现场 `analyze` 后逐条 `update_config` 增量写配置（异常只记日志、成功只记日志不弹气泡），菜单项文案「一键应用优化建议（N 项）」、`enabled` 由计数决定，无可应用项时置灰；`v1.7.0`——定向清理内存大户（配置 3 键 `target_clean` / `target_clean_min_mb` / `target_clean_top`，与 v1.6.0 同批提交，细节见 §8 第 14 项）；`v1.8.0`——趋势预防式清理（配置 2 键 `predict_clean` / `predict_window_min`：按历史采样最小二乘拟合上升斜率，预判 `predict_window_min` 分钟内触及物理/提交阈值即提前清理，仍走「保守→定向大户→全量激进」阶梯、最小打扰，与 v1.6.0/v1.7.0 同批提交，细节见 §8 第 15 项）；`v1.9.0`——清理效果闭环（**尚未提交**，细节见 §8 第 16 项）：配置 2 键 `effect_track`（默认 True）/ `effect_min_relief_sec`（默认 600，clamp 60–86400），每次自动清理前先量距上次自动清理多久 （`relief = now - last_clean`，`last_clean=0` 即上次来自手动/CLI 时不测、开关关也不测），不足下限判「效果偏短」并透传 `do_clean(low_relief=True)` 累计 `stats.short_relief`（非 0 才落键）；托盘通知追加「距上次自动清理 N 分钟（偏短）」、菜单统计行追加「（短效 N 次）」；`advisor.frequent_short_relief`（短效过半且 ≥3 次，与频繁升档同源同口径）出一条「保守清理效果不佳，建议直接改用激进」带一键应用，并作为档位自调优第二条判据（同 `_maybe_adapt_level`，一次性、落闩、只发一条通知、可关）
 - **v1.9.0 / v1.10.0 已 code+test+doc 收口，tag/push 待用户确认**：`v1.9.0`——清理效果闭环（细节见 §8 第 16 项）；**`v1.10.0`**——自适应冷却 + 档位自调优重武装（细节见 §8 第 17 项）：静态 `cooldown` 只是「最大缺口」——短效复发时不会更快复查，连续 hold 住后也不放松。`Guard._cooldown_gap()` 据此改成状态机：距上次清理不足 `effect_min_relief_sec`（短效复发）时把下次最小间隔压到 `max(cooldown * _COOLDOWN_SHRINK(0.5), adaptive_cooldown_floor)`，连续 `_COOLDOWN_OK_STREAK(2)` 次达标再恢复完整 `cooldown`；四处冷却判定（趋势预防 / 超阈值 / 低内存 / 定时清理）全部改走它，压缩只减不增（`clamp(0, cooldown)`，floor 高于 `cooldown` 也不放大），`adaptive_cooldown` 关掉时恒为用户值。streak 是纯内存态（`_relief_short_streak` / `_relief_ok_streak`），不落盘、重启即回用户值。档位自调优重武装：`Guard._sync_level_seen()` 每次热重载后比对 `_level_seen` 与当前档位，仅「激进→保守」且确实自动切过、`auto_level_adapt` 仍开时才清 `level_adapt_done` 闩（写盘走 `update_config` 读-改-写持锁，并把 `_cfg_mtime` 刷成写盘后的新值，省掉下一 tick 一次白重载与一行多余日志）；`_maybe_adapt_level` 自动切换后同步 `_level_seen` 为「aggressive」，避免把自己的切换误判成用户手动切回。配置 2 键 `adaptive_cooldown`（默认 True）/ `adaptive_cooldown_floor`（默认 30，clamp 5–3600），均无菜单开关。
-- **v1.11.0 后台进程工作集清理 + 泄漏进程增长感知（代码+测试+README 已收口，尚未 commit/tag）**：`v1.11.0`——定向大户只清工作集榜上前几名，那些没有可见顶层窗口的后台进程同样在顶阈值却长期排不上号。`do_clean` 阶梯在「定向大户」之后、「自动升档」之前插入 bg 阶梯：`visible_window_pids()`（`EnumWindows` + `IsWindowVisible` + `GetWindowThreadProcessId`，枚举失败或触 `_WINDOW_ENUM_MAX` 上限一律返回 None）取可见窗口 PID 集合，`_run_bg_trim` 清空其余进程工作集；返回 None 时宁可不做（宁可少一次清理也不误伤前台）。同版把监控里已有的 Top15 采样顺手拟合每个进程的 RSS 上升斜率（`clean.growth_slopes`：采样 <5、跨度 <300s、斜率 ≤0 一律剔除，进程中途启退直接排除），斜率 ≥`_LEAK_MIN_SLOPE`(128KB/s) 且净增长 ≥`_LEAK_MIN_GROWTH`(64MB) 判疑似泄漏（`leak_candidates`，双阈值、按斜率降序、最多 `_LEAK_MAX_ROWS`(5) 条）：这些进程作为定向清理的优先候选（`do_clean(growth_rows=...)` 进 extras，不受 `target_clean_min_mb` 下限、PID 去重、仍受 `target_clean_top` 截断），泄漏初期还没长成大户也能第一时间掐住；advisor 另出一条「N 个进程内存持续上涨（疑似泄漏）」提醒（`analyze(..., leaks=...)`）。`Guard.proc_history` 是 `deque(maxlen=GROWTH_MAX_SAMPLES(40))` 逐进程采样历史，`_refresh_advice` 里 append + 识别只多一次内存计算、**零额外系统调用**。配置 1 键 `bg_trim`（默认 True）、stats 键 `bg_trimmed`（非 0 才落键）；菜单「后台进程工作集清理」`on_toggle_bg_trim` 可关，统计行改为「升档 / 定向 / 后台 / 预防 / 短效次数」。细节见 §8 第 18 项
+- **v1.11.0 后台进程工作集清理 + 泄漏进程增长感知（代码+测试+README 已收口，已 commit `6308c5f`，push/tag 待用户确认）**：`v1.11.0`——定向大户只清工作集榜上前几名，那些没有可见顶层窗口的后台进程同样在顶阈值却长期排不上号。`do_clean` 阶梯在「定向大户」之后、「自动升档」之前插入 bg 阶梯：`visible_window_pids()`（`EnumWindows` + `IsWindowVisible` + `GetWindowThreadProcessId`，枚举失败或触 `_WINDOW_ENUM_MAX` 上限一律返回 None）取可见窗口 PID 集合，`_run_bg_trim` 清空其余进程工作集；返回 None 时宁可不做（宁可少一次清理也不误伤前台）。同版把监控里已有的 Top15 采样顺手拟合每个进程的 RSS 上升斜率（`clean.growth_slopes`：采样 <5、跨度 <300s、斜率 ≤0 一律剔除，进程中途启退直接排除），斜率 ≥`_LEAK_MIN_SLOPE`(128KB/s) 且净增长 ≥`_LEAK_MIN_GROWTH`(64MB) 判疑似泄漏（`leak_candidates`，双阈值、按斜率降序、最多 `_LEAK_MAX_ROWS`(5) 条）：这些进程作为定向清理的优先候选（`do_clean(growth_rows=...)` 进 extras，不受 `target_clean_min_mb` 下限、PID 去重、仍受 `target_clean_top` 截断），泄漏初期还没长成大户也能第一时间掐住；advisor 另出一条「N 个进程内存持续上涨（疑似泄漏）」提醒（`analyze(..., leaks=...)`）。`Guard.proc_history` 是 `deque(maxlen=GROWTH_MAX_SAMPLES(40))` 逐进程采样历史，`_refresh_advice` 里 append + 识别只多一次内存计算、**零额外系统调用**。配置 1 键 `bg_trim`（默认 True）、stats 键 `bg_trimmed`（非 0 才落键）；菜单「后台进程工作集清理」`on_toggle_bg_trim` 可关，统计行改为「升档 / 定向 / 后台 / 预防 / 短效次数」。细节见 §8 第 18 项
+- **v1.12.0 持续压力粘滞激进 + 阶梯分阶段度量与阶段自学习（代码+测试+README/HANDOFF 已收口，尚未 commit/tag）**：v1.12.0——上一轮自动清理走完整条阶梯（保守→定向大户→后台→升档）后 `still` 仍为真，说明温和阶梯对持续高压已不够用：下一轮自动清理直接按激进档执行、不再从保守档重跑（`sticky_aggressive`，默认开；`_sticky_allowed` 在 `auto_level_adapt` 关时一并失效），压力一旦解除即退出粘滞、回到「从保守档起重」。同版把阶梯里已被证明无效的阶段学掉：某阶段连续 `stage_learn_strikes`（默认 3，clamp 2–10）次释放量为 0 就跳过它（`stage_learn`，默认开，只影响定向/后台两级、不影响升档）。`do_clean` 增 `sticky=` / `skip=` 形参，回传 `still` 与各级释放量 `targeted_freed` / `bg_freed` / `escalated_freed`；通知追加「分阶段释放: 定向 X、后台 Y、升档 Z」（只列真的清到东西的阶段）与「持续高压：粘滞激进」。配置 3 键 `sticky_aggressive` / `stage_learn` / `stage_learn_strikes`、stats 键 `sticky`（非 0 才落键）；菜单「持续高压粘滞激进」`on_toggle_sticky` 与「阶段自学习(跳过无效阶段)」`on_toggle_stage_learn`，统计行追加「（粘滞 N 次）」。细节见 §8 第 19 项
 - 语言/平台：Python 3.8+ / Windows only（清理调用 `NtSetSystemInformation`，无法跨平台）
 
 ## 2. 快速上手
 
-```powershell
+``powershell
 pip install -r requirements.txt        # psutil / pystray / Pillow
 python mem_guard.py                     # 需管理员权限（清理才生效）
 python mem_guard.py --once              # 打印一次状态并清理一次
 python mem_guard.py --selftest          # 内置自检（CI 与打包后冒烟都用它）
-```
+``
 
 - 后台无窗运行：用 `启动 MemGuard（管理员）.bat`（自动提权 + `pythonw`）。
 - 配置：首次运行生成同目录 `mem_guard.json`，支持热重载（改完无需重启）。字段见 `README.md` 的「配置文件」表。
@@ -32,28 +33,28 @@ python mem_guard.py --selftest          # 内置自检（CI 与打包后冒烟�
 
 | 文件 | 职责 | 关键导出 |
 |---|---|---|
-| `memguard/config.py` | 版本/路径、默认配置（v1.9.0 起含效果闭环 2 键、v1.10.0 起含自适应冷却 2 键）、**配置校验与钳制**、**唯一写盘入口 `update_config`（读-改-写持 `_CONFIG_LOCK`）**、落盘日志 `log` | `__version__`、`load_config`、`save_config`、`update_config`、`normalize_config`、`gb`、`_CONFIG_LOCK`、`CLEAN_BLACKLIST_STEMS`、`_norm_proc_name`、`_blacklist_stems`、`BASE_DIR`、`LOG_PATH` |
+| `memguard/config.py` | 版本/路径、默认配置（v1.9.0 起含效果闭环 2 键、v1.10.0 起含自适应冷却 2 键、v1.12.0 起含粘滞激进与阶段自学习 3 键）、**配置校验与钳制**、**唯一写盘入口 `update_config`（读-改-写持 `_CONFIG_LOCK`）**、落盘日志 `log` | `__version__`、`load_config`、`save_config`、`update_config`、`normalize_config`、`gb`、`_CONFIG_LOCK`、`CLEAN_BLACKLIST_STEMS`、`_norm_proc_name`、`_blacklist_stems`、`BASE_DIR`、`LOG_PATH` |
 | `memguard/winapi.py` | ctypes 绑定：内存读取、进程枚举快路径、特权启用/禁用/查询、单实例互斥体、底层清理调用 | `get_mem`、`process_working_sets`、`is_admin`、`privilege_state`、`enable_privilege`、`disable_privilege`、`_purge_list`、`clear_file_cache`、`single_instance`、`MemoryEmptyWorkingSets/FlushModifiedList/PurgeStandbyList`、`APP_USER_MODEL_ID`、`set_app_user_model_id`、`create_show_event`、`open_show_event`、`close_show_event`、`request_show_overview`、`wait_show_request`、`visible_window_pids` |
 | `memguard/privileges.py` | **特权管理**：清理所需高特权启用 + 用完即恢复的上下文管理器 | `CLEAN_PRIVILEGES`、`clean_privileges()` |
 | `memguard/actions.py` | **清理动作**：单个底层调用的封装（缓存/工作集/修改页/standby/低优先级 standby） | `purge_working_sets`、`flush_modified_list`、`purge_standby_list`、`purge_low_priority_standby`、`clear_system_file_cache`、`empty_process_working_sets`、`empty_selected_working_sets`（按 PID 精确清空，只碰给定进程） |
-| `memguard/clean.py` | **清理编排与统计**：编排各动作、汇总结果；**保守不达标自动升档激进（v1.5.1，最多一次）**；**定向清理内存大户（v1.7.0：保守仍超阈值时按工作集精确清空前 N 个进程，仍不达标才升档）**；**趋势预防式清理（v1.8.0：`_slope_per_sec` 最小二乘拟合上升斜率 + `predictive_due` 预判窗口内触阈即提前清理）**；**清理效果度量（v1.9.0：`do_clean(low_relief=...)` 把距上次自动清理不足 `effect_min_relief_sec` 的清理累计进 `stats.short_relief`）**；进程 Top 统计（快路径 + 定点补齐 + psutil 兜底）；v1.11.0 起含泄漏增长感知与后台进程工作集清理 | `do_clean`、`top_processes_list`、`top_processes`、`_run_clean_actions`、`_wait_avail_rise`、`_still_pressured`、`_bump_stats`、`_target_clean_candidates`、`_run_target_clean`、`_slope_per_sec`、`predictive_due`、`_run_bg_trim`、`growth_slopes`、`leak_candidates` |
+| `memguard/clean.py` | **清理编排与统计**：编排各动作、汇总结果；**保守不达标自动升档激进（v1.5.1，最多一次）**；**定向清理内存大户（v1.7.0：保守仍超阈值时按工作集精确清空前 N 个进程，仍不达标才升档）**；**趋势预防式清理（v1.8.0：`_slope_per_sec` 最小二乘拟合上升斜率 + `predictive_due` 预判窗口内触阈即提前清理）**；**清理效果度量（v1.9.0：`do_clean(low_relief=...)` 把距上次自动清理不足 `effect_min_relief_sec` 的清理累计进 `stats.short_relief`）**；进程 Top 统计（快路径 + 定点补齐 + psutil 兜底）；v1.11.0 起含泄漏增长感知与后台进程工作集清理，v1.12.0 起含持续压力粘滞激进、阶梯阶段跳过与分阶段释放量 | `do_clean`、`top_processes_list`、`top_processes`、`_run_clean_actions`、`_wait_avail_rise`、`_still_pressured`、`_bump_stats`、`_target_clean_candidates`、`_run_target_clean`、`_slope_per_sec`、`predictive_due`、`_run_bg_trim`、`growth_slopes`、`leak_candidates` |
 | `memguard/advisor.py` | 优化建议引擎（基于内存状态+配置生成分级建议；v1.8.0 起含预防式清理频繁触发建议，v1.9.0 起含清理效果偏短建议，v1.11.0 起含疑似泄漏进程提醒） | `analyze`、`format_advice`、`frequent_escalation`、`frequent_prevention`、`frequent_short_relief`、`advice_actions`；`analyze(..., leaks=...)` 泄漏提醒 |
 | `memguard/ui.py` | 界面层：托盘/窗口图标绘制、气泡、概览/Top10/趋势/建议窗口（不依赖 pystray） | `make_icon`、`app_icon`、`apply_window_icon`、`message_box`、`show_overview_window`、`show_top_window`、`show_trend_window`、`show_advice_window`、`apply_advice_actions` |
 | `memguard/autostart.py` | 开机自启：计划任务注册/查询/卸载（frozen 分支用 XML 导入，兼容含空格路径） | `autostart_enabled`、`install_autostart`、`remove_autostart` |
 | `memguard/diag.py` | 诊断导出：状态/进程/日志/配置打包 zip | `export_diagnostics` |
 | `memguard/update.py` | **自动更新**：GitHub 最新 Release 查询与版本比较、资产挑选（setup 优先/便携兜底）、下载与静默安装/自替换（纯标准库 urllib） | `check_and_notify`、`install_latest`、`pick_asset`、`due_for_check`、`fetch_latest_release`、`_parse_version` |
-| `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（以 `guard` 为参数，不反向 import tray；含「后台进程工作集清理」开关） | `build_menu(guard)` |
-| `memguard/tray.py` | 主循环 `Guard`：状态、配置热重载（含档位自调优重新武装）、监控循环（含趋势预防式清理等四类触发源、清理效果度量、自适应冷却 `_cooldown_gap`、逐进程采样 `proc_history` 与泄漏识别；档位自调优两条判据）、托盘图标自愈、唤窗信号监听 | `Guard` |
+| `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（以 `guard` 为参数，不反向 import tray；含「后台进程工作集清理」「持续高压粘滞激进」「阶段自学习(跳过无效阶段)」开关） | `build_menu(guard)` |
+| `memguard/tray.py` | 主循环 `Guard`：状态、配置热重载（含档位自调优重新武装）、监控循环（含趋势预防式清理等四类触发源、清理效果度量、自适应冷却 `_cooldown_gap`、逐进程采样 `proc_history` 与泄漏识别；档位自调优两条判据、v1.12.0 起含持续压力粘滞激进（`_sticky_aggr` / `_sticky_allowed`）与阶梯阶段自学习（`_post_clean_learn`））、托盘图标自愈、唤窗信号监听 | `Guard` |
 | `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、`--show`、`--check-update`、`--update`、控制台隐藏 | `main` |
 | `mem_guard.py` | 薄启动器 | — |
 | `pin_taskbar.ps1` | 任务栏固定 / 桌面快捷方式（幂等，写 AUMID 与「以管理员身份运行」位） | — |
 
 **依赖方向单向无环**（新接手改代码时务必保持，避免循环导入）：
 
-```
+``
 config ← winapi ← privileges ← actions ← clean ← advisor ← ui ← autostart ← diag ← menu ← tray ← cli
                                                           （update 仅依赖 config）
-```
+``
 
 ## 4. 关键设计点（改代码前必读）
 
@@ -82,6 +83,7 @@ config ← winapi ← privileges ← actions ← clean ← advisor ← ui ← au
   否则菜单顶部累计统计要等下一次热重载才刷新。
 - **清理区域与多触发源（v1.4.0 起）**：`clean_areas` 控制各清理区域开关（含新增的 `MemoryPurgeLowPriorityStandbyList = 5` 低优先级 standby；旧系统不支持会返回非 0 并如实展示，不算失败）。触发源三种——超阈值（带防抖/冷却）、可用内存低于 `min_avail_mb`（受冷却约束）、定时 `scheduled_minutes`（v1.5.1 起同样守冷却，冷却内跳过且不推进 `last_scheduled`），统一走 `Guard._auto_clean`；**趋势预防（v1.8.0 起第四触发源）**：未越线时 `Guard._maybe_predictive_clean` 调 `clean.predictive_due` 预判 `predict_window_min` 分钟内是否触及物理/提交阈值，命中即提前清理（受 `predict_clean` 开关与冷却约束，通知 reason 标「预防式」、走 `preventive=True`）；**清理效果度量（v1.9.0，非触发源）**：动手前先算 `relief = now - last_clean`（`last_clean=0` 表示上次清理来自手动/CLI，此时不测；`effect_track` 关掉也不测），`relief < effect_min_relief_sec`（默认 600，严格小于）即 `low_relief=True`，透传 `do_clean` 累计 `stats.short_relief`（非 0 才落键）；**自适应冷却（v1.10.0）**：四类触发源共用的最小间隔不再是静态 `cfg["cooldown"]`，而是 `Guard._cooldown_gap()`——短效复发（距上次清理不足 `effect_min_relief_sec`）时压到 `max(cooldown*0.5, adaptive_cooldown_floor)`，连续 2 次达标恢复完整 `cooldown`；压缩只减不增（`clamp(0, cooldown)`，floor 高于 `cooldown` 也不放大），`adaptive_cooldown` 关掉时恒为用户值。streak 纯内存态（`_relief_short_streak`/`_relief_ok_streak`），不落盘、重启即回用户值；`clean_on_start` 在监控线程启动时清一次。累计统计 `stats`（count/freed/escalated/targeted/preventive/short_relief）在 `do_clean` 成功后经 `save_config` 持久化——**每次成功清理都会写一次配置文件**，勿在热重载 mtime 比较上引入写盘循环。
 - **清理阶梯与泄漏增长感知（v1.11.0）**：阶梯为「保守 → 定向大户 → 后台进程 → 全量激进」，每级最多一次——v1.11.0 在「定向大户」之后、「自动升档」之前插入 **bg 阶梯**：`visible_window_pids()` 取可见顶层窗口进程集合（枚举失败或触上限返回 None），`_run_bg_trim` 只清空**没有可见窗口**的后台进程工作集，None 时直接跳过并在 detail 记「后台进程工作集:跳过(无法枚举窗口)」。同版加**泄漏进程增长感知**：`Guard.proc_history`（`deque(maxlen=40)`，`_refresh_advice` 里随 Top15 采样一起 append，零额外系统调用）→ `clean.growth_slopes` 只对全程在场、跨度 ≥300s、采样 ≥5 的进程拟合上升斜率（`_slope_per_sec` 最小二乘），`leak_candidates` 再要斜率 ≥128KB/s **且**净增长 ≥64MB，最多 5 条；结果经 `do_clean(growth_rows=...)` 进 `_target_clean_candidates` 的 `extra_rows`——**优先于大户采样、不受 `target_clean_min_mb` 下限、PID 去重、仍受 `target_clean_top` 截断**；`advisor.analyze(..., leaks=...)` 另出一条泄漏提醒，`tray._auto_clean` 与菜单手动清理都透传 `growth_rows=self.leaks`。配置 1 键 `bg_trim`（默认 True），stats 键 `bg_trimmed`（非 0 才落键），菜单「后台进程工作集清理」可关、统计行「（后台 N 次）」。
+- **持续压力粘滞激进 + 阶梯阶段自学习（v1.12.0）**：`Guard._auto_clean` 调 `do_clean(..., sticky=self._sticky_aggr and self._sticky_allowed(), skip=self._skip_stages())`——`sticky_aggressive`（默认开，`auto_level_adapt` 关时一并失效）置位后下一轮直接按激进档执行、不再从保守档重跑；`_post_clean_learn` 按回传 `still` 更新粘滞态（压力仍在且未粘滞→进入粘滞并往通知追加说明句；压力解除→退出粘滞并把 `_stage_zero` 清零），并按 `targeted_freed` / `bg_freed` 维护阶段零释放计数 `_stage_zero`（清到东西即清零、否则记一次），连续 `stage_learn_strikes` 次为 0 的阶段进 `_skip_stages()` 被跳过——只影响定向/后台两级、升档不受影响；阶段计数只在非粘滞轮更新（粘滞轮整条阶梯被跳过，没什么可学）。`do_clean(sticky=True)` 同步累计 `stats.sticky`（`_bump_stats(sticky=...)`，非 0 才落键），通知按 `targeted_freed` / `bg_freed` / `escalated_freed` 追加「分阶段释放: 定向 X、后台 Y、升档 Z」（只列非 0 阶段，别把通知刷长）。
 - **左键概览 + 窗口设计约定（v1.4.2 起）**：
   - **左键=主窗口**：pystray 默认左键展开右键菜单，与 WinMemoryCleaner / Mem Reduct（左键开窗、右键给菜单）相反。
     `tray` 自定义 `class _GuardIcon(pystray.Icon)` 覆写 `__call__`，有 `on_left_click` 就走回调（`Guard.open_overview`），
@@ -119,20 +121,20 @@ config ← winapi ← privileges ← actions ← clean ← advisor ← ui ← au
 
 **本地打包**（产物 `dist\mem_guard.exe`，约 18MB）：
 
-```powershell
+``powershell
 pip install pyinstaller
 .\build.ps1                 # 默认单文件；结束自动跑 --selftest 冒烟，失败即报错
 .\build.ps1 -OneDir         # 目录版（启动快、单进程）
 .\build.ps1 -NoTk           # 排除 tkinter（体积小约 10MB，趋势窗口不可用）
 .\build.ps1 -Upx            # 启用 UPX 压缩（默认关：易被杀软误报）
-```
+``
 
 **本地编译安装器（可选）**：需自装 Inno Setup 6，然后执行
 `ISCC.exe /DAppVersion=<版本> installer\mem_guard.iss`，产物为 `dist\MemGuard-Setup-<版本>.exe`。
 
 **自动发布（GitHub Actions）**：`.github/workflows/release.yml` 为 `on: push: tags: ["v*"]`。流程：安装依赖 → `pytest -q` → `--selftest` → PyInstaller 打包 → 冻结版 exe 跑 `--selftest` → **Inno Setup 编译安装器**（`installer/mem_guard.iss`，版本号从 `config.py` 注入）→ 上传产物 → 创建 Release（附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）。
 
-```powershell
+``powershell
 # 发版三步
 # 1) 先把 __version__（config.py）与 README 的「当前版本」手动 +1
 git add -A
@@ -140,7 +142,7 @@ git commit -m "refactor/fix: ..."
 git tag vX.Y.Z
 git push origin main
 git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
-```
+``
 
 ### ⚠ 发布相关雷区（已踩过，必看）
 
@@ -269,6 +271,14 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
      - menu / tray：`menu.on_toggle_bg_trim` 只提交增量（`menu.py:183`），菜单项「后台进程工作集清理」插在「趋势预防式清理」之后（`menu.py:387`，checked 读 live `guard.cfg`）；`line_stats` 统计行由「升档 / 定向 / 预防 / 短效次数」改为「升档 / 定向 / 后台 / 预防 / 短效次数」（`menu.py:199` 读 `bg_trimmed`）；`menu.on_clean_now` 与 `tray._auto_clean` 通知体追加「后台进程工作集: N 个」。
      - 验证：全量 **379 passed**（较 v1.10.0 的 353 净增 26：test_clean 15——bg 阶梯 6 + 泄漏 extras 1 + `growth_slopes` 3 + `leak_candidates` 2 + `_target_clean_candidates` extras 3；另 test_winapi 3 + test_advisor 2 + test_config 2 + test_menu 2 + test_tray 2），并行修好 18 条存量测试桩签名（`_fake_bump_stats` / `_fake_do_clean` / analyze 桩缺 `leaks=None`）；pyflakes 干净、`--selftest` 全 PASS。`mem_guard.json`（git 未跟踪）仍勿提交。
 
+19. **v1.12.0 持续压力粘滞激进 + 阶梯分阶段度量与阶段自学习（代码+测试+文档已完成，尚未 commit/tag；省步骤不加打扰、最小打扰）**：
+     - 架构（粘滞激进）：`memguard/tray.py` 新增 `Guard._sticky_aggr`（默认 False）与 `Guard._sticky_allowed()`（`sticky_aggressive` 与 `auto_level_adapt` 双开关都开才允许——后者关说明用户连档位都不想让它自己动，粘滞本质是强制激进、同样不该自作主张）；`_auto_clean` 改调 `do_clean(..., sticky=self._sticky_aggr and self._sticky_allowed())`，置位后直接按激进档执行、跳过保守→定向→后台整条阶梯；`_post_clean_learn(r)` 按回传 `still` 更新粘滞态——压力仍在且未粘滞时进入粘滞（通知追加「内存压力持续，后续自动清理将直接按激进档执行」），压力解除即退出并把 `_stage_zero` 清零（进入/退出各记一条日志）。
+     - 架构（阶段自学习 + 分阶段度量）：`do_clean` 增 `sticky=False` / `skip=()` 形参与回传键 `still` / `sticky` / `targeted_freed` / `bg_freed` / `escalated_freed`（各级释放量取该级清理后可用物理增量、`max(delta, 0)`）；`Guard._stage_zero`（初始 `targeted`/`bg` 各 0）+ `_bump_stage_zero`（清到东西即清零、否则记一次）+ `_skip_stages()`（某阶段连续 `stage_learn_strikes` 次为 0 即跳过，只影响 targeted/bg 两级、升档不受影响）——阶段计数只在非粘滞轮更新（粘滞轮整条阶梯被跳过，没什么可学）。`clean._bump_stats` 增 `sticky` 形参，`sticky=True` 时累计 `stats.sticky`。
+     - 动机：v1.11.0 的阶梯对「持续高压」每次都在白跑——保守清一遍不达标、定向/后台各清一遍、最后才升档，一轮里同一批内存被清四次；而总释放不出东西的那级（如定向大户榜为空）纯属浪费。粘滞让持续高压直接进激进，阶段自学习把已被证明无效的阶段跳掉：两者都只省步骤、不加打扰。
+     - 配置 3 键：`sticky_aggressive`（默认 True）、`stage_learn`（默认 True）、`stage_learn_strikes`（默认 3，`normalize_config` 走 `_clamp_int` 钳制 2–10）；stats 键 `sticky`（非 0 才落键，不污染干净配置）。
+     - menu / tray：`menu.on_toggle_sticky` / `menu.on_toggle_stage_learn` 只提交增量（`menu.py:183` / `menu.py:188`），菜单项「持续高压粘滞激进」「阶段自学习(跳过无效阶段)」插在「后台进程工作集清理」之后（checked 读 live `guard.cfg`）；统计行改为「升档 / 定向 / 后台 / 预防 / 短效 / 粘滞次数」（`menu.py:210` 读 `sticky`）；通知体按 `targeted_freed` / `bg_freed` / `escalated_freed` 追加「分阶段释放: 定向 X、后台 Y、升档 Z」（只列非 0 阶段），粘滞轮再追加「持续高压：粘滞激进」。
+     - 验证：全量 **397 passed**（较 v1.11.0 的 379 净增 18：test_clean 7 + test_tray 5 + test_config 3 + test_menu 3），并把存量测试假桩统一到新签名（test_clean 的 `_bump_stats` 桩改 `sticky=False`、test_tray 的假 `do_clean` 统一 `(..., growth_rows=None, sticky=False, skip=(), **kw)`）；pyflakes 干净、`--selftest` 全 PASS。`mem_guard.json`（git 未跟踪）仍勿提交。
+
 ## 9. 其他踩坑索引（详见 `.codebuddy/memory` 的 `MEMORY.md`）
 
 - 含中文的 `.ps1` 必须 **UTF-8 with BOM**，否则 PowerShell 5.1 按 GBK 解中文引号破坏语法。
@@ -295,6 +305,7 @@ git push origin vX.Y.Z       # 推 tag 即触发 CI 出 Release
 - **取证环境坑（cua_repl 子进程 / 裁剪 PATH）**：子进程环境只剩 13 个变量，**没有 `APPDATA`/`LOCALAPPDATA`**，Python 里要显式补 `os.environ["APPDATA"] = USERPROFILE + "\AppData\Roaming"`；`Stop-Process -Name` 与 `taskkill` 在裁剪 PATH 下都不可用，按 PID 杀（`Get-CimInstance Win32_Process` 取 ProcessId）；detached 后台进程会被隔离区销毁，长任务改用同步大 timeout；桌面真实路径是 `D:\Desktop`（不是 `%USERPROFILE%\Desktop`）。嵌套 exec 工具链（exec_command / apply_patch / view_image）2026-09-30 复核可用；超过约 10s 的命令仍建议重定向到文件再读，避免静默丢输出。
 
 ---
+历史：2026-10-04最后更新：2026-10-04（v1.12.0 持续压力粘滞激进 + 阶梯分阶段度量与阶段自学习收口：上一轮自动清理走完整条阶梯仍没压住，下一轮直接按激进档执行、不再从保守档重跑（`sticky_aggressive`，默认开；`auto_level_adapt` 关时一并失效），压力解除即退出粘滞重回保守档；阶段自学习把连续 `stage_learn_strikes`(3) 次释放为 0 的阶段跳过（`stage_learn`，默认开，只影响定向/后台、不影响升档）；`do_clean(sticky=, skip=)` 回传 `still` 与 `targeted_freed` / `bg_freed` / `escalated_freed`，通知追加「分阶段释放: 定向 X、后台 Y、升档 Z」与「持续高压：粘滞激进」，统计行追加「（粘滞 N 次）」、`stats.sticky` 非 0 才落键；全量 397 passed（净增 18），pyflakes 干净、`--selftest` 全 PASS，细节见 §8 第 19 项）
 历史：2026-10-04最后更新：2026-10-04（v1.11.0 后台进程工作集清理 + 泄漏进程增长感知收口：定向大户只清工作集榜上前几名，无可见顶层窗口的后台进程同样在顶阈值却长期排不上号——`winapi.visible_window_pids()`（EnumWindows + IsWindowVisible + GetWindowThreadProcessId，回调返回 0 或触 `_WINDOW_ENUM_MAX` 一律 None）取可见窗口集合，`clean._run_bg_trim` 只清其余进程，None 时宁可不做；阶梯改为「保守 → 定向大户 → 后台进程 → 全量激进」。同版把 `_refresh_advice` 里已有的 Top15 采样顺手喂进 `Guard.proc_history`（deque(maxlen=40)，零额外系统调用）：`clean.growth_slopes`（≥5 采样、跨度 ≥300s、斜率 >0）拟合 RSS 斜率，`leak_candidates` 双阈值（128KB/s 且净增 64MB）+ 按斜率降序截 5 条，经 `do_clean(growth_rows=...)` 进 `_target_clean_candidates` extras——优先、不受 `target_clean_min_mb` 下限、PID 去重、受 top 截断；`advisor.analyze(..., leaks=...)` 出一条泄漏提醒。配置 1 键 `bg_trim`（默认 True）、stats `bg_trimmed`（非 0 才落键）；菜单「后台进程工作集清理」「后台 N 次」统计行；全量 379 passed（净增 26），pyflakes 干净、`--selftest` 全 PASS，细节见 §8 第 18 项）
 最后更新：2026-10-04（v1.10.0 自适应冷却 + 档位自调优重武装收口：静态 `cooldown` 从「每次自动清理后的固定最小间隔」升级为状态机 `Guard._cooldown_gap()`——与 `_auto_clean` 共用同一份判定输入，距上次清理不足 `effect_min_relief_sec`（短效复发）时累计 `_relief_short_streak`，把最小间隔压到 `max(cooldown * _COOLDOWN_SHRINK(0.5), adaptive_cooldown_floor)`，连续 `_COOLDOWN_OK_STREAK(2)` 次达标再恢复完整 `cooldown`；四处冷却判定（趋势预防 / 超阈值 / 低内存 / 定时清理）全部改走它，压缩只减不增（`clamp(0, cooldown)`，floor 高于 cooldown 也不放大），`adaptive_cooldown` 关掉时恒为用户值。streak（`_relief_short_streak`/`_relief_ok_streak`）纯内存态、不落盘，`relief=None`（上次清理来自手动/CLI）不判定。档位自调优重武装：`Guard._sync_level_seen()` 每次热重载后比对 `_level_seen` 与当前档位，仅「激进→保守」且确实自动切过、`auto_level_adapt` 仍开时才清 `level_adapt_done` 闩，写盘走 `update_config` 读-改-写持锁并把 `_cfg_mtime` 刷成写盘后的新 mtime，省掉下一 tick 一次白重载与一行多余日志；`_maybe_adapt_level` 自动切换后同步 `_level_seen` 为「aggressive」，避免把自动切换误判成用户手动切回。配置 2 键 `adaptive_cooldown`（默认 True）/ `adaptive_cooldown_floor`（默认 30，clamp 5–3600）；全量 353 passed（较 v1.9.0 的 345 净增 8），pyflakes 干净、`--selftest` 全 PASS，与 v1.6.0–v1.9.0 同批尚未 commit/tag，细节见 §8 第 17 项）
 历史：2026-10-04最后更新：2026-10-04（v1.9.0 清理效果闭环收口：把「清完就完」补上效果度量——`tray._auto_clean` 增 `low_relief` 形参，动手前算 `relief = now - last_clean`（`last_clean=0` 或 `effect_track` 关不测），不足 `effect_min_relief_sec`（默认 600，clamp 60–86400）判「效果偏短」并透传 `do_clean` 累计 `stats.short_relief`（非 0 才落键）；通知追加「距上次自动清理 N 分钟（偏短）」、统计行「（短效 N 次）」；`advisor.frequent_short_relief` 出一条「保守清理效果不佳，建议直接改用激进」（可一键应用）并作为档位自调优第二条判据（同 `_maybe_adapt_level`，一次性、落闩、只发一条通知、可关）。配置 2 键 `effect_track`/`effect_min_relief_sec`，**无菜单开关**；全量 345 passed（净增 14），pyflakes 干净、`--selftest` 全 PASS，尚**未提交**（tag/push 待用户确认）。细节见 §8 第 16 项）

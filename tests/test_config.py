@@ -358,3 +358,30 @@ def test_normalize_config_stats_short_relief_roundtrip():
     assert zero["stats"] == {"count": 3, "freed": 100}
     plain = normalize_config({"stats": {"count": 3, "freed": 100}})
     assert plain["stats"] == {"count": 3, "freed": 100}
+
+def test_default_config_sticky_and_stage_learn_keys_present():
+    """持续压力粘滞激进 + 阶梯阶段自学习（v1.12.0）三个键必须有默认值。"""
+    for key in ("sticky_aggressive", "stage_learn", "stage_learn_strikes"):
+        assert key in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["sticky_aggressive"] is True
+    assert d["stage_learn"] is True
+    assert d["stage_learn_strikes"] == 3
+
+def test_normalize_config_sticky_and_stage_learn_coercion_and_clamp():
+    """两个开关 bool 强转；strikes 钳在 [2, 10] 次，脏值回落默认。"""
+    assert normalize_config({"sticky_aggressive": 0})["sticky_aggressive"] is False
+    assert normalize_config({"stage_learn": "off"})["stage_learn"] is True
+    assert normalize_config({"stage_learn_strikes": 1})["stage_learn_strikes"] == 2
+    assert normalize_config({"stage_learn_strikes": 99})["stage_learn_strikes"] == 10
+    assert normalize_config({"stage_learn_strikes": "x"})["stage_learn_strikes"] == 3
+    assert normalize_config({"stage_learn_strikes": None})["stage_learn_strikes"] == 3
+
+def test_normalize_config_stats_sticky_roundtrip():
+    """粘滞计数只持久化非 0 值：0/缺失都不落键，统计行按有无决定显示。"""
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "sticky": 2}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "sticky": 2}
+    zero = normalize_config({"stats": {"count": 3, "freed": 100, "sticky": 0}})
+    assert zero["stats"] == {"count": 3, "freed": 100}
+    plain = normalize_config({"stats": {"count": 3, "freed": 100}})
+    assert plain["stats"] == {"count": 3, "freed": 100}

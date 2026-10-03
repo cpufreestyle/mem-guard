@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -52,6 +52,10 @@ DEFAULT_CONFIG = {
     # ---- 自适应冷却（v1.10.0）：短效复发时允许更快复查，连续 hold 住后恢复用户值 ----
     "adaptive_cooldown": True,   # 开：短效复发后把下次最小间隔压到 max(cooldown*factor, floor)，连续达标恢复 cooldown
     "adaptive_cooldown_floor": 30,  # 压缩后的最小间隔下限(秒)，clamp 5..3600；压缩只减不增，永不高于用户 cooldown
+    # ---- 持续压力粘滞激进 + 阶梯阶段自学习（v1.12.0）：高压不再每轮从保守档重跑 ----
+    "sticky_aggressive": True,  # 开：上一轮走完整条阶梯仍没压住，下一轮自动清理直接按激进档执行
+    "stage_learn": True,        # 开：某阶梯阶段连续多次没释放出东西就跳过它，省一轮时间
+    "stage_learn_strikes": 3,   # 连续几次该阶段释放量为 0 才跳过，clamp 2..10
     "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
     # conservative=仅清 standby list/修改页/文件缓存（温和，对前台几乎无影响，默认）
     # aggressive  =额外清空各进程工作集（释放更多，但前台程序下次访问需重新读盘，可能卡顿）
@@ -160,6 +164,10 @@ def normalize_config(raw) -> dict:
     cfg["adaptive_cooldown_floor"] = _clamp_int(
         cfg.get("adaptive_cooldown_floor"), 5, 3600,
         DEFAULT_CONFIG["adaptive_cooldown_floor"])
+    cfg["sticky_aggressive"] = bool(cfg.get("sticky_aggressive", True))
+    cfg["stage_learn"] = bool(cfg.get("stage_learn", True))
+    cfg["stage_learn_strikes"] = _clamp_int(
+        cfg.get("stage_learn_strikes"), 2, 10, DEFAULT_CONFIG["stage_learn_strikes"])
     cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
@@ -208,6 +216,9 @@ def normalize_config(raw) -> dict:
     # bg_trimmed（后台进程工作集清理次数）口径同上：非 0 才落键，没 trim 过的配置保持原形状
     if raw_stats.get("bg_trimmed"):
         cfg["stats"]["bg_trimmed"] = _clamp_int(raw_stats.get("bg_trimmed"), 0, 10 ** 9, 0)
+    # sticky（持续压力粘滞激进次数）口径同上：非 0 才落键，没粘滞过的配置保持原形状
+    if raw_stats.get("sticky"):
+        cfg["stats"]["sticky"] = _clamp_int(raw_stats.get("sticky"), 0, 10 ** 9, 0)
     return cfg
 
 

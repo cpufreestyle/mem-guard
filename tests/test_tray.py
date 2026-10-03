@@ -446,7 +446,7 @@ def test_auto_clean_notify_marks_escalation(monkeypatch):
     """自动清理补了激进一次：托盘通知要标「（自动升档）」；没升档时不误导（自动优化主链路）。"""
     switch = {"esc": True}
 
-    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         return {
             "ok": True,
             "freed": 3 * GB,
@@ -479,7 +479,7 @@ def test_auto_clean_notify_marks_targeted(monkeypatch):
     """定向清了大户：托盘通知要列出是哪几个；没定向时不出现该段。"""
     switch = {"tgt": True}
 
-    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         return {
             "ok": True,
             "freed": 3 * GB,
@@ -587,7 +587,7 @@ def test_auto_clean_marks_short_relief_when_last_clean_was_recent(monkeypatch):
     """距上次自动清理不足下限：本次记 low_relief，通知注明间隔多久（效果闭环）。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         seen["low_relief"] = low_relief
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 4},
@@ -614,7 +614,7 @@ def test_auto_clean_skips_effect_measure_without_prev_clean(monkeypatch):
     """上次清理来自手动/CLI（last_clean=0）：没有可对比基线，不测效果也不提间隔。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         seen["low_relief"] = low_relief
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 4},
@@ -639,7 +639,7 @@ def test_auto_clean_skips_effect_measure_when_disabled(monkeypatch):
     """effect_track 关掉：不度量间隔、不累计短效，通知里也不提这茬。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         seen["low_relief"] = low_relief
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 4},
@@ -665,7 +665,7 @@ def test_auto_clean_effect_boundary_is_strictly_below_threshold(monkeypatch):
     """边界口径：正好等于下限不算短效（判据是严格小于），差 1 秒才算。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         seen["low_relief"] = low_relief
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 4},
@@ -726,7 +726,7 @@ def test_maybe_predictive_clean_notifies_with_trend_note(monkeypatch):
     """趋势即将触阈：提前清一次，通知里带「斜率 / 预计分钟 / 阈值」解释。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         seen["reason"] = reason
         seen["preventive"] = preventive
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
@@ -754,7 +754,7 @@ def test_maybe_predictive_clean_respects_cooldown(monkeypatch):
     """冷却内不提前清理：预防式也不该比普通自动清理更频繁。"""
     calls = []
 
-    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         calls.append(reason)
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -776,7 +776,7 @@ def test_maybe_predictive_clean_skips_when_trend_flat(monkeypatch):
     """占用平稳：交给预警气泡和超阈值清理，别提前动。"""
     calls = []
 
-    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
         calls.append(reason)
         return {"ok": True, "freed": 0, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -798,7 +798,7 @@ def test_maybe_predictive_clean_skips_when_disabled(monkeypatch):
     for kw in ({"predict_clean": False}, {"auto_clean": False}):
         calls = []
 
-        def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None):
+        def _fake_do_clean(reason="自动", preventive=False, low_relief=False, growth_rows=None, sticky=False, skip=(), **kw):
             calls.append(reason)
             return {"ok": True, "freed": 0, "level": "conservative",
                     "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -1046,3 +1046,142 @@ def test_auto_clean_passes_leak_rows_to_do_clean(monkeypatch):
     g._auto_clean(1000.0, "自动", g.state)
 
     assert seen["rows"] == [("leaky.exe", 2 * GB, 42)]
+
+# ---------------------------------------- 持续压力粘滞激进 + 阶段自学习（v1.12.0）
+
+def _sticky_r(**over):
+    """假 do_clean 的结果：v1.12.0 新增的键一次给全，别让缺项误导判定。"""
+    base = {"ok": True, "freed": 1024, "level": "conservative", "escalated": False,
+            "targeted": [], "bg_trim": 0, "detail": "-", "stats": {"count": 9},
+            "before": {}, "after": {}, "still": False, "sticky": False,
+            "targeted_freed": 0, "bg_freed": 0, "escalated_freed": 0}
+    base.update(over)
+    return base
+
+def _sticky_fake(got, results):
+    """记录每次收到的 sticky 形参，并按给定序列回吐结果。"""
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None,
+                       sticky=False, skip=(), **kw):
+        got.append(sticky)
+        res = dict(results[len(got) - 1])
+        res.setdefault("sticky", sticky)
+        return _sticky_r(**res)
+    return _fake_do_clean
+
+def test_auto_clean_enters_sticky_after_pressure_persists(monkeypatch):
+    """完整阶梯后压力仍在：下一轮直接按激进档，进入说明只弹一次。"""
+    got = []
+    notes = []
+    monkeypatch.setattr(tray, "do_clean",
+                         _sticky_fake(got, [{"still": True},
+                                            {"still": True,
+                                             "level": "aggressive"}]))
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=86.0))
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._auto_clean(1000.0, "自动", g.state)
+    g._auto_clean(1001.0, "自动", g.state)
+
+    assert got == [False, True], "第二轮才该以 sticky=True 调 do_clean"
+    assert g._sticky_aggr is True
+    assert any("持续高压：粘滞激进" in t for _, t in notes)
+    assert sum("直接按激进档" in t for _, t in notes) == 1, "进入说明只弹一次"
+
+
+def test_auto_clean_leaves_sticky_once_relieved_and_rearms(monkeypatch):
+    """压力一解除就退出粘滞、下次又从保守档起重（重武装），不赖在激进档。"""
+    got = []
+    logs = []
+    monkeypatch.setattr(tray, "do_clean",
+                         _sticky_fake(got, [{"still": True}, {"still": True},
+                                            {"still": False}, {"still": True}]))
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state(phys_pct=86.0))
+    g.icon.notify = lambda text, title=None: None
+
+    for i in range(3):
+        g._auto_clean(1000.0 + i, "自动", g.state)
+    assert got == [False, True, True]
+    assert g._sticky_aggr is False, "第三轮压力已解除：应退出粘滞"
+    assert any("粘滞激进退出" in m for m in logs)
+
+    g._auto_clean(1003.0, "自动", g.state)
+    assert got == [False, True, True, False], "退出后下一轮回到保守档起重"
+    assert g._sticky_aggr is True, "压力仍在则重新进入粘滞"
+
+
+def test_auto_clean_skips_sticky_when_switch_off(monkeypatch):
+    """sticky_aggressive 关掉：压力再持续也不强制激进（用户不想让它自己动档）。"""
+    got = []
+    monkeypatch.setattr(tray, "do_clean",
+                         _sticky_fake(got, [{"still": True}, {"still": True}]))
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=86.0))
+    g.cfg["sticky_aggressive"] = False
+    g.icon.notify = lambda text, title=None: None
+
+    g._auto_clean(1000.0, "自动", g.state)
+    g._auto_clean(1001.0, "自动", g.state)
+
+    assert got == [False, False]
+    assert g._sticky_aggr is False
+
+
+def test_auto_clean_skips_stage_after_zero_release_streak(monkeypatch):
+    """某阶段连续多次没释放出东西就跳过它：到 strikes 才生效，之前照跑。"""
+    got, skips = [], []
+    rows = [("big.exe", 2 * GB, 4242)]
+
+    def _fake_do_clean(reason="自动", low_relief=False, growth_rows=None,
+                       sticky=False, skip=(), **kw):
+        got.append(sticky)
+        skips.append(set(skip))
+        # skip 命中了这一级就真的没跑：回吐空 targeted，学习计数不该继续累加
+        hit = [] if "targeted" in skip else rows
+        return _sticky_r(still=True, sticky=sticky, targeted=hit,
+                         targeted_freed=0)
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=86.0))
+    g.cfg["stage_learn_strikes"] = 2
+    g.cfg["sticky_aggressive"] = False      # 隔离变量：只验阶段跳过
+    g.icon.notify = lambda text, title=None: None
+
+    for i in range(3):
+        g._auto_clean(1000.0 + i, "自动", g.state)
+
+    assert got == [False, False, False], "隔离了粘滞，不关阶段学习的事"
+    assert skips == [set(), set(), {"targeted"}]
+    assert g._stage_zero["targeted"] == 2
+
+
+def test_auto_clean_notify_marks_sticky_and_stage_release(monkeypatch):
+    """粘滞轮通知要点明「持续高压」，并按阶段只列真的释放出来的量。"""
+    monkeypatch.setattr(tray, "do_clean",
+                         _sticky_fake([], [{"sticky": True,
+                                            "level": "aggressive",
+                                            "escalated": True,
+                                            "escalated_freed": int(2.5 * GB)}]))
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=86.0))
+    notes = []
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._auto_clean(1000.0, "自动", g.state)
+
+    body = notes[0][1]
+    assert "持续高压：粘滞激进" in body
+    assert "分阶段释放: 升档 2.5GB" in body
+    assert "定向" not in body, "没清到东西的阶段不必列出来"

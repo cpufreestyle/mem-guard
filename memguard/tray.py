@@ -63,6 +63,11 @@ class Guard:
         self._relief_short_streak = 0  # 连续「距上次清理不足 effect_min_relief_sec」次数
         self._relief_ok_streak = 0     # 连续「效果达标」次数
         self._level_seen = self.cfg.get("clean_level")  # 上次观察到的档位（识别用户手动切回保守）
+        # v1.12.0 持续压力粘滞激进：纯内存态，不落盘。上一轮走完整条阶梯仍没压住
+        # 内存压力时置位，下一轮自动清理直接按激进档执行（见 _post_clean_learn）
+        self._sticky_aggr = False
+        # v1.12.0 阶梯阶段自学习：某阶段连续多次没释放出东西就跳过它（不落盘）
+        self._stage_zero = {"targeted": 0, "bg": 0}
 
 
     # -- 循环 ----------------------------------------------------
@@ -124,6 +129,10 @@ class Guard:
         效果闭环）：上次清理没hold住、压力很快复发。动手前先度量间隔——effect_track
         关闭、或上次清理来自手动/CLI（last_clean=0）时不测；短效则透传给 do_clean
         累计 stats.short_relief，供统计行、通知与 advisor 自调优使用。
+        v1.12.0 起还负责持续压力粘滞激进与阶梯阶段自学习：_sticky_aggr 置位
+        且 _sticky_allowed() 时以 sticky=True 调 do_clean 直接激进执行，并按
+        _skip_stages() 跳过已被学习证明无效的阶梯阶段；清理后由
+        _post_clean_learn 更新上述状态，返回的说明句追加到通知正文。
         """
         prev = self.last_clean
         relief = now - prev if prev > 0 else None
@@ -142,12 +151,17 @@ class Guard:
         if low_relief:
             kw["low_relief"] = True
         # 泄漏进程一起带下去：定向清理会优先清它们（见 do_clean 的 growth_rows）
-        r = do_clean(reason, growth_rows=self.leaks, **kw)
+        sticky_on = self._sticky_aggr and self._sticky_allowed()
+        r = do_clean(reason, growth_rows=self.leaks, sticky=sticky_on,
+                     skip=self._skip_stages(), **kw)
+        sticky_note = ""
         if r["ok"]:
             # 统计已在 do_clean 里落盘：顺手同步回内存，否则菜单顶部那行累计统计要等
             # 下一次热重载（间隔由 interval 决定，最长可能等很久）才刷新
             if r.get("stats"):
                 self.cfg["stats"] = r["stats"]
+            # v1.12.0 阶段自学习：按 still / targeted_freed 等结果更新粘滞态与跳过集
+            sticky_note = self._post_clean_learn(r)
         if r["ok"] and self.icon:
             top3 = top_processes_list(3)
             top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
@@ -163,10 +177,23 @@ class Guard:
                 body += f"\n定向清理大户:\n{tgt_txt}"
             if r.get("bg_trim"):
                 body += f"\n后台进程工作集: {r['bg_trim']} 个"
+            # v1.12.0 分阶段释放量：只列真的清到了东西的阶段，别把通知刷长
+            stage_lines = []
+            for label, key in (("定向", "targeted_freed"), ("后台", "bg_freed"),
+                               ("升档", "escalated_freed")):
+                v = r.get(key) or 0
+                if v > 0:
+                    stage_lines.append(f"{label} {gb(v)}")
+            if stage_lines:
+                body += "\n分阶段释放: " + "、".join(stage_lines)
+            if r.get("sticky"):
+                body += "\n持续高压：粘滞激进"
             if relief is not None and self.cfg.get("effect_track", True):
                 body += f"\n距上次自动清理 {relief / 60:.1f} 分钟"
                 if low_relief:
                     body += "（偏短）"
+            if sticky_note:
+                body += f"\n{sticky_note}"
             if note:
                 body += f"\n{note}"
             title = "MemGuard 自动清理" if reason == "自动" else f"MemGuard {reason}清理"
@@ -210,6 +237,60 @@ class Guard:
             self._relief_ok_streak += 1
             if self._relief_ok_streak >= _COOLDOWN_OK_STREAK:
                 self._relief_short_streak = 0
+
+    # -- 持续压力粘滞激进 + 阶梯阶段自学习（v1.12.0）--------------------
+
+    def _sticky_allowed(self) -> bool:
+        """粘滞激进是否被允许：总开关或档位自调优关闭时都不粘滞。
+
+        sticky_aggressive 是本次功能的总开关；auto_level_adapt 关闭说明用户
+        连档位都不想让它自己动，粘滞（本质是强制激进）同样不该自作主张。
+        """
+        return bool(self.cfg.get("sticky_aggressive", True)
+                    and self.cfg.get("auto_level_adapt", True))
+
+    def _skip_stages(self) -> set:
+        """本轮要跳过的阶梯阶段名集合（stage_learn 关闭或未达标时为空集）。
+
+        某阶段连续 stage_learn_strikes 次没释放出东西，说明它对当前这轮压力
+        没用，跳过省时间；只影响 targeted/bg 两个阶梯阶段，升档不受影响。
+        """
+        if not self.cfg.get("stage_learn", True):
+            return set()
+        strikes = int(self.cfg.get("stage_learn_strikes", 3) or 0)
+        return {name for name, zero in self._stage_zero.items() if zero >= strikes}
+
+    def _bump_stage_zero(self, name: str, freed: int) -> None:
+        """记录某阶梯阶段本轮是否真的清到了东西：清到了就清零计数，否则记一次。"""
+        if freed > 0:
+            self._stage_zero[name] = 0
+        else:
+            self._stage_zero[name] += 1
+
+    def _post_clean_learn(self, r: dict) -> str:
+        """按清理结果更新粘滞态与阶段零释放计数，返回要追加进通知的说明句。
+
+        压力解除（still 为假）：退出粘滞、阶段计数清零，回到「从保守档重跑».
+        压力仍在且未粘滞：进入粘滞，下一轮直接激进；已粘滞则保持。阶段计数只在
+        本轮真的跑了阶梯时更新——粘滞轮整条阶梯都被跳过，没什么可学的。
+        """
+        if not r.get("still"):
+            if self._sticky_aggr:
+                log("粘滞激进退出 | 清理后压力已解除，下次自动清理回到保守档起重")
+            self._sticky_aggr = False
+            self._stage_zero = {"targeted": 0, "bg": 0}
+            return ""
+        note = ""
+        if not r.get("sticky") and not self._sticky_aggr and self._sticky_allowed():
+            self._sticky_aggr = True
+            note = "内存压力持续，后续自动清理将直接按激进档执行（跳过已证不够用的阶梯）"
+            log("粘滞激进进入 | 完整阶梯后压力仍在，下次自动清理直接按激进档")
+        if not r.get("sticky"):
+            if r.get("targeted"):
+                self._bump_stage_zero("targeted", r.get("targeted_freed") or 0)
+            if r.get("bg_trim"):
+                self._bump_stage_zero("bg", r.get("bg_freed") or 0)
+        return note
 
     def _maybe_predictive_clean(self, now: float, s: dict) -> bool:
         """趋势预防式清理（v1.8.0）：还没超阈值，但按上升斜率很快就要超。
