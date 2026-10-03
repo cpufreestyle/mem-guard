@@ -176,7 +176,7 @@ def build_menu(guard) -> pystray.Menu:
     def on_toggle_level_adapt(icon, item) -> None:
         guard.cfg = update_config(
             {"auto_level_adapt": not bool(guard.cfg.get("auto_level_adapt", True))})
-        log(f"保守频繁升档自动改激进 -> {'开' if guard.cfg['auto_level_adapt'] else '关'}")
+        log(f"保守档不给力自动改激进 -> {'开' if guard.cfg['auto_level_adapt'] else '关'}")
 
     def on_toggle_predict_clean(icon, item) -> None:
         guard.cfg = update_config(
@@ -188,10 +188,12 @@ def build_menu(guard) -> pystray.Menu:
         esc = int(st.get('escalated', 0))
         tgt = int(st.get('targeted', 0))
         prev = int(st.get('preventive', 0))
+        srt = int(st.get('short_relief', 0))
         base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
         return (base + (f"（升档 {esc} 次）" if esc else "")
                 + (f"（定向 {tgt} 次）" if tgt else "")
-                + (f"（预防 {prev} 次）" if prev else ""))
+                + (f"（预防 {prev} 次）" if prev else "")
+                + (f"（短效 {srt} 次）" if srt else ""))
 
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
@@ -372,7 +374,7 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("escalate_clean", True))),
         pystray.MenuItem("定向清理内存大户", on_toggle_target_clean,
                          checked=lambda i: bool(guard.cfg.get("target_clean", True))),
-        pystray.MenuItem("保守频繁升档自动改激进", on_toggle_level_adapt,
+        pystray.MenuItem("保守档不给力自动改激进", on_toggle_level_adapt,
                          checked=lambda i: bool(guard.cfg.get("auto_level_adapt", True))),
         pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
                          checked=lambda i: bool(guard.cfg.get("predict_clean", True))),

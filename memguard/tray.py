@@ -16,7 +16,8 @@ import time
 import pystray
 
 from . import update
-from .advisor import advice_actions, analyze, frequent_escalation
+from .advisor import (advice_actions, analyze, frequent_escalation,
+                      frequent_short_relief)
 from .clean import do_clean, predictive_due, top_processes_list
 from .config import CONFIG_PATH, __version__, gb, load_config, log, update_config
 from .menu import build_menu
@@ -30,6 +31,10 @@ from .winapi import (close_show_event, create_show_event, ensure_tray_promoted,
 # pystray 的 NIM_ADD 发生在 icon.run() 里，而 _declare_tray_pin 抢在它前面跑，注册表
 # 条目多半还没影；最多等这么久让条目出现，等不到就交给日志说明。
 TRAY_PIN_WAIT = 15.0
+
+# ---- 自适应冷却（v1.10.0）：短效复发时把下次最小间隔压缩，连续 hold 住后恢复用户值 ----
+_COOLDOWN_SHRINK = 0.5   # 压缩系数：短效复发后的最小间隔 = max(cooldown * 系数, floor)
+_COOLDOWN_OK_STREAK = 2  # 连续这么多次距上次清理 >= effect_min_relief_sec，就恢复完整 cooldown
 
 
 class Guard:
@@ -51,6 +56,10 @@ class Guard:
         self._show_event = None       # 唤窗事件句柄：给二次启动的信号用
         self._tray_pin_done = False   # 托盘常驻声明是否已尝试过（只试一次）
         self._update_checking = False  # 是否已有一次更新检查在途（防重复发起）
+        # 自适应冷却（v1.10.0）：纯内存态，不落盘；短效复发压间隔，连续达标恢复
+        self._relief_short_streak = 0  # 连续「距上次清理不足 effect_min_relief_sec」次数
+        self._relief_ok_streak = 0     # 连续「效果达标」次数
+        self._level_seen = self.cfg.get("clean_level")  # 上次观察到的档位（识别用户手动切回保守）
 
 
     # -- 循环 ----------------------------------------------------
@@ -102,16 +111,36 @@ class Guard:
 
 
     def _auto_clean(self, now: float, reason: str, s: dict, note: str = "",
-                    preventive: bool = False) -> None:
+                    preventive: bool = False, low_relief: bool = False) -> None:
         """执行一次自动清理并弹通知（各触发源共用；reason 用于日志与通知标题）。
 
         note 非空时追加到通知正文末尾：预防式清理用它解释「还没超阈值为什么清」。
         preventive=True 表示本次是趋势预防式清理，do_clean 会累计 stats.preventive，
         供统计行展示与 advisor 的自调优建议使用。
+        low_relief=True 表示本次距上次自动清理不足 effect_min_relief_sec（v1.9.0
+        效果闭环）：上次清理没hold住、压力很快复发。动手前先度量间隔——effect_track
+        关闭、或上次清理来自手动/CLI（last_clean=0）时不测；短效则透传给 do_clean
+        累计 stats.short_relief，供统计行、通知与 advisor 自调优使用。
         """
+        prev = self.last_clean
+        relief = now - prev if prev > 0 else None
+        if (relief is not None and self.cfg.get("effect_track", True)
+                and relief < int(self.cfg.get("effect_min_relief_sec", 600) or 0)):
+            low_relief = True
+        if low_relief and relief is not None:
+            log(f"{reason}清理 | 距上次自动清理 {relief / 60:.1f} 分钟，"
+                f"上次清理未稳住内存（效果偏短）")
         self.last_clean = now
+        self._note_relief(relief, low_relief)
         self.over_since = None
-        r = do_clean(reason, preventive=True) if preventive else do_clean(reason)
+        if preventive and low_relief:
+            r = do_clean(reason, preventive=True, low_relief=True)
+        elif preventive:
+            r = do_clean(reason, preventive=True)
+        elif low_relief:
+            r = do_clean(reason, low_relief=True)
+        else:
+            r = do_clean(reason)
         if r["ok"]:
             # 统计已在 do_clean 里落盘：顺手同步回内存，否则菜单顶部那行累计统计要等
             # 下一次热重载（间隔由 interval 决定，最长可能等很久）才刷新
@@ -130,6 +159,10 @@ class Guard:
                 tgt_txt = "\n".join(
                     f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in r["targeted"])
                 body += f"\n定向清理大户:\n{tgt_txt}"
+            if relief is not None and self.cfg.get("effect_track", True):
+                body += f"\n距上次自动清理 {relief / 60:.1f} 分钟"
+                if low_relief:
+                    body += "（偏短）"
             if note:
                 body += f"\n{note}"
             title = "MemGuard 自动清理" if reason == "自动" else f"MemGuard {reason}清理"
@@ -140,6 +173,39 @@ class Guard:
                 )
             except Exception:
                 pass
+
+    def _cooldown_gap(self) -> int:
+        """本次自动清理后的最小间隔（秒）：v1.10.0 自适应冷却。
+
+        静态 cooldown 是最大缺口：短效复发时不会更快复查，连续 hold 住后也不放松。
+        这里与 _auto_clean 共用同一份判定输入：距上次清理不足 effect_min_relief_sec
+        时累计 _relief_short_streak，把最小间隔压到 max(cooldown * _COOLDOWN_SHRINK,
+        adaptive_cooldown_floor)，连续 _COOLDOWN_OK_STREAK 次达标再恢复完整 cooldown。
+        压缩只减不增：clamp(0, cooldown)，floor 高于 cooldown 也不放大；开关关闭时
+        恒为用户值。四处冷却判定（趋势预防 / 超阈值 / 低内存 / 定时）都走这里。
+        """
+        cfg = self.cfg
+        gap = int(cfg.get("cooldown", 300) or 0)
+        if not cfg.get("adaptive_cooldown", True) or self._relief_short_streak <= 0:
+            return gap
+        floor = int(cfg.get("adaptive_cooldown_floor", 30) or 0)
+        return max(0, min(gap, max(int(gap * _COOLDOWN_SHRINK), floor)))
+
+    def _note_relief(self, relief, low_relief: bool) -> None:
+        """记录本次自动清理的效果好坏，驱动 _cooldown_gap 的自适应（纯内存态，不落盘）。
+
+        relief 为 None（上次清理来自手动/CLI，或无上次记录）时不判定；短效累计
+        _relief_short_streak，连续 _COOLDOWN_OK_STREAK 次达标清零、恢复完整冷却。
+        """
+        if relief is None:
+            return
+        if low_relief:
+            self._relief_ok_streak = 0
+            self._relief_short_streak += 1
+        else:
+            self._relief_ok_streak += 1
+            if self._relief_ok_streak >= _COOLDOWN_OK_STREAK:
+                self._relief_short_streak = 0
 
     def _maybe_predictive_clean(self, now: float, s: dict) -> bool:
         """趋势预防式清理（v1.8.0）：还没超阈值，但按上升斜率很快就要超。
@@ -153,7 +219,7 @@ class Guard:
             cfg = self.cfg
             if not (cfg.get("predict_clean") and cfg["auto_clean"]):
                 return False
-            if now - self.last_clean <= cfg["cooldown"]:
+            if now - self.last_clean <= self._cooldown_gap():
                 return False
             pred = predictive_due(self.history, cfg)
             if not pred:
@@ -177,6 +243,11 @@ class Guard:
                 self._cfg_mtime = mtime
                 if mtime is not None:
                     self.cfg = load_config()
+                    # 手动把档位从激进切回保守 = 想重新评估自调优，重新武装（v1.10.0）；
+                    # 返回 True 说明已清闩写盘，_cfg_mtime 取写盘后的新值，省掉下一 tick 一次白重载
+                    if self._sync_level_seen():
+                        self._cfg_mtime = (os.path.getmtime(CONFIG_PATH)
+                                           if os.path.exists(CONFIG_PATH) else mtime)
                     # 配置刚变（可能换了档位/阈值），把建议节流计时清零，让菜单上的
                     # 「优化建议（N 条）」立刻反映新配置，而不是最多再等一个周期
                     self._advice_at = 0.0
@@ -200,34 +271,75 @@ class Guard:
         except Exception:
             pass
 
-    def _maybe_adapt_level(self) -> None:
-        """自调优闭环（v1.6.0）：保守档频繁升档时自动改用激进档，整个生命周期最多一次。
+    def _sync_level_seen(self) -> bool:
+        """档位观察 + 自调优重武装（v1.10.0）：用户手动切回保守档时重新武装。
 
-        判据与 advisor 3b 同源（frequent_escalation）：累计清理 escalated 过半且
-        ≥3 次——「先温和再彻底」每次多跑一遍、多打扰一次，不如一次清到位。切换走
-        update_config（读-改-写持锁）并落 level_adapt_done 闩：用户手动切回保守也不会
-        被再次自动覆盖；关掉 auto_level_adapt 则完全不评估。任何异常只记日志，绝不让
-        监控循环崩。
+        v1.6.0/v1.9.0 的 level_adapt_done 是永久闩：自动切过一次激进后，即使内存工
+        况变了、用户也手动改回了保守，也永远不再自动评估。这里每次热重载后比对「上次
+        观察到的档位」与当前档位：只有 激进→保守（且确实自动切过、auto_level_adapt
+        仍开着）才清闩。写盘走 update_config 读-改-写持锁，返回是否已重新武装——调用
+        方据此把 _cfg_mtime 更新为写盘后的新 mtime，省掉下一 tick 一次白重载与一行多
+        余日志。
+        """
+        prev_level = self._level_seen
+        cur_level = self.cfg.get("clean_level")
+        self._level_seen = cur_level
+        if prev_level != "aggressive" or cur_level != "conservative":
+            return False
+        if not (self.cfg.get("level_adapt_done") and self.cfg.get("auto_level_adapt", True)):
+            return False
+        self.cfg = update_config({"level_adapt_done": False})
+        log("检测到手动切回保守档，档位自调优已重新武装（再次频繁不达标会自动切激进）")
+        return True
+
+    def _maybe_adapt_level(self) -> None:
+        """自调优闭环（v1.6.0/v1.9.0）：保守档不给力时自动改用激进档，整个生命周期最多一次。
+
+        两条判据均与 advisor 3b 同源：累计清理 escalated 过半且 ≥3 次
+        （frequent_escalation，保守清完仍不达标需升档），或 short_relief 过半且
+        ≥3 次（frequent_short_relief，距上次清理不足 effect_min_relief_sec 即
+        效果偏短）——「先温和再彻底」在这台机器上只是白跑一遍、多打扰一次，不如
+        一次清到位。切换走 update_config（读-改-写持锁）并落 level_adapt_done 闩：
+        用户手动切回保守会重新武装；关掉 auto_level_adapt 则完全不评估。
+        任何异常只记日志，绝不让监控循环崩。
         """
         try:
             cfg = self.cfg
             if not cfg.get("auto_level_adapt", True) or cfg.get("level_adapt_done"):
                 return
-            if not frequent_escalation(cfg):
+            esc = frequent_escalation(cfg)
+            srt = frequent_short_relief(cfg)
+            if not (esc or srt):
                 return
             st = cfg.get("stats") or {}
             clean_cnt = int(st.get("count", 0) or 0)
             esc_cnt = int(st.get("escalated", 0) or 0)
+            srt_cnt = int(st.get("short_relief", 0) or 0)
+            min_relief = int(cfg.get("effect_min_relief_sec", 600) or 0)
             self.cfg = update_config({"clean_level": "aggressive",
                                       "level_adapt_done": True})
-            log(f"自动优化 | 保守档累计 {clean_cnt} 次清理中 {esc_cnt} 次仍不达标需升档，"
-                f"清理力度已自动切换为激进（一次性，不再自动评估，可随时手动改回）")
+            self._level_seen = "aggressive"  # 免得下一 tick 把「自动切换」误判成用户手动切回
+            crit = []
+            if esc:
+                crit.append(f"保守档累计 {clean_cnt} 次清理中 {esc_cnt} 次仍不达标需升档")
+            if srt:
+                crit.append(f"保守档累计 {clean_cnt} 次清理中 {srt_cnt} 次"
+                            f"距上次清理不足 {min_relief} 秒（效果偏短）")
+            log(f"自动优化 | {'；'.join(crit)}，"
+                f"清理力度已自动切换为激进（可随时手动改回；改回保守档会重新武装）")
             if self.icon:
+                lines = []
+                if esc:
+                    lines.append(f"保守档 {clean_cnt} 次清理有 {esc_cnt} 次清完仍不达标")
+                if srt:
+                    lines.append(f"保守档 {clean_cnt} 次清理有 {srt_cnt} 次"
+                                 f"距上次清理不足 {min_relief} 秒")
+                body = ("\n".join(lines)
+                        + "\n已自动切换为激进档：一次清到位，少跑一遍少打扰一次\n"
+                        "（右键菜单可随时改回保守；改回保守档会重新武装）")
                 try:
                     self.icon.notify(
-                        f"保守档 {clean_cnt} 次清理有 {esc_cnt} 次清完仍不达标\n"
-                        f"已自动切换为激进档：一次清到位，少跑一遍少打扰一次\n"
-                        f"（右键菜单可随时改回保守）",
+                        body,
                         "MemGuard 自动优化",
                     )
                 except Exception:
@@ -315,7 +427,7 @@ class Guard:
         """
         sched = self.cfg.get("scheduled_minutes", 0)
         return bool(sched and now - self.last_scheduled >= sched * 60
-                    and now - self.last_clean > self.cfg["cooldown"])
+                    and now - self.last_clean > self._cooldown_gap())
 
     def monitor(self) -> None:
         self.maybe_reload_config()
@@ -366,7 +478,7 @@ class Guard:
                         self.over_since = now
                     debounced = (now - self.over_since) >= self.cfg.get("debounce_sec", 0)
                     due = (self.cfg["auto_clean"] and debounced
-                           and now - self.last_clean > self.cfg["cooldown"])
+                           and now - self.last_clean > self._cooldown_gap())
                     if due:
                         self._auto_clean(now, "自动", s)
                 else:
@@ -375,7 +487,7 @@ class Guard:
                 min_avail = self.cfg.get("min_avail_mb", 0)
                 if (min_avail and s["avail_phys"] < min_avail * 1024 * 1024
                         and self.cfg["auto_clean"]
-                        and now - self.last_clean > self.cfg["cooldown"]):
+                        and now - self.last_clean > self._cooldown_gap()):
                     self._auto_clean(now, "低内存", s)
                 # 触发源 3：定时清理（不看内存占用，按设定间隔触发）
                 if self._scheduled_due(now):

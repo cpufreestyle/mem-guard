@@ -445,7 +445,7 @@ def test_auto_clean_notify_marks_escalation(monkeypatch):
     """自动清理补了激进一次：托盘通知要标「（自动升档）」；没升档时不误导（自动优化主链路）。"""
     switch = {"esc": True}
 
-    def _fake_do_clean(reason="自动"):
+    def _fake_do_clean(reason="自动", low_relief=False):
         return {
             "ok": True,
             "freed": 3 * GB,
@@ -478,7 +478,7 @@ def test_auto_clean_notify_marks_targeted(monkeypatch):
     """定向清了大户：托盘通知要列出是哪几个；没定向时不出现该段。"""
     switch = {"tgt": True}
 
-    def _fake_do_clean(reason="自动"):
+    def _fake_do_clean(reason="自动", low_relief=False):
         return {
             "ok": True,
             "freed": 3 * GB,
@@ -548,7 +548,8 @@ def test_auto_level_adapt_skips_when_off_latched_or_rare(monkeypatch):
     monkeypatch.setattr(tray, "log", lambda m: None)
 
     for kw in ({"auto_level_adapt": False}, {"level_adapt_done": True},
-               {"stats": {"count": 10, "escalated": 2}}):
+               {"stats": {"count": 10, "escalated": 2}},
+               {"stats": {"count": 10, "short_relief": 2}}):
         g = _guard(_state())
         g.cfg = _adapt_cfg(**kw)
         g._maybe_adapt_level()
@@ -569,6 +570,138 @@ def test_auto_level_adapt_failure_only_logs(monkeypatch):
     g.cfg = _adapt_cfg()
     g._maybe_adapt_level()
     assert any("自动档位适配异常" in m for m in logs)
+
+
+# ---------------------------------------------------------------- 清理效果闭环（v1.9.0）
+
+
+def _effect_cfg(**kw):
+    """构造一份开了效果度量的归一化配置，可按关键字覆盖单项。"""
+    base = {"effect_track": True, "effect_min_relief_sec": 600}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_auto_clean_marks_short_relief_when_last_clean_was_recent(monkeypatch):
+    """距上次自动清理不足下限：本次记 low_relief，通知注明间隔多久（效果闭环）。"""
+    seen = {}
+
+    def _fake_do_clean(reason="自动", low_relief=False):
+        seen["low_relief"] = low_relief
+        return {"ok": True, "freed": 2 * GB, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {"count": 4},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=86.0))
+    g.cfg = _effect_cfg()
+    g.last_clean = 1000.0
+    notes = []
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._auto_clean(1000.0 + 300, "自动", g.state)   # 距上次仅 5 分钟（<600 秒）
+
+    assert seen["low_relief"] is True
+    assert any("距上次自动清理 5.0 分钟" in t for _, t in notes)
+    assert any("（偏短）" in t for _, t in notes)
+
+
+def test_auto_clean_skips_effect_measure_without_prev_clean(monkeypatch):
+    """上次清理来自手动/CLI（last_clean=0）：没有可对比基线，不测效果也不提间隔。"""
+    seen = {}
+
+    def _fake_do_clean(reason="自动", low_relief=False):
+        seen["low_relief"] = low_relief
+        return {"ok": True, "freed": 2 * GB, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {"count": 4},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=86.0))
+    g.cfg = _effect_cfg()
+    notes = []
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._auto_clean(1000.0, "自动", g.state)
+
+    assert seen["low_relief"] is False
+    assert all("距上次自动清理" not in t for _, t in notes)
+
+
+def test_auto_clean_skips_effect_measure_when_disabled(monkeypatch):
+    """effect_track 关掉：不度量间隔、不累计短效，通知里也不提这茬。"""
+    seen = {}
+
+    def _fake_do_clean(reason="自动", low_relief=False):
+        seen["low_relief"] = low_relief
+        return {"ok": True, "freed": 2 * GB, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {"count": 4},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=86.0))
+    g.cfg = _effect_cfg(effect_track=False)
+    g.last_clean = 1000.0
+    notes = []
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._auto_clean(1000.0 + 60, "自动", g.state)   # 只隔 1 分钟，但度量已关
+
+    assert seen["low_relief"] is False
+    assert all("距上次自动清理" not in t for _, t in notes)
+
+
+def test_auto_clean_effect_boundary_is_strictly_below_threshold(monkeypatch):
+    """边界口径：正好等于下限不算短效（判据是严格小于），差 1 秒才算。"""
+    seen = {}
+
+    def _fake_do_clean(reason="自动", low_relief=False):
+        seen["low_relief"] = low_relief
+        return {"ok": True, "freed": 2 * GB, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {"count": 4},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=86.0))
+    g.cfg = _effect_cfg()
+    g.last_clean = 1000.0
+
+    g._auto_clean(1000.0 + 600, "自动", g.state)   # 正好 600 秒
+    assert seen["low_relief"] is False
+    g._auto_clean(1000.0 + 600 + 599, "自动", g.state)   # 距上次 599 秒
+    assert seen["low_relief"] is True
+
+
+def test_auto_level_adapt_switches_on_short_relief_criterion(monkeypatch):
+    """短效判据独立触发自调优：日志与通知都要点明「距上次清理不足 N 秒」。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                        lambda ch: changes.append(dict(ch)) or {
+                            "clean_level": "aggressive", "level_adapt_done": True})
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _adapt_cfg(stats={"count": 10, "short_relief": 6})
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_level()
+    assert changes == [{"clean_level": "aggressive", "level_adapt_done": True}]
+    assert g.cfg["clean_level"] == "aggressive"
+    assert any("距上次清理不足 600 秒" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+    assert "距上次清理不足 600 秒" in notes[0][1]
 
 
 # ---------------------------------------------------------------- 趋势预防式清理（v1.8.0）
@@ -592,7 +725,7 @@ def test_maybe_predictive_clean_notifies_with_trend_note(monkeypatch):
     """趋势即将触阈：提前清一次，通知里带「斜率 / 预计分钟 / 阈值」解释。"""
     seen = {}
 
-    def _fake_do_clean(reason="自动", preventive=False):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False):
         seen["reason"] = reason
         seen["preventive"] = preventive
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
@@ -620,7 +753,7 @@ def test_maybe_predictive_clean_respects_cooldown(monkeypatch):
     """冷却内不提前清理：预防式也不该比普通自动清理更频繁。"""
     calls = []
 
-    def _fake_do_clean(reason="自动", preventive=False):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False):
         calls.append(reason)
         return {"ok": True, "freed": 2 * GB, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -642,7 +775,7 @@ def test_maybe_predictive_clean_skips_when_trend_flat(monkeypatch):
     """占用平稳：交给预警气泡和超阈值清理，别提前动。"""
     calls = []
 
-    def _fake_do_clean(reason="自动", preventive=False):
+    def _fake_do_clean(reason="自动", preventive=False, low_relief=False):
         calls.append(reason)
         return {"ok": True, "freed": 0, "level": "conservative",
                 "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -664,7 +797,7 @@ def test_maybe_predictive_clean_skips_when_disabled(monkeypatch):
     for kw in ({"predict_clean": False}, {"auto_clean": False}):
         calls = []
 
-        def _fake_do_clean(reason="自动", preventive=False):
+        def _fake_do_clean(reason="自动", preventive=False, low_relief=False):
             calls.append(reason)
             return {"ok": True, "freed": 0, "level": "conservative",
                     "escalated": False, "detail": "-", "stats": {"count": 3},
@@ -684,7 +817,7 @@ def test_maybe_predictive_clean_failure_only_logs(monkeypatch):
     """do_clean 抛异常只记日志：预防式清理失败绝不能带崩监控循环。"""
     logs = []
 
-    def _boom(reason="自动", preventive=False):
+    def _boom(reason="自动", preventive=False, low_relief=False):
         raise RuntimeError("clean gone")
 
     monkeypatch.setattr(tray, "do_clean", _boom)
@@ -696,3 +829,171 @@ def test_maybe_predictive_clean_failure_only_logs(monkeypatch):
 
     assert g._maybe_predictive_clean(1000.0, g.state) is False
     assert any("预防式清理异常" in m for m in logs)
+
+# ------------------------------------------------- 自适应冷却与自调优重武装（v1.10.0）
+
+
+def _cooldown_cfg(**kw):
+    "构造一份开了自适应冷却的归一化配置，可按关键字覆盖单项。"
+    base = {"cooldown": 300, "adaptive_cooldown": True,
+            "adaptive_cooldown_floor": 30, "effect_track": True,
+            "effect_min_relief_sec": 600, "scheduled_minutes": 30}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_cooldown_gap_shrinks_on_short_relief_then_recovers():
+    """短效复发把最小间隔减半，连续两次达标后恢复用户值（自适应冷却）。"""
+    g = _guard(_state())
+    g.cfg = _cooldown_cfg()
+
+    assert g._cooldown_gap() == 300, "没短效记录：恒为用户 cooldown"
+
+    g._note_relief(300, True)
+    assert g._relief_short_streak == 1
+    assert g._cooldown_gap() == 150, "短效复发：压到 cooldown 的一半"
+
+    g._note_relief(120, True)
+    assert g._cooldown_gap() == 150, "连续短效继续压缩（只减不增）"
+
+    g._note_relief(900, False)
+    assert g._cooldown_gap() == 150, "一次达标还不够：等连续 _COOLDOWN_OK_STREAK 次"
+    g._note_relief(900, False)
+    assert g._cooldown_gap() == 300, "连续达标：恢复完整冷却"
+    assert g._relief_short_streak == 0
+
+
+def test_cooldown_gap_never_exceeds_user_cooldown():
+    """floor 高于用户 cooldown 也不放大：压缩只减不增，clamp 到 cooldown 以内。"""
+    g = _guard(_state())
+    g.cfg = _cooldown_cfg(cooldown=60, adaptive_cooldown_floor=3600)
+
+    g._note_relief(10, True)
+    assert g._cooldown_gap() == 60
+
+
+def test_cooldown_gap_keeps_user_value_when_disabled():
+    """adaptive_cooldown 关掉：即使有短效记录也不改最小间隔。"""
+    g = _guard(_state())
+    g.cfg = _cooldown_cfg(adaptive_cooldown=False)
+
+    g._note_relief(10, True)
+    assert g._relief_short_streak == 1
+    assert g._cooldown_gap() == 300
+
+
+def test_note_relief_ignores_missing_baseline():
+    """上次清理来自手动/CLI（relief=None）：不判定好坏，冷却不被压缩。"""
+    g = _guard(_state())
+    g.cfg = _cooldown_cfg()
+
+    g._note_relief(None, True)
+    assert g._relief_short_streak == 0
+    assert g._relief_ok_streak == 0
+    assert g._cooldown_gap() == 300
+
+
+def test_scheduled_due_uses_shrunk_gap_after_short_relief():
+    """定时清理也走自适应冷却：短效复发后 user cooldown 内也能提前复查。"""
+    g = _guard(_state())
+    g.cfg = _cooldown_cfg()
+    now = time.time()
+    g.last_scheduled = now - 30 * 60
+    g.last_clean = now - 200
+
+    assert g._scheduled_due(now) is False, "用户冷却 300s 内：仍跳过"
+
+    g._note_relief(200, True)
+    assert g._cooldown_gap() == 150
+    assert g._scheduled_due(now) is True, "压缩后 150s 已过：允许复查"
+
+
+def test_sync_level_seen_rearms_latch_on_manual_switch_back(monkeypatch):
+    """用户手动把档位切回保守：清 level_adapt_done 闩重新武装，只写一次盘。"""
+    changes, logs = [], []
+    monkeypatch.setattr(tray, "update_config",
+                        lambda ch: changes.append(dict(ch)) or
+                        {"clean_level": "conservative", "level_adapt_done": False})
+    monkeypatch.setattr(tray, "log", logs.append)
+    monkeypatch.setattr(tray.os.path, "exists", lambda p: False)
+
+    g = _guard(_state())
+    g.cfg = _adapt_cfg(clean_level="conservative", level_adapt_done=True)
+    g._level_seen = "aggressive"
+
+    assert g._sync_level_seen() is True
+    assert changes == [{"level_adapt_done": False}]
+    assert g.cfg["level_adapt_done"] is False
+    assert g._level_seen == "conservative"
+    assert any("重新武装" in m for m in logs)
+
+    assert g._sync_level_seen() is False, "已回到保守：不再写盘"
+    assert len(changes) == 1
+
+
+def test_sync_level_seen_ignores_other_transitions(monkeypatch):
+    """只有 激进→保守 才重武装：自动切换的过程、闩未落、开关关闭都不动配置。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                        lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+    monkeypatch.setattr(tray.os.path, "exists", lambda p: False)
+
+    g = _guard(_state())
+
+    g.cfg = _adapt_cfg(clean_level="conservative", level_adapt_done=True)
+    g._level_seen = "conservative"
+    assert g._sync_level_seen() is False
+
+    g.cfg = _adapt_cfg(clean_level="aggressive", level_adapt_done=True)
+    g._level_seen = "aggressive"
+    assert g._sync_level_seen() is False, "自动切激进本身不该误判成用户手动切回"
+
+    g.cfg = _adapt_cfg(clean_level="conservative", level_adapt_done=False)
+    g._level_seen = "aggressive"
+    assert g._sync_level_seen() is False, "没自动切过：没有闩可清"
+
+    g.cfg = _adapt_cfg(clean_level="conservative", level_adapt_done=True,
+                       auto_level_adapt=False)
+    g._level_seen = "aggressive"
+    assert g._sync_level_seen() is False, "自调优已关：不重新武装"
+
+    assert changes == []
+
+
+def test_hot_reload_rearms_level_adapt_and_refreshes_mtime(monkeypatch, tmp_path):
+    """热重载链路：外部把档位改回保守即清闩写盘，_cfg_mtime 取写盘后的新值。"""
+    cfg_file = tmp_path / "mem_guard.json"
+    cfg_file.write_text('{"clean_level": "conservative", "level_adapt_done": true}',
+                        encoding="utf-8")
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", str(cfg_file))
+    monkeypatch.setattr(tray, "CONFIG_PATH", str(cfg_file))
+    written = {}
+
+    def _fake_update_config(changes):
+        written.update(changes)
+        # 模拟 update_config 的读-改-写持锁：落盘并把 mtime 推后
+        touched = time.time() + 10
+        os.utime(cfg_file, (touched, touched))
+        return {"clean_level": "conservative", "level_adapt_done": False}
+
+    monkeypatch.setattr(tray, "update_config", _fake_update_config)
+    logs = []
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    guard = Guard()
+    guard.cfg = _adapt_cfg(clean_level="aggressive", level_adapt_done=True)
+    guard._level_seen = "aggressive"
+    t0 = time.time()
+    os.utime(cfg_file, (t0, t0))
+    guard._cfg_mtime = t0 - 5        # 上次看到的 mtime 更早：跑一次热重载
+
+    guard.maybe_reload_config()
+    # 外部把档位改回保守：清闩写盘
+    assert any("重新武装" in m for m in logs)
+    assert written == {"level_adapt_done": False}
+    assert guard._cfg_mtime == os.path.getmtime(str(cfg_file))
+
+    guard.maybe_reload_config()
+    assert logs.count("配置已热重载（来自 mem_guard.json）") == 1, \
+        "_cfg_mtime 已跟上写盘后的 mtime：不该再白重载一次"

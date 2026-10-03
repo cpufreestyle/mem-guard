@@ -103,7 +103,7 @@ def test_menu_toggle_escalate_writes_current_config(monkeypatch):
 
 
 def test_menu_toggle_level_adapt_writes_current_config(monkeypatch):
-    """「保守频繁升档自动改激进」勾选只提交增量 auto_level_adapt，并即时回填。"""
+    """「保守档不给力自动改激进」勾选只提交增量 auto_level_adapt，并即时回填。"""
     merged = []
     monkeypatch.setattr(menu, "update_config",
                         lambda changes: merged.append(dict(changes)) or dict(changes))
@@ -111,7 +111,7 @@ def test_menu_toggle_level_adapt_writes_current_config(monkeypatch):
     guard = _FakeGuard({"auto_level_adapt": True})
     menu_tree = build_menu(guard)
 
-    item = _find_item(menu_tree, "保守频繁升档自动改激进")
+    item = _find_item(menu_tree, "保守档不给力自动改激进")
     assert item.checked is True
     item(guard.icon)
 
@@ -465,3 +465,17 @@ def test_stats_line_shows_preventive_count():
     line = next(i.text for i in build_menu(guard).items
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "预防" not in line
+
+
+def test_stats_line_shows_short_relief_count():
+    """统计行：有效果偏短次数时追加「（短效 N 次）」，没短效过时不出现该字样。"""
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "short_relief": 2}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "累计清理 5 次" in line
+    assert "（短效 2 次）" in line
+
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "短效" not in line

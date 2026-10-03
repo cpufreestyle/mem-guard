@@ -229,3 +229,39 @@ def test_analyze_silent_when_prevention_rare():
     cfg = normalize_config({"stats": {"count": 100, "preventive": 2}})
     items = advisor.analyze(cfg, _mem())
     assert all("预防式清理频繁" not in i["title"] for i in items)
+
+
+# ---------------------------------------------------------------- 清理效果判据（v1.9.0）
+
+
+def test_frequent_short_relief_requires_majority_and_floor():
+    """短效占比过半且至少 3 次才算「频繁」；档位已激进则无上升空间，返回 False。"""
+    base = {"clean_level": "conservative", "stats": {"count": 10, "short_relief": 6}}
+    assert advisor.frequent_short_relief(base) is True
+    fewer = {**base, "stats": {"count": 10, "short_relief": 2}}
+    assert advisor.frequent_short_relief(fewer) is False
+    under_half = {**base, "stats": {"count": 10, "short_relief": 3}}
+    assert advisor.frequent_short_relief(under_half) is False
+    minority = {**base, "stats": {"count": 7, "short_relief": 3}}
+    assert advisor.frequent_short_relief(minority) is False
+    assert advisor.frequent_short_relief({**base, "stats": {"count": 6, "short_relief": 3}}) is True
+    assert advisor.frequent_short_relief({**base, "stats": {}}) is False
+    assert advisor.frequent_short_relief({**base, "clean_level": "aggressive"}) is False
+
+
+def test_analyze_advises_aggressive_when_short_relief_frequent():
+    """清理效果偏短频繁触发：先温和再反复清只是拖延，建议一次清到位。"""
+    cfg = normalize_config({"stats": {"count": 10, "short_relief": 6}})
+    items = advisor.analyze(cfg, _mem())
+    hit = [i for i in items if "清理效果不佳" in i["title"]]
+    assert hit
+    assert hit[0]["action"] == {"label": "改用激进档",
+                                "changes": {"clean_level": "aggressive"}}
+    assert "6" in hit[0]["text"]
+
+
+def test_analyze_silent_when_short_relief_rare():
+    """偶尔短效一次是正常现象（清完内存很快又涨），不该制造配置调整噪音。"""
+    cfg = normalize_config({"stats": {"count": 100, "short_relief": 2}})
+    items = advisor.analyze(cfg, _mem())
+    assert all("清理效果不佳" not in i["title"] for i in items)

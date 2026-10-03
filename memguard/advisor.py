@@ -24,6 +24,8 @@ LEVEL_WARN = "warn"
 LEVEL_TIP = "tip"
 LEVEL_INFO = "info"
 _LEVEL_ORDER = {LEVEL_WARN: 0, LEVEL_TIP: 1, LEVEL_INFO: 2}
+# 激进档被判定为「杀鸡用牛刀」的余量：物理/提交占用距阈值都这么多个百分点以上才算宽裕
+_AGGRESSIVE_SLACK = 20
 
 
 def frequent_escalation(cfg: dict) -> bool:
@@ -56,6 +58,52 @@ def frequent_prevention(cfg: dict) -> bool:
     if clean_cnt <= 0 or prev_cnt < 3 or prev_cnt * 2 < clean_cnt:
         return False
     return str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"
+
+
+def frequent_short_relief(cfg: dict) -> bool:
+    """保守档清理是否「频繁短效」：累计清理里 short_relief 过半且至少 3 次。
+
+    v1.9.0 起 stats.short_relief 记录距上次自动清理不足 effect_min_relief_sec
+    的次数——上次清理没 hold 住、内存压力很快复发。若短效频繁到过半，说明这台
+    机器上保守档每次清完都在短时间内又被顶回去，「先温和」纯属白跑一遍，不如
+    一次清到位。与 frequent_escalation 同源同口径，档位已是激进时返回 False
+    ——没有更大力度的空间可建议。被 tray 的自动改激进（v1.9.0 起自调优第二条
+    判据）与 analyze 的 3b 建议共用，两处必须同源。
+    """
+    st = cfg.get("stats") or {}
+    clean_cnt = int(st.get("count", 0) or 0)
+    srt_cnt = int(st.get("short_relief", 0) or 0)
+    if clean_cnt <= 0 or srt_cnt < 3 or srt_cnt * 2 < clean_cnt:
+        return False
+    return str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"
+
+
+def aggressive_not_needed(cfg: dict, mem: dict | None = None) -> bool:
+    """激进档是否「杀鸡用牛刀」：档位激进但内存长期宽裕，建议切回保守（v1.10.0）。
+
+    与 frequent_escalation 等同源同口径：被 tray 与 analyze 共用，两处必须说一样的话。
+    三条同时满足才劝：档位是激进、物理与提交占用都距阈值 >= _AGGRESSIVE_SLACK 个百分点，
+    且 min_avail_mb 关闭或可用物理仍高于其下限。采样缺失一律 False——宁可闭嘴也别瞎劝。
+    mem 省略时才现场取一次采样。
+    """
+    if str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive":
+        return False
+    try:
+        m = mem if mem is not None else get_mem()
+    except Exception:
+        return False
+    if not isinstance(m, dict) or "phys_pct" not in m:
+        return False
+    phys_pct = m.get("phys_pct", 0)
+    commit_pct = m.get("commit_pct", 0)
+    if int(cfg.get("phys_threshold", 85)) - phys_pct < _AGGRESSIVE_SLACK:
+        return False
+    if int(cfg.get("commit_threshold", 90)) - commit_pct < _AGGRESSIVE_SLACK:
+        return False
+    min_avail = int(cfg.get("min_avail_mb", 0) or 0)
+    if min_avail and m.get("avail_phys", 0) < min_avail * 1024 * 1024:
+        return False
+    return True
 
 
 def advice_actions(items: list) -> list:
@@ -194,6 +242,28 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list
                      f"预防式清理只是把触发点往前挪，内存仍在持续上涨；建议把「清理力度」改为激进，"
                      f"一次清到位（建议窗口可一键应用）。"),
             "action": {"label": "改用激进档", "changes": {"clean_level": "aggressive"}},
+        })
+    srt_cnt = int(st.get("short_relief", 0) or 0)
+    if frequent_short_relief(cfg):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "保守清理效果不佳，建议直接改用激进",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {srt_cnt} 次距上次自动清理不足 "
+                     f"效果下限（效果偏短）——上次清完没多久内存又被顶回去。"
+                     f"「先温和再彻底」在这台机器上只是拖延，建议把「清理力度」改为激进，"
+                     f"一次清到位（建议窗口可一键应用）。"),
+            "action": {"label": "改用激进档", "changes": {"clean_level": "aggressive"}},
+        })
+    # ---- 3c. 反向建议（v1.10.0）：激进档杀鸡用牛刀，内存宽裕时劝退 ----
+    if aggressive_not_needed(cfg, s):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "激进档但内存长期宽裕，建议切回保守",
+            "text": (f"当前物理 {phys_pct:.0f}% / 提交 {commit_pct:.0f}%，距阈值都有 "
+                     f"{_AGGRESSIVE_SLACK} 个百分点以上的余量。激进档每次都要清空各进程"
+                     f"工作集，前台程序下次访问得重新读盘、可能卡顿；内存长期宽裕时保守"
+                     f"档已够用，建议切回保守（建议窗口可一键应用）。"),
+            "action": {"label": "切回保守档", "changes": {"clean_level": "conservative"}},
         })
     if not cfg.get("escalate_clean", True) and phys_pct >= cfg.get("phys_threshold", 85):
         items.append({

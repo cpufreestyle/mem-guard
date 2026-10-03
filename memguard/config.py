@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.8.0"
+__version__ = "1.10.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -44,6 +44,12 @@ DEFAULT_CONFIG = {
     # ---- 档位自调优（v1.6.0）：保守档频繁升档说明「先温和再彻底」白跑一遍，自动改激进 ----
     "auto_level_adapt": True,  # 累计清理中 escalated 过半且≥3 次时，自动把清理力度切为激进（一次性）
     "level_adapt_done": False, # 已自动切过激进的闩：挡住重复覆盖，用户手动切回保守也不再自动评估
+    # ---- 清理效果闭环（v1.9.0）：度量「距上次自动清理多久」，短效=没 hold 住 ----
+    "effect_track": True,     # 开：自动清理时度量与上次自动清理的间隔，偏短则累计 short_relief 并提示
+    "effect_min_relief_sec": 600,  # 与上次自动清理间隔小于该秒数视为「效果偏短」（清理压力很快复发）
+    # ---- 自适应冷却（v1.10.0）：短效复发时允许更快复查，连续 hold 住后恢复用户值 ----
+    "adaptive_cooldown": True,   # 开：短效复发后把下次最小间隔压到 max(cooldown*factor, floor)，连续达标恢复 cooldown
+    "adaptive_cooldown_floor": 30,  # 压缩后的最小间隔下限(秒)，clamp 5..3600；压缩只减不增，永不高于用户 cooldown
     "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
     # conservative=仅清 standby list/修改页/文件缓存（温和，对前台几乎无影响，默认）
     # aggressive  =额外清空各进程工作集（释放更多，但前台程序下次访问需重新读盘，可能卡顿）
@@ -144,6 +150,13 @@ def normalize_config(raw) -> dict:
         cfg.get("predict_window_min"), 1, 60, DEFAULT_CONFIG["predict_window_min"])
     cfg["auto_level_adapt"] = bool(cfg.get("auto_level_adapt", True))
     cfg["level_adapt_done"] = bool(cfg.get("level_adapt_done", False))
+    cfg["effect_track"] = bool(cfg.get("effect_track", True))
+    cfg["effect_min_relief_sec"] = _clamp_int(
+        cfg.get("effect_min_relief_sec"), 60, 86400, DEFAULT_CONFIG["effect_min_relief_sec"])
+    cfg["adaptive_cooldown"] = bool(cfg.get("adaptive_cooldown", True))
+    cfg["adaptive_cooldown_floor"] = _clamp_int(
+        cfg.get("adaptive_cooldown_floor"), 5, 3600,
+        DEFAULT_CONFIG["adaptive_cooldown_floor"])
     cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
@@ -185,6 +198,10 @@ def normalize_config(raw) -> dict:
     # preventive（趋势预防式清理次数）口径同上：非 0 才落键，没预防过的配置保持原形状
     if raw_stats.get("preventive"):
         cfg["stats"]["preventive"] = _clamp_int(raw_stats.get("preventive"), 0, 10 ** 9, 0)
+    # short_relief（清理效果偏短次数）口径同上：距上次自动清理不足 effect_min_relief_sec
+    # 说明上次清理没 hold 住、内存压力很快复发，非 0 才落键保持干净配置原形状
+    if raw_stats.get("short_relief"):
+        cfg["stats"]["short_relief"] = _clamp_int(raw_stats.get("short_relief"), 0, 10 ** 9, 0)
     return cfg
 
 

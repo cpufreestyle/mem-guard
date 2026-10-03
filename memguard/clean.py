@@ -70,7 +70,7 @@ def _wait_avail_rise(before: dict) -> dict:
 
 
 def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
-                preventive: bool = False) -> dict:
+                preventive: bool = False, short_relief: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -82,6 +82,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
     精确清大户的触发频次。
     preventive=True 时同步累计「趋势预防式清理次数」：v1.8.0 起按上升斜率
     提前清理的触发频次（normalize_config 只持久化非 0 值）。
+    short_relief=True 时同步累计「清理效果偏短次数」：v1.9.0 起距上次自动清理
+    不足 effect_min_relief_sec 说明上次清理没 hold 住、压力很快复发（口径同上）。
     """
     with _CONFIG_LOCK:
         cfg = load_config()
@@ -94,6 +96,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
             st["targeted"] = int(st.get("targeted", 0)) + 1
         if preventive:
             st["preventive"] = int(st.get("preventive", 0)) + 1
+        if short_relief:
+            st["short_relief"] = int(st.get("short_relief", 0)) + 1
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
@@ -267,7 +271,7 @@ def predictive_due(history, cfg: dict):
 
 
 def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None,
-            preventive: bool = False) -> dict:
+            preventive: bool = False, low_relief: bool = False) -> dict:
     """执行一次清理，返回结果统计（特权在返回前恢复，用完即关）。
 
     level: "conservative"（默认，只清 standby/修改页/文件缓存）或
@@ -276,6 +280,9 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     全部核心区域被关闭时不会误报失败。清理成功后更新累计统计（stats）并持久化。
     preventive=True 表示本次由「趋势预防式清理」触发（v1.8.0）：只多累计一个
     stats.preventive 计数供统计行与建议引擎使用，清理动作本身完全一样。
+    low_relief=True 表示本次距上次自动清理不足 effect_min_relief_sec（v1.9.0
+    效果闭环）：只多累计一个 stats.short_relief 计数供统计行、通知与 advisor
+    自调优使用，清理动作本身完全一样。
     """
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
@@ -356,7 +363,8 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     }
     # 累计统计：只统计真正成功的清理，随配置持久化；写盘失败不影响本次清理结果
     try:
-        result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive)
+        result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive,
+                                     low_relief)
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

@@ -310,3 +310,33 @@ def test_normalize_config_stats_preventive_roundtrip():
     assert zero["stats"] == {"count": 3, "freed": 100}
     plain = normalize_config({"stats": {"count": 3, "freed": 100}})
     assert plain["stats"] == {"count": 3, "freed": 100}
+
+
+def test_default_config_effect_track_keys_present():
+    """清理效果闭环（v1.9.0）两个键必须有默认值，否则老配置行为漂移。"""
+    for key in ("effect_track", "effect_min_relief_sec"):
+        assert key in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["effect_track"] is True
+    assert d["effect_min_relief_sec"] == 600
+
+
+def test_normalize_config_effect_track_coercion_and_clamp():
+    """开关 bool 强转；效果下限钳在 [60, 86400] 秒，脏值回落默认。"""
+    assert normalize_config({"effect_track": 0})["effect_track"] is False
+    assert normalize_config({"effect_track": 1})["effect_track"] is True
+    assert normalize_config({"effect_min_relief_sec": 0})["effect_min_relief_sec"] == 60
+    assert normalize_config({"effect_min_relief_sec": -3})["effect_min_relief_sec"] == 60
+    assert normalize_config({"effect_min_relief_sec": 999999})["effect_min_relief_sec"] == 86400
+    assert normalize_config({"effect_min_relief_sec": "abc"})["effect_min_relief_sec"] == 600
+    assert normalize_config({"effect_min_relief_sec": None})["effect_min_relief_sec"] == 600
+
+
+def test_normalize_config_stats_short_relief_roundtrip():
+    """短效计数只持久化非 0 值：0/缺失都不落键，统计行按有无决定显示。"""
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "short_relief": 2}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "short_relief": 2}
+    zero = normalize_config({"stats": {"count": 3, "freed": 100, "short_relief": 0}})
+    assert zero["stats"] == {"count": 3, "freed": 100}
+    plain = normalize_config({"stats": {"count": 3, "freed": 100}})
+    assert plain["stats"] == {"count": 3, "freed": 100}

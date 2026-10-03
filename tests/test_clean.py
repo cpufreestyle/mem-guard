@@ -284,7 +284,8 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
             return wait_after
     monkeypatch.setattr(clean, "_wait_avail_rise", _wait)
     monkeypatch.setattr(clean, "_bump_stats",
-                        lambda freed, escalated=False, targeted=False, preventive=False:
+                        lambda freed, escalated=False, targeted=False, preventive=False,
+                        short_relief=False:
                             {"count": 9, "freed": freed})
     monkeypatch.setattr(clean, "log", lambda msg: None)   # 别往真实日志文件里写测试噪声
 
@@ -458,7 +459,8 @@ def test_do_clean_escalation_feeds_stats_counter(monkeypatch):
     _admin_env(monkeypatch, wait_after=wait_after)
     monkeypatch.setattr(
         clean, "_bump_stats",
-        lambda freed, escalated=False, targeted=False, preventive=False:
+        lambda freed, escalated=False, targeted=False, preventive=False,
+               short_relief=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -474,7 +476,8 @@ def test_do_clean_no_escalation_feeds_stats_counter(monkeypatch):
     _admin_env(monkeypatch, wait_after=wait_after)
     monkeypatch.setattr(
         clean, "_bump_stats",
-        lambda freed, escalated=False, targeted=False, preventive=False:
+        lambda freed, escalated=False, targeted=False, preventive=False,
+               short_relief=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -596,7 +599,8 @@ def test_do_clean_target_feeds_stats_counter(monkeypatch):
     ]
     seen = []
 
-    def _fake_bump(freed, escalated=False, targeted=False, preventive=False):
+    def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
+                   short_relief=False):
         seen.append(targeted)
         return {"count": 9, "freed": freed}
 
@@ -815,13 +819,44 @@ def test_do_clean_passes_preventive_to_stats(monkeypatch):
     """preventive=True 要一路透传到 _bump_stats：统计行和自调优建议都靠它。"""
     seen = []
 
-    def _fake_bump(freed, escalated=False, targeted=False, preventive=False):
+    def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
+                   short_relief=False):
         seen.append(preventive)
         return {"count": 9, "freed": freed}
 
     _admin_env(monkeypatch)
     monkeypatch.setattr(clean, "_bump_stats", _fake_bump)
     r = clean.do_clean("预防式", preventive=True)
+
+    assert r["ok"] is True
+    assert seen == [True]
+
+
+# ---------------------------------------------------------------- 清理效果闭环（v1.9.0）
+
+
+def test_bump_stats_counts_short_relief(monkeypatch, tmp_path):
+    """short_relief 只在传入 True 时累计；一次都没短效过的配置不落这个键。"""
+    cfg_file = tmp_path / "mem_guard.json"
+    cfg_file.write_text(json.dumps({"stats": {"count": 1, "freed": 0}}), encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    assert clean._bump_stats(10, short_relief=True)["short_relief"] == 1
+    assert clean._bump_stats(10)["short_relief"] == 1, "没短效过不能凭空累计"
+
+
+def test_do_clean_passes_low_relief_to_stats(monkeypatch):
+    """low_relief=True 要一路透传到 _bump_stats：统计行和自调优建议都靠它。"""
+    seen = []
+
+    def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
+                   short_relief=False):
+        seen.append(short_relief)
+        return {"count": 9, "freed": freed}
+
+    _admin_env(monkeypatch)
+    monkeypatch.setattr(clean, "_bump_stats", _fake_bump)
+    r = clean.do_clean("短效", low_relief=True)
 
     assert r["ok"] is True
     assert seen == [True]
