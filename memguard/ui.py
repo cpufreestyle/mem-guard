@@ -15,9 +15,9 @@ import threading
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .advisor import analyze, format_advice
+from .advisor import advice_actions, analyze, format_advice
 from .clean import top_processes, top_processes_list
-from .config import gb
+from .config import gb, log, update_config
 from .winapi import (SM_CXSMICON, get_mem, icon_handle, set_window_class_icons,
                      toplevel_hwnd, user32)
 
@@ -628,12 +628,39 @@ def _build_trend(tk, history_getter) -> None:
     root.mainloop()
 
 
-def show_advice_window(cfg: dict) -> None:
-    """弹出可刷新的优化建议窗口；无 tkinter 时回退到 MessageBox。"""
+def apply_advice_actions(items: list, apply_fn) -> list:
+    """把建议里带的 action 依次交给 apply_fn（一般是 config.update_config）。
+
+    返回成功应用的动作列表：单条失败只跳过该条、不连带其余建议——「应用建议」是
+    顺手功能，绝不能因为某一条写不进去，就把其余项也一起废掉。
+    """
+    done: list = []
+    for act in advice_actions(items):
+        changes = dict(act.get("changes") or {})
+        if not changes:
+            continue
+        try:
+            apply_fn(changes)
+        except Exception:
+            continue
+        done.append(act)
+    return done
+
+
+def show_advice_window(cfg) -> None:
+    """弹出可刷新的优化建议窗口；无 tkinter 时回退到 MessageBox。
+
+    cfg 既可以是配置 dict，也可以是返回 dict 的 callable（托盘传后者）：一键应用
+    会写配置并让 guard.cfg 换成新 dict，传 callable 才能让「刷新」读到最新配置，
+    否则窗口里看到的永远是开窗那一刻的旧快照。
+    """
     global _advice_window_open
     if _advice_window_open:
         return
     _advice_window_open = True
+
+    def current_cfg() -> dict:
+        return cfg() if callable(cfg) else cfg
 
     def worker() -> None:
         global _advice_window_open
@@ -641,7 +668,7 @@ def show_advice_window(cfg: dict) -> None:
             import tkinter as tk
         except Exception:
             _advice_window_open = False
-            message_box("MemGuard - 优化建议", format_advice(analyze(cfg)))
+            message_box("MemGuard - 优化建议", format_advice(analyze(current_cfg())))
             return
         try:
             root = tk.Tk()
@@ -660,17 +687,50 @@ def show_advice_window(cfg: dict) -> None:
                 body.tag_config(lvl, foreground=color,
                                 font=("Microsoft YaHei UI", 10, "bold"))
 
+            bar = tk.Frame(root)
+            bar.pack(fill="x", pady=4)
+
+            def apply_one(act: dict):
+                def run() -> None:
+                    try:
+                        update_config(dict(act.get("changes") or {}))
+                    except Exception as e:
+                        message_box("MemGuard - 应用建议", f"应用失败：{e!r}")
+                        return
+                    log(f"优化建议一键应用 | {act.get('label', '应用')} -> "
+                        f"{act.get('changes') or {}}")
+                    refresh()
+                return run
+
+            def apply_all() -> None:
+                done = apply_advice_actions(analyze(current_cfg()), update_config)
+                if done:
+                    log("优化建议一键应用 | 全部 " +
+                        "、".join(str(a.get("label", "应用")) for a in done))
+                refresh()
+
             def refresh() -> None:
-                items = analyze(cfg)
+                items = analyze(current_cfg())
                 body.delete("1.0", "end")
                 if not items:
                     body.insert("end", "未发现明显可优化项，当前配置与内存状态良好。")
-                    return
-                for it in items:
-                    lvl = it["level"]
-                    body.insert("end", f"[{LEVEL_TAGS.get(lvl, '·')}] ", lvl)
-                    body.insert("end", f"{it['title']}\n", lvl)
-                    body.insert("end", "    " + it["text"] + "\n\n")
+                else:
+                    for it in items:
+                        lvl = it["level"]
+                        body.insert("end", f"[{LEVEL_TAGS.get(lvl, '·')}] ", lvl)
+                        body.insert("end", f"{it['title']}\n", lvl)
+                        body.insert("end", "    " + it["text"] + "\n\n")
+                for w in bar.winfo_children():
+                    w.destroy()
+                acts = advice_actions(items)
+                if acts:
+                    tk.Label(bar, text="一键应用：").pack(side="left", padx=(10, 4))
+                    for act in acts:
+                        tk.Button(bar, text=act["label"], width=13,
+                                  command=apply_one(act)).pack(side="left", padx=3)
+                    if len(acts) > 1:
+                        tk.Button(bar, text="全部应用", width=9,
+                                  command=apply_all).pack(side="left", padx=3)
 
             tk.Button(root, text="刷新", width=12, command=refresh).pack(pady=8)
             refresh()

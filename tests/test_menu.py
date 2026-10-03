@@ -27,6 +27,7 @@ class _FakeGuard:
             "avail_commit": 16 * 1024 ** 3,
         }
         self.advice_count = 3
+        self.advice_apply_count = 1
         self.history = []
         self.icon = None
         self.stop = threading.Event()
@@ -41,6 +42,14 @@ def _find_item(menu_tree, label):
         if item.text == label:
             return item
     raise AssertionError(f"菜单里找不到「{label}」")
+
+
+def _find_item_by_text(menu_tree, needle):
+    """按文案片段取菜单项：动态文案项会先求值，故只能按包含关系找。"""
+    for item in menu_tree.items:
+        if needle in str(item.text):
+            return item
+    raise AssertionError(f"菜单里找不到含「{needle}」的菜单项")
 
 
 def test_build_menu_returns_menu():
@@ -91,6 +100,40 @@ def test_menu_toggle_escalate_writes_current_config(monkeypatch):
 
     assert merged == [{"escalate_clean": False}], "只提交本次勾选，不带旧快照里的其它字段"
     assert guard.cfg["escalate_clean"] is False, "合并结果要立刻回填，勾选态实时生效"
+
+
+def test_menu_toggle_level_adapt_writes_current_config(monkeypatch):
+    """「保守频繁升档自动改激进」勾选只提交增量 auto_level_adapt，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"auto_level_adapt": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "保守频繁升档自动改激进")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"auto_level_adapt": False}], "只提交本次勾选，不带旧快照里的其它字段"
+    assert guard.cfg["auto_level_adapt"] is False, "合并结果要立刻回填，勾选态实时生效"
+
+
+def test_menu_toggle_target_clean_writes_current_config(monkeypatch):
+    """「定向清理内存大户」勾选只提交增量 target_clean，并即时回填（读写当前配置）。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"target_clean": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "定向清理内存大户")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"target_clean": False}], "只提交本次勾选，不带旧快照里的其它字段"
+    assert guard.cfg["target_clean"] is False, "合并结果要立刻回填，勾选态实时生效"
 
 
 def test_menu_checked_reads_live_config(monkeypatch):
@@ -231,6 +274,20 @@ def test_stats_line_shows_escalation_count():
     assert "升档" not in line
 
 
+def test_stats_line_shows_targeted_count():
+    """统计行：有定向清理次数时追加「（定向 N 次）」，没定向过时不出现该字样。"""
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "targeted": 2}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "累计清理 5 次" in line
+    assert "（定向 2 次）" in line
+
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "定向" not in line
+
+
 # ---------------------------------------------------------------- 立即清理回显（v1.5.1）
 
 class _FakeIcon:
@@ -267,3 +324,144 @@ def test_clean_now_notify_marks_escalation(monkeypatch):
     _, body = icon.messages[0]
     assert "自动升档" in body
     assert "激进" in body
+    assert "定向清理大户" not in body, "没定向过的结果不能出现定向字样（老结果没这个键）"
+
+
+def test_clean_now_notify_marks_targeted(monkeypatch):
+    """手动清理精确清过大户：通知要单列「定向清理大户」段，与托盘自动清理同口径。"""
+    def _fake_do_clean(reason="手动"):
+        return {
+            "ok": True,
+            "freed": 3 * 1024 ** 3,
+            "level": "conservative",
+            "escalated": False,
+            "targeted": [("big.exe", 2 * 1024 ** 3, 4242)],
+            "detail": "-",
+            "stats": {"count": 12},
+            "before": {"avail_phys": 4 * 1024 ** 3, "commit_pct": 70.0},
+            "after": {"avail_phys": 7 * 1024 ** 3, "commit_pct": 60.0},
+        }
+
+    monkeypatch.setattr(menu, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
+
+    icon = _FakeIcon()
+    guard = _FakeGuard()
+    _find_item(build_menu(guard), "立即清理")(icon)
+
+    _, body = icon.messages[0]
+    assert "定向清理大户" in body
+    assert "big.exe" in body
+    assert "自动升档" not in body
+
+
+# ------------------------------------------------ 一键应用优化建议（v1.6.0 增量）
+
+def test_menu_one_click_apply_writes_increment_and_logs(monkeypatch):
+    """托盘一键应用：逐条增量写配置、即时回填、只记日志不弹气泡。"""
+    merged, logged = [], []
+    monkeypatch.setattr(menu, "log", logged.append)
+    monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(menu, "analyze", lambda cfg, mem=None, top=None: [
+        {"title": "自动清理已关闭",
+         "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
+        {"title": "预警未开启",
+         "action": {"label": "开启预警(15%)", "changes": dict(warn_margin=15)}},
+        {"title": "未以管理员身份运行"},
+    ])
+
+    guard = _FakeGuard({"auto_clean": False, "warn_margin": 0})
+    guard.advice_apply_count = 2
+
+    def _fake_update(changes):
+        merged.append(dict(changes))
+        guard.cfg.update(changes)
+        return dict(guard.cfg)
+
+    monkeypatch.setattr(menu, "update_config", _fake_update)
+
+    item = _find_item_by_text(build_menu(guard), "一键应用优化建议")
+    assert item.enabled is True, "有可应用项时菜单项必须可点"
+    item(guard.icon)
+
+    assert merged == [dict(auto_clean=True), dict(warn_margin=15)], "只提交本次改动"
+    assert guard.cfg["auto_clean"] is True and guard.cfg["warn_margin"] == 15, "要即时回填"
+    assert guard.advice_apply_count == 0, "可应用计数清零，菜单项翻成「0 项」并置灰"
+    assert guard.advice_count == 1, "总数只扣掉本次落地的那几条，精确值交给后台刷新"
+    assert any("优化建议一键应用 | " in m and "开启自动清理" in m for m in logged)
+
+
+def test_menu_apply_advice_disabled_without_actionable_items(monkeypatch):
+    """建议全是提示级（没带 action）时一键应用项应置灰：点了没反应比没有更糟。"""
+    monkeypatch.setattr(menu, "analyze", lambda cfg, mem=None, top=None: [
+        {"title": "未以管理员身份运行"}, {"title": "内存充裕"}])
+
+    guard = _FakeGuard()
+    guard.advice_apply_count = 0
+    item = _find_item_by_text(build_menu(guard), "一键应用优化建议")
+
+    assert "0 项" in str(item.text)
+    assert item.enabled is False
+
+
+def test_menu_apply_advice_skips_failing_single_action(monkeypatch):
+    """单条写配置失败只跳过该条：其余建议照样落地，绝不一损俱损。"""
+    merged, logged = [], []
+    monkeypatch.setattr(menu, "log", logged.append)
+    monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(menu, "analyze", lambda cfg, mem=None, top=None: [
+        {"title": "自动清理已关闭",
+         "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
+        {"title": "预警未开启",
+         "action": {"label": "开启预警(15%)", "changes": dict(warn_margin=15)}},
+    ])
+
+    guard = _FakeGuard({"auto_clean": False, "warn_margin": 0})
+    guard.advice_apply_count = 2
+
+    def _fake_update(changes):
+        if "warn_margin" in changes:
+            raise OSError("disk gone")
+        merged.append(dict(changes))
+        guard.cfg.update(changes)
+        return dict(guard.cfg)
+
+    monkeypatch.setattr(menu, "update_config", _fake_update)
+
+    item = _find_item_by_text(build_menu(guard), "一键应用优化建议")
+    item(guard.icon)
+
+    assert merged == [dict(auto_clean=True)], "失败那条被跳过，成功那条照写"
+    assert guard.advice_apply_count == 1, "计数只减成功的条数"
+    assert any("优化建议一键应用 | " in m for m in logged)
+
+
+def test_menu_toggle_predict_clean_writes_current_config(monkeypatch):
+    """「趋势预防式清理」勾选只提交增量 predict_clean，并即时回填（v1.8.0）。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"predict_clean": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "趋势预防式清理")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"predict_clean": False}], "只提交本次勾选，不带旧快照里的其它字段"
+    assert guard.cfg["predict_clean"] is False, "合并结果要立刻回填，勾选态实时生效"
+
+
+def test_stats_line_shows_preventive_count():
+    """统计行：有预防次数时追加「（预防 N 次）」，没预防过时不出现该字样。"""
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "preventive": 2}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "累计清理 5 次" in line
+    assert "（预防 2 次）" in line
+
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "预防" not in line

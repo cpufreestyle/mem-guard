@@ -17,6 +17,7 @@ import psutil
 from .actions import (
     clear_system_file_cache,
     empty_process_working_sets,
+    empty_selected_working_sets,
     flush_modified_list,
     purge_low_priority_standby,
     purge_standby_list,
@@ -28,6 +29,12 @@ from .winapi import get_mem, is_admin, process_working_sets
 
 # 快路径句柄被拒的进程数超过该上限就不再用 psutil 补齐（见 top_processes_list）
 _FILL_MAX = 24
+
+# 趋势预防式清理（v1.8.0）：按历史采样拟合斜率，预判多久后触及阈值
+_PREDICT_MIN_SAMPLES = 6      # 至少这么多个采样点才谈「趋势」，刚启动的噪声不作数
+_PREDICT_MIN_SPAN = 60.0      # 采样至少要覆盖这么长时间(秒)，否则一分钟的抖动也叫趋势
+_PREDICT_MAX_SAMPLES = 60     # 最多回看这么多个点（默认 10s 间隔约等于 10 分钟）
+_PREDICT_MIN_SLOPE = 0.02     # 最小有效斜率(%/秒，即 1.2%/分钟)：低于它视为平稳
 
 
 def _status(rc: int) -> str:
@@ -62,7 +69,8 @@ def _wait_avail_rise(before: dict) -> dict:
     return after
 
 
-def _bump_stats(freed: int, escalated: bool = False) -> dict:
+def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
+                preventive: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -70,6 +78,10 @@ def _bump_stats(freed: int, escalated: bool = False) -> dict:
 
     escalated=True 时同步累计「自动升档次数」，用于统计行展示保守清理不达
     标后补激进清理的触发频次（normalize_config 只持久化非 0 值）。
+    targeted=True 时同步累计「定向清理次数」，用于统计行展示保守清理后
+    精确清大户的触发频次。
+    preventive=True 时同步累计「趋势预防式清理次数」：v1.8.0 起按上升斜率
+    提前清理的触发频次（normalize_config 只持久化非 0 值）。
     """
     with _CONFIG_LOCK:
         cfg = load_config()
@@ -78,6 +90,10 @@ def _bump_stats(freed: int, escalated: bool = False) -> dict:
         st["freed"] = int(st.get("freed", 0)) + max(freed, 0)
         if escalated:
             st["escalated"] = int(st.get("escalated", 0)) + 1
+        if targeted:
+            st["targeted"] = int(st.get("targeted", 0)) + 1
+        if preventive:
+            st["preventive"] = int(st.get("preventive", 0)) + 1
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
@@ -161,13 +177,105 @@ def _still_pressured(m: dict, cfg: dict) -> bool:
     return False
 
 
-def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None) -> dict:
+def _target_clean_candidates(rows, cfg) -> list:
+    """从 Top 进程采样里挑出「工作集大户」：≥ target_clean_min_mb，取前 target_clean_top 个。
+
+    rows 是 top_processes_list 的返回 [(name, rss_bytes, pid), ...]（已按工作集降序）；
+    开关关闭或阈值/条数 ≤0 时返回 []（不打扰）。纯函数，便于单测。
+    """
+    if not cfg.get("target_clean", True):
+        return []
+    min_bytes = int(cfg.get("target_clean_min_mb") or 0) * 1024 * 1024
+    top = int(cfg.get("target_clean_top") or 0)
+    if min_bytes <= 0 or top <= 0:
+        return []
+    out = []
+    for row in rows or []:
+        try:
+            name, rss, pid = row
+        except (TypeError, ValueError):
+            continue
+        if int(rss) >= min_bytes:
+            out.append((name, rss, pid))
+        if len(out) >= top:
+            break
+    return out
+
+
+def _run_target_clean(cands, blacklist) -> tuple:
+    """在特权窗口内只清空候选大户的工作集，返回 (已清理数, 跳过数)。"""
+    with clean_privileges():
+        return empty_selected_working_sets([pid for _, _, pid in cands], blacklist)
+
+
+def _slope_per_sec(samples, idx: int) -> float:
+    """最小二乘拟合 samples 第 idx 列随时钟(第 0 列，epoch 秒)的斜率，单位/秒。
+
+    采样点至少 2 个、且时间戳不能全相同（sxx<=0 时无斜率可言）。"""
+    n = len(samples)
+    if n < 2:
+        return 0.0
+    t0 = samples[0][0]
+    xs = [row[0] - t0 for row in samples]
+    ys = [float(row[idx]) for row in samples]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return 0.0
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return sxy / sxx
+
+
+def predictive_due(history, cfg: dict):
+    """趋势预防判定：预计窗口内触及阈值就返回触阈倒计时，否则 None（纯函数）。
+
+    history 是 (t, phys_pct, commit_pct) 采样列表（新在后，即 Guard.history）；
+    cfg 读 predict_clean / predict_window_min / 两个阈值。采样不足、跨度太短、
+    读数为平稳(斜率低于 _PREDICT_MIN_SLOPE)、已越线(那是超阈值清理的活)、
+    或预计触阈时间超出窗口，一律 None——任何一条不满足都不该提前打扰。
+    返回 {"eta": 秒, "slope_pm": %/分钟, "metric": "物理"|"提交"}，eta 取两者较小。
+    """
+    if not cfg.get("predict_clean", True):
+        return None
+    samples = list(history or [])[-_PREDICT_MAX_SAMPLES:]
+    if len(samples) < _PREDICT_MIN_SAMPLES:
+        return None
+    if samples[-1][0] - samples[0][0] < _PREDICT_MIN_SPAN:
+        return None
+    try:
+        window = float(int(cfg.get("predict_window_min", 5) or 0)) * 60.0
+    except (TypeError, ValueError):
+        return None
+    if window <= 0:
+        return None
+    best = None
+    for idx, threshold, metric in ((1, cfg.get("phys_threshold"), "物理"),
+                                   (2, cfg.get("commit_threshold"), "提交")):
+        if threshold is None:
+            continue
+        slope = _slope_per_sec(samples, idx)
+        if slope < _PREDICT_MIN_SLOPE:
+            continue    # 涨得太慢：交给预警气泡和超阈值清理，别提前动
+        now_pct = float(samples[-1][idx])
+        if now_pct >= threshold:
+            continue    # 已经越线：预防不抢超阈值触发源的活
+        eta = (threshold - now_pct) / slope
+        if eta <= window and (best is None or eta < best["eta"]):
+            best = {"eta": eta, "slope_pm": slope * 60.0, "metric": metric}
+    return best
+
+
+def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None,
+            preventive: bool = False) -> dict:
     """执行一次清理，返回结果统计（特权在返回前恢复，用完即关）。
 
     level: "conservative"（默认，只清 standby/修改页/文件缓存）或
     "aggressive"（在此基础上额外清空各进程工作集）；None 时读取配置里的 clean_level。
     具体清理哪些区域由配置 clean_areas 控制（对标 WinMemoryCleaner 的勾选项）；
     全部核心区域被关闭时不会误报失败。清理成功后更新累计统计（stats）并持久化。
+    preventive=True 表示本次由「趋势预防式清理」触发（v1.8.0）：只多累计一个
+    stats.preventive 计数供统计行与建议引擎使用，清理动作本身完全一样。
     """
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
@@ -192,6 +300,28 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
 
     after = _wait_avail_rise(before)
     escalated = False
+    targeted = []
+
+    # 定向清理（v1.7.0 阶梯第一级）：保守清理后仍超阈值时，先只对工作集最大的几个
+    # 进程精确清空——比直接全量升档的打扰小；仍不达标才轮到升档的「全清」
+    if (not aggressive and bool(cfg.get("target_clean", True))
+            and _still_pressured(after, cfg)):
+        cands = []
+        try:
+            cands = _target_clean_candidates(top_processes_list(15), cfg)
+        except Exception:
+            cands = []
+        if cands:
+            n, skipped = _run_target_clean(cands, bl)
+            names = "、".join(f"{name} {gb(rss)}" for name, rss, _ in cands)
+            if n:
+                # 采纳定向：再等一次把回补计入，供下面的升档判断复用最新 after
+                after = _wait_avail_rise(after)
+                targeted = list(cands)
+                detail.append(f"定向清理大户({names}): {n} 个"
+                              + (f"（跳过 {skipped}）" if skipped else ""))
+            else:
+                detail.append(f"定向清理大户({names}): 未成功")
 
     # 自动升档：保守清理后若仍超阈值，立即补一次激进清理（最多一次、带开关、最小打扰）
     if (not aggressive and bool(cfg.get("escalate_clean", True))
@@ -221,11 +351,12 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         "after": after,
         "level": lvl,
         "escalated": escalated,
+        "targeted": targeted,
         "detail": ", ".join(detail),
     }
     # 累计统计：只统计真正成功的清理，随配置持久化；写盘失败不影响本次清理结果
     try:
-        result["stats"] = _bump_stats(freed, escalated)
+        result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive)
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

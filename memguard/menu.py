@@ -12,11 +12,13 @@ import threading
 
 import pystray
 
+from .advisor import analyze
 from .autostart import autostart_enabled, install_autostart, remove_autostart
 from .clean import do_clean, top_processes_list
 from .config import LOG_PATH, __version__, gb, log, update_config
 from .diag import export_diagnostics
-from .ui import show_advice_window, show_top_window, show_trend_window
+from .ui import (apply_advice_actions, show_advice_window, show_top_window,
+                show_trend_window)
 from .update import fetch_latest_release, install_latest
 from .winapi import is_admin
 
@@ -52,9 +54,14 @@ def build_menu(guard) -> pystray.Menu:
             lvl_txt += "（自动升档）"
         top3 = top_processes_list(3)
         top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
+        tgt = r.get("targeted") or []
+        tgt_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in tgt)
+        body = (f"释放 {gb(freed)}  可用物理 {gb(r['after']['avail_phys'])}（{lvl_txt}档）\n"
+                f"当前占用 Top3:\n{top_txt}")
+        if tgt:
+            body += f"\n定向清理大户:\n{tgt_txt}"
         icon.notify(
-            f"释放 {gb(freed)}  可用物理 {gb(r['after']['avail_phys'])}（{lvl_txt}档）\n"
-            f"当前占用 Top3:\n{top_txt}",
+            body,
             "MemGuard 清理完成",
         )
         guard.refresh()
@@ -161,11 +168,30 @@ def build_menu(guard) -> pystray.Menu:
             {"escalate_clean": not bool(guard.cfg.get("escalate_clean", True))})
         log(f"清理未达标自动升档 -> {'开' if guard.cfg['escalate_clean'] else '关'}")
 
+    def on_toggle_target_clean(icon, item) -> None:
+        guard.cfg = update_config(
+            {"target_clean": not bool(guard.cfg.get("target_clean", True))})
+        log(f"定向清理内存大户 -> {'开' if guard.cfg['target_clean'] else '关'}")
+
+    def on_toggle_level_adapt(icon, item) -> None:
+        guard.cfg = update_config(
+            {"auto_level_adapt": not bool(guard.cfg.get("auto_level_adapt", True))})
+        log(f"保守频繁升档自动改激进 -> {'开' if guard.cfg['auto_level_adapt'] else '关'}")
+
+    def on_toggle_predict_clean(icon, item) -> None:
+        guard.cfg = update_config(
+            {"predict_clean": not bool(guard.cfg.get("predict_clean", True))})
+        log(f"趋势预防式清理 -> {'开' if guard.cfg['predict_clean'] else '关'}")
+
     def line_stats(_):
         st = guard.cfg.get("stats") or {}
         esc = int(st.get('escalated', 0))
+        tgt = int(st.get('targeted', 0))
+        prev = int(st.get('preventive', 0))
         base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
-        return base + (f"（升档 {esc} 次）" if esc else "")
+        return (base + (f"（升档 {esc} 次）" if esc else "")
+                + (f"（定向 {tgt} 次）" if tgt else "")
+                + (f"（预防 {prev} 次）" if prev else ""))
 
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
@@ -183,6 +209,30 @@ def build_menu(guard) -> pystray.Menu:
 
     def on_advice(icon=None, item=None) -> None:
         show_advice_window(guard.cfg)
+
+    def on_apply_advice(icon=None, item=None) -> None:
+        """不弹窗、一键应用当前可落地的优化建议（与建议窗口共用同一套动作表）。
+
+        建议是现场 analyze 出来的：菜单上那个计数由后台低频刷新，点击这一刻配置可能
+        已经变了（热重载、或刚点过别的菜单项），按当前配置重新分析才不会拿过期结论
+        写盘。单条失败只跳过该条；成功后只写日志、不再弹气泡——菜单项自己从「N 项」
+        翻成「0 项」并置灰，就是最省打扰的反馈。
+        """
+        def _apply(changes):
+            guard.cfg = update_config(changes)
+
+        try:
+            items = analyze(guard.cfg, guard.state, top_processes_list(15))
+            done = apply_advice_actions(items, _apply)
+        except Exception as e:
+            log(f"优化建议一键应用异常: {e!r}")
+            return
+        if not done:
+            log("优化建议一键应用 | 当前没有可应用的建议")
+            return
+        guard.advice_apply_count = max(0, guard.advice_apply_count - len(done))
+        guard.advice_count = max(0, guard.advice_count - len(done))
+        log("优化建议一键应用 | " + "、".join(a.get("label", "应用") for a in done))
 
     def on_export(icon=None, item=None) -> None:
         path = export_diagnostics()
@@ -304,6 +354,9 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("内存占用 Top10", on_top),
         pystray.MenuItem("内存趋势", on_trend),
         pystray.MenuItem(lambda i: f"优化建议（{guard.advice_count} 条）", on_advice),
+        pystray.MenuItem(lambda i: f"一键应用优化建议（{guard.advice_apply_count} 项）",
+                         on_apply_advice,
+                         enabled=lambda i: guard.advice_apply_count > 0),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("自动清理", on_toggle_auto,
                          checked=lambda i: guard.cfg["auto_clean"]),
@@ -317,6 +370,12 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("clean_on_start"))),
         pystray.MenuItem("清理未达标自动升档", on_toggle_escalate,
                          checked=lambda i: bool(guard.cfg.get("escalate_clean", True))),
+        pystray.MenuItem("定向清理内存大户", on_toggle_target_clean,
+                         checked=lambda i: bool(guard.cfg.get("target_clean", True))),
+        pystray.MenuItem("保守频繁升档自动改激进", on_toggle_level_adapt,
+                         checked=lambda i: bool(guard.cfg.get("auto_level_adapt", True))),
+        pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
+                         checked=lambda i: bool(guard.cfg.get("predict_clean", True))),
         pystray.MenuItem("开机自启", on_toggle_autostart,
                          checked=lambda i: autostart_enabled()),
         pystray.MenuItem(

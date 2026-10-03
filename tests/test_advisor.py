@@ -144,3 +144,88 @@ def test_analyze_silent_when_escalation_disabled_but_healthy():
     cfg = normalize_config({"escalate_clean": False})
     items = advisor.analyze(cfg, _mem(phys_pct=40.0))
     assert all("自动升档已关闭" not in i["title"] for i in items)
+
+
+# ---------------------------------------------------------------- 频繁升档判据（v1.6.0：与 tray 自动改激进同源）
+
+def test_frequent_escalation_requires_majority_and_floor():
+    """升档占比过半且至少 3 次才算「频繁」；档位已激进则无上升空间，一律返回 False。"""
+    base = {"clean_level": "conservative", "stats": {"count": 10, "escalated": 6}}
+    assert advisor.frequent_escalation(base) is True
+    assert advisor.frequent_escalation({**base, "stats": {"count": 10, "escalated": 2}}) is False
+    assert advisor.frequent_escalation({**base, "stats": {"count": 10, "escalated": 3}}) is False
+    assert advisor.frequent_escalation({**base, "stats": {"count": 7, "escalated": 3}}) is False
+    assert advisor.frequent_escalation({**base, "stats": {"count": 6, "escalated": 3}}) is True
+    assert advisor.frequent_escalation({**base, "stats": {}}) is False
+    assert advisor.frequent_escalation({**base, "clean_level": "aggressive"}) is False
+
+
+# ---------------------------------------------------------------- 一键应用动作（自动优化闭环：建议能落地）
+
+def test_analyze_attaches_one_click_actions_for_automation_knobs():
+    """自动优化相关建议都带 action：建议窗口据此生成「一键应用」按钮。"""
+    cfg = normalize_config({
+        "auto_clean": False, "warn_margin": 0, "cooldown": 60,
+        "escalate_clean": False,
+        "stats": {"count": 6, "escalated": 3},
+    })
+    items = advisor.analyze(cfg, _mem(phys_pct=99.0))
+    acts = {a["label"]: a["changes"]
+            for a in advisor.advice_actions(items)}
+
+    assert acts["开启自动清理"] == {"auto_clean": True}
+    assert acts["开启预警(15%)"] == {"warn_margin": 15}
+    assert acts["冷却调为 300s"] == {"cooldown": 300}
+    assert acts["开启自动升档"] == {"escalate_clean": True}
+    assert acts["改用激进档"] == {"clean_level": "aggressive"}
+
+
+def test_healthy_config_has_no_actionable_knob():
+    """配置健康时不给按钮：建议窗口只剩「内存充裕」这类提示，没有可乱点的东西。"""
+    items = advisor.analyze(normalize_config({}), _mem())
+    assert advisor.advice_actions(items) == []
+
+
+def test_advice_actions_dedupes_and_ignores_plain_items():
+    """同一键被多条建议惦记时只留第一条；无 action 的建议（页面文件/进程类）忽略。"""
+    items = [
+        {"title": "没有动作", "text": "x"},
+        {"action": {"label": "先来的", "changes": {"cooldown": 300}}},
+        {"action": {"label": "后来的", "changes": {"cooldown": 600}}},
+        {"action": {"label": "空 changes", "changes": {}}},
+        "not-a-dict",
+    ]
+
+    assert advisor.advice_actions(items) == [
+        {"label": "先来的", "changes": {"cooldown": 300}}]
+
+# ---------------------------------------------------------------- 预防式清理判据（v1.8.0）
+
+def test_frequent_prevention_requires_majority_and_floor():
+    """预防占比过半且至少 3 次才算「频繁」；档位已激进则无上升空间，返回 False。"""
+    base = {"clean_level": "conservative", "stats": {"count": 10, "preventive": 6}}
+    assert advisor.frequent_prevention(base) is True
+    assert advisor.frequent_prevention({**base, "stats": {"count": 10, "preventive": 2}}) is False
+    assert advisor.frequent_prevention({**base, "stats": {"count": 10, "preventive": 3}}) is False
+    assert advisor.frequent_prevention({**base, "stats": {"count": 7, "preventive": 3}}) is False
+    assert advisor.frequent_prevention({**base, "stats": {"count": 6, "preventive": 3}}) is True
+    assert advisor.frequent_prevention({**base, "stats": {}}) is False
+    assert advisor.frequent_prevention({**base, "clean_level": "aggressive"}) is False
+
+
+def test_analyze_advises_aggressive_when_prevention_frequent():
+    """预防式清理频繁触发：说明内存在持续上涨，提前温和清只是拖延。"""
+    cfg = normalize_config({"stats": {"count": 10, "preventive": 6}})
+    items = advisor.analyze(cfg, _mem())
+    hit = [i for i in items if "预防式清理频繁" in i["title"]]
+    assert hit
+    assert hit[0]["action"] == {"label": "改用激进档",
+                               "changes": {"clean_level": "aggressive"}}
+    assert "6" in hit[0]["text"]
+
+
+def test_analyze_silent_when_prevention_rare():
+    """偶尔预防一次是特性在正常工作，不该制造配置调整噪音。"""
+    cfg = normalize_config({"stats": {"count": 100, "preventive": 2}})
+    items = advisor.analyze(cfg, _mem())
+    assert all("预防式清理频繁" not in i["title"] for i in items)

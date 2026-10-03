@@ -238,3 +238,75 @@ def test_normalize_config_stats_escalated_roundtrip():
         "count": 3, "freed": 100}
     assert normalize_config({"stats": {"count": 3, "freed": 100}})["stats"] == {
         "count": 3, "freed": 100}
+
+
+def test_normalize_config_level_adapt_defaults_and_coercion():
+    """档位自调优（v1.6.0）：开关默认开、闩默认关，脏值一律 bool 强转不崩。"""
+    cfg = normalize_config({})
+    assert cfg["auto_level_adapt"] is True
+    assert cfg["level_adapt_done"] is False
+    assert normalize_config({"auto_level_adapt": 0})["auto_level_adapt"] is False
+    assert normalize_config({"auto_level_adapt": 1})["auto_level_adapt"] is True
+    assert normalize_config({"level_adapt_done": 1})["level_adapt_done"] is True
+
+
+def test_default_config_target_clean_keys_present():
+    """定向清理内存大户（v1.7.0）三个键必须有默认值，否则老配置行为漂移。"""
+    for key in ("target_clean", "target_clean_min_mb", "target_clean_top"):
+        assert key in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["target_clean"] is True
+    assert d["target_clean_min_mb"] == 1024
+    assert d["target_clean_top"] == 3
+
+
+def test_normalize_config_target_clean_coercion_and_clamp():
+    """开关 bool 强转；阈值钳在 [128, 32768]MB、条数钳在 [1, 10]，脏值回落默认。"""
+    assert normalize_config({"target_clean": 0})["target_clean"] is False
+    assert normalize_config({"target_clean": 1})["target_clean"] is True
+    assert normalize_config({"target_clean_min_mb": 16})["target_clean_min_mb"] == 128
+    assert normalize_config({"target_clean_min_mb": 99999})["target_clean_min_mb"] == 32768
+    assert normalize_config({"target_clean_min_mb": "abc"})["target_clean_min_mb"] == 1024
+    assert normalize_config({"target_clean_top": 0})["target_clean_top"] == 1
+    assert normalize_config({"target_clean_top": 99})["target_clean_top"] == 10
+    assert normalize_config({"target_clean_top": None})["target_clean_top"] == 3
+
+
+def test_normalize_config_stats_targeted_roundtrip():
+    """定向计数只持久化非 0 值：0/缺失都不落键，统计行按有无决定显示。"""
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "targeted": 2}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "targeted": 2}
+    zero = normalize_config({"stats": {"count": 3, "freed": 100, "targeted": 0}})
+    assert zero["stats"] == {"count": 3, "freed": 100}
+    plain = normalize_config({"stats": {"count": 3, "freed": 100}})
+    assert plain["stats"] == {"count": 3, "freed": 100}
+
+
+def test_default_config_predict_clean_keys_present():
+    """趋势预防式清理（v1.8.0）两个键必须有默认值，否则老配置行为漂移。"""
+    for key in ("predict_clean", "predict_window_min"):
+        assert key in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["predict_clean"] is True
+    assert d["predict_window_min"] == 5
+
+
+def test_normalize_config_predict_clean_coercion_and_clamp():
+    """开关 bool 强转；预测窗口钳在 [1, 60] 分钟，脏值回落默认。"""
+    assert normalize_config({"predict_clean": 0})["predict_clean"] is False
+    assert normalize_config({"predict_clean": 1})["predict_clean"] is True
+    assert normalize_config({"predict_window_min": 0})["predict_window_min"] == 1
+    assert normalize_config({"predict_window_min": -3})["predict_window_min"] == 1
+    assert normalize_config({"predict_window_min": 999})["predict_window_min"] == 60
+    assert normalize_config({"predict_window_min": "abc"})["predict_window_min"] == 5
+    assert normalize_config({"predict_window_min": None})["predict_window_min"] == 5
+
+
+def test_normalize_config_stats_preventive_roundtrip():
+    """预防计数只持久化非 0 值：0/缺失都不落键，统计行按有无决定显示。"""
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "preventive": 2}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "preventive": 2}
+    zero = normalize_config({"stats": {"count": 3, "freed": 100, "preventive": 0}})
+    assert zero["stats"] == {"count": 3, "freed": 100}
+    plain = normalize_config({"stats": {"count": 3, "freed": 100}})
+    assert plain["stats"] == {"count": 3, "freed": 100}

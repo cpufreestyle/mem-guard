@@ -2,7 +2,8 @@
 """
 优化建议引擎：基于实时内存状态与配置，给出可操作的「实用建议」。
 
-只依赖标准库 + config / winapi / clean，被 tray（菜单展示）与 cli（自检）调用；
+只依赖标准库 + config / winapi / clean，被 tray（菜单展示）、ui（建议窗口一键应用）
+与 cli（自检）调用；
 自身不含 UI、不含网络，纯本地分析。模块依赖落在 clean 之后：
     config ← winapi ← clean ← advisor ← tray ← cli
 """
@@ -23,6 +24,60 @@ LEVEL_WARN = "warn"
 LEVEL_TIP = "tip"
 LEVEL_INFO = "info"
 _LEVEL_ORDER = {LEVEL_WARN: 0, LEVEL_TIP: 1, LEVEL_INFO: 2}
+
+
+def frequent_escalation(cfg: dict) -> bool:
+    """保守档是否「频繁升档」：累计清理里 escalated 过半且至少 3 次。
+
+    v1.5.1 起 stats.escalated 记录保守清理后仍需补激进的次数；本判据被 tray 的
+    自动改激进（v1.6.0 自调优）与 analyze 的 3b 建议共用，两处必须同源，否则
+    「已自动切了激进」与「还建议改激进」会各说各话。档位已是激进时返回 False
+    ——没有「再升一档」的空间，先清到位就不存在频繁补刀。
+    """
+    st = cfg.get("stats") or {}
+    clean_cnt = int(st.get("count", 0) or 0)
+    esc_cnt = int(st.get("escalated", 0) or 0)
+    if clean_cnt <= 0 or esc_cnt < 3 or esc_cnt * 2 < clean_cnt:
+        return False
+    return str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"
+
+
+def frequent_prevention(cfg: dict) -> bool:
+    """趋势预防式清理是否「频繁」：累计清理里 preventive 过半且至少 3 次。
+
+    v1.8.0 起 stats.preventive 记录按上升斜率提前清理的次数；预防式清理都发生在
+    真触阈之前，若它频繁到过半，说明这台机器内存持续快速上涨，「提前温和一次」
+    也只是拖延，不如一次清到位。与 frequent_escalation 同源同口径，档位已是
+    激进时返回 False——没有更大力度的空间可建议。
+    """
+    st = cfg.get("stats") or {}
+    clean_cnt = int(st.get("count", 0) or 0)
+    prev_cnt = int(st.get("preventive", 0) or 0)
+    if clean_cnt <= 0 or prev_cnt < 3 or prev_cnt * 2 < clean_cnt:
+        return False
+    return str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"
+
+
+def advice_actions(items: list) -> list:
+    """从建议列表抽出「可一键应用」的动作：按出现顺序去重，返回 [{"label", "changes"}]。
+
+    changes 只带本次要改的键（增量），由调用方交给 config.update_config 读-改-写
+    合并；若同一个键被多条建议同时惦记（例如既建议开自动清理又建议关），只保留
+    最先出现的那条，避免一次点击互相打架。没有 action 的建议原样忽略。
+    """
+    out: list = []
+    seen: set = set()
+    for it in items:
+        act = it.get("action") if isinstance(it, dict) else None
+        if not act:
+            continue
+        changes = act.get("changes") or {}
+        keys = tuple(sorted(changes))
+        if not keys or keys in seen:
+            continue
+        seen.add(keys)
+        out.append({"label": act.get("label", "应用"), "changes": dict(changes)})
+    return out
 
 
 def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list:
@@ -80,6 +135,7 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list
             "level": LEVEL_INFO,
             "title": "自动清理已关闭",
             "text": "超阈值时不会自动清理，仅记录日志与弹提醒；如需自动处理请勾选「自动清理」。",
+            "action": {"label": "开启自动清理", "changes": {"auto_clean": True}},
         })
     if not cfg.get("warn_margin"):
         items.append({
@@ -87,6 +143,7 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list
             "title": "预警未开启",
             "text": "warn_margin=0 表示关闭超阈前预警。开启（如 15）可在内存接近阈值时"
                     "提前弹气泡提醒，便于手动干预。",
+            "action": {"label": "开启预警(15%)", "changes": {"warn_margin": 15}},
         })
     cooldown = cfg.get("cooldown", 300)
     if cooldown and cooldown <= 60:
@@ -95,6 +152,7 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list
             "title": "清理冷却较短",
             "text": f"cooldown={cooldown}s 较短，内存反复边缘抖动时可能较频繁触发清理；"
                     f"可适当调大（如 300s）以减少打扰。",
+            "action": {"label": "冷却调为 300s", "changes": {"cooldown": 300}},
         })
     if cfg.get("commit_threshold", 90) <= cfg.get("phys_threshold", 85):
         items.append({
@@ -116,15 +174,26 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list
     st = cfg.get("stats") or {}
     clean_cnt = int(st.get("count", 0) or 0)
     esc_cnt = int(st.get("escalated", 0) or 0)
-    if (esc_cnt >= 3 and esc_cnt * 2 >= clean_cnt
-            and str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"):
+    if frequent_escalation(cfg):
         items.append({
             "level": LEVEL_TIP,
             "title": "保守档频繁升档，建议直接改用激进",
             "text": (f"已累计清理 {clean_cnt} 次，其中 {esc_cnt} 次保守清理后仍未达标、"
                      f"自动补了一次激进清理（占 {esc_cnt * 100 // max(clean_cnt, 1)}%）。"
                      f"每次「先温和再彻底」等于多跑一遍、多打扰一次；建议把「清理力度」改为激进，"
-                     f"一次清到位（右键托盘 -> 清理力度 -> 激进）。"),
+                     f"一次清到位（建议窗口可一键应用）。"),
+            "action": {"label": "改用激进档", "changes": {"clean_level": "aggressive"}},
+        })
+    prev_cnt = int(st.get("preventive", 0) or 0)
+    if frequent_prevention(cfg):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "预防式清理频繁触发，建议直接改用激进",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {prev_cnt} 次是趋势预测到即将触阈、"
+                     f"提前清理的（占 {prev_cnt * 100 // max(clean_cnt, 1)}%）。"
+                     f"预防式清理只是把触发点往前挪，内存仍在持续上涨；建议把「清理力度」改为激进，"
+                     f"一次清到位（建议窗口可一键应用）。"),
+            "action": {"label": "改用激进档", "changes": {"clean_level": "aggressive"}},
         })
     if not cfg.get("escalate_clean", True) and phys_pct >= cfg.get("phys_threshold", 85):
         items.append({
@@ -132,6 +201,7 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list
             "title": "自动升档已关闭但内存已超阈值",
             "text": ("当前物理占用已达阈值，却关闭了「清理未达标自动升档」，保守清理后不会再补激进清理。"
                      "若常出现刚清完又超阈值，建议开启（右键托盘 -> 清理未达标自动升档）。"),
+            "action": {"label": "开启自动升档", "changes": {"escalate_clean": True}},
         })
 
     # ---- 4. 进程 / 白名单 ----

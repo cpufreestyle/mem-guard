@@ -116,6 +116,21 @@ def test_advice_survives_scan_failure(monkeypatch):
     assert g.advice_count == 7
 
 
+def test_advice_refresh_counts_applyable_actions(monkeypatch):
+    """一次刷新同时给出「总条数」与「可一键应用条数」，后者供菜单项置灰。"""
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "analyze", lambda cfg, mem=None, top=None: [
+        {"title": "自动清理已关闭",
+         "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
+        {"title": "未以管理员身份运行"},
+    ])
+
+    g = Guard()
+    g._refresh_advice(time.time())
+    assert g.advice_count == 2
+    assert g.advice_apply_count == 1, "只有带 action 的建议才算可一键应用"
+
+
 def test_hot_reload_resets_advice_throttle(monkeypatch, tmp_path):
     """配置热重载后立刻重算建议条数，而不是最多再等一个 advice_refresh_sec。"""
     cfg_file = tmp_path / "mem_guard.json"
@@ -457,3 +472,227 @@ def test_auto_clean_notify_marks_escalation(monkeypatch):
     g._auto_clean(124.0, "自动", g.state)
     assert "自动升档" not in notes[1][1]
     assert "（保守档）" in notes[1][1]
+
+
+def test_auto_clean_notify_marks_targeted(monkeypatch):
+    """定向清了大户：托盘通知要列出是哪几个；没定向时不出现该段。"""
+    switch = {"tgt": True}
+
+    def _fake_do_clean(reason="自动"):
+        return {
+            "ok": True,
+            "freed": 3 * GB,
+            "level": "conservative",
+            "escalated": False,
+            "detail": "-",
+            "stats": {"count": 12},
+            "targeted": ([("big.exe", 2 * GB, 4242)] if switch["tgt"] else []),
+            "before": {"avail_phys": 4 * GB, "commit_pct": 70.0},
+            "after": {"avail_phys": 7 * GB, "commit_pct": 60.0},
+        }
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+
+    g = _guard(_state(phys_pct=86.0))
+    notes = []
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._auto_clean(123.0, "自动", g.state)
+    assert "定向清理大户" in notes[0][1]
+    assert "big.exe" in notes[0][1]
+
+    switch["tgt"] = False
+    g._auto_clean(124.0, "自动", g.state)
+    assert "定向清理大户" not in notes[1][1]
+
+
+# ---------------------------------------------------------------- 档位自调优（v1.6.0：自动优化主链路）
+
+def _adapt_cfg(**kw):
+    """构造一份「保守档 + 频繁升档」的归一化配置，可按关键字覆盖单项。"""
+    base = {"auto_level_adapt": True, "level_adapt_done": False,
+            "stats": {"count": 10, "escalated": 6}}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_auto_level_adapt_switches_to_aggressive_once(monkeypatch):
+    """频繁升档 → 自动切激进并落闩：一次生效、有日志有通知；第二次调用不再动配置。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                        lambda ch: changes.append(dict(ch)) or {
+                            "clean_level": "aggressive", "level_adapt_done": True})
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _adapt_cfg()
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_level()
+    assert changes == [{"clean_level": "aggressive", "level_adapt_done": True}]
+    assert g.cfg["clean_level"] == "aggressive"
+    assert g.cfg["level_adapt_done"] is True
+    assert any("自动优化" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+
+    g._maybe_adapt_level()
+    assert len(changes) == 1, "闩 level_adapt_done 生效：不重复自动覆盖用户手动选择"
+
+
+def test_auto_level_adapt_skips_when_off_latched_or_rare(monkeypatch):
+    """开关关闭 / 已自动切过 / 升档不频繁：三种情形都不写配置（最小打扰）。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                        lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    for kw in ({"auto_level_adapt": False}, {"level_adapt_done": True},
+               {"stats": {"count": 10, "escalated": 2}}):
+        g = _guard(_state())
+        g.cfg = _adapt_cfg(**kw)
+        g._maybe_adapt_level()
+        assert changes == [], kw
+
+
+def test_auto_level_adapt_failure_only_logs(monkeypatch):
+    """update_config 抛异常只记日志：自调优失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(_changes):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tray, "update_config", _boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _adapt_cfg()
+    g._maybe_adapt_level()
+    assert any("自动档位适配异常" in m for m in logs)
+
+
+# ---------------------------------------------------------------- 趋势预防式清理（v1.8.0）
+
+def _predict_cfg(**kw):
+    """构造一份「开了预防式清理」的归一化配置，可按关键字覆盖单项。"""
+    base = {"predict_clean": True, "auto_clean": True, "cooldown": 300,
+            "phys_threshold": 85, "predict_window_min": 5}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def _rise(n=8, step=10.0, end=79.0, slope_pm=1.5):
+    """匀速上涨的采样历史：(t, phys, commit)，最后一个是「当前」占用。"""
+    per_step = slope_pm * step / 60.0
+    t0 = 1_000_000.0
+    return [(t0 + i * step, end - (n - 1 - i) * per_step, 50.0) for i in range(n)]
+
+
+def test_maybe_predictive_clean_notifies_with_trend_note(monkeypatch):
+    """趋势即将触阈：提前清一次，通知里带「斜率 / 预计分钟 / 阈值」解释。"""
+    seen = {}
+
+    def _fake_do_clean(reason="自动", preventive=False):
+        seen["reason"] = reason
+        seen["preventive"] = preventive
+        return {"ok": True, "freed": 2 * GB, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {"count": 3},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=79.0))
+    g.cfg = _predict_cfg()
+    g.history = _rise()
+    notes = []
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    assert g._maybe_predictive_clean(1000.0, g.state) is True
+    assert seen == {"reason": "预防式", "preventive": True}
+    assert notes[0][0] == "MemGuard 预防式清理"
+    assert "趋势" in notes[0][1] and "分钟" in notes[0][1] and "阈值" in notes[0][1]
+    assert g._warned is True, "同一次 tick 不用再弹接近阈值预警"
+
+
+def test_maybe_predictive_clean_respects_cooldown(monkeypatch):
+    """冷却内不提前清理：预防式也不该比普通自动清理更频繁。"""
+    calls = []
+
+    def _fake_do_clean(reason="自动", preventive=False):
+        calls.append(reason)
+        return {"ok": True, "freed": 2 * GB, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {"count": 3},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=79.0))
+    g.cfg = _predict_cfg()
+    g.history = _rise()
+    g.last_clean = 900.0            # 距上次清理才 100s，冷却 300s
+
+    assert g._maybe_predictive_clean(1000.0, g.state) is False
+    assert calls == []
+
+
+def test_maybe_predictive_clean_skips_when_trend_flat(monkeypatch):
+    """占用平稳：交给预警气泡和超阈值清理，别提前动。"""
+    calls = []
+
+    def _fake_do_clean(reason="自动", preventive=False):
+        calls.append(reason)
+        return {"ok": True, "freed": 0, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {"count": 3},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state(phys_pct=79.0))
+    g.cfg = _predict_cfg()
+    g.history = _rise(slope_pm=0.0)
+
+    assert g._maybe_predictive_clean(1000.0, g.state) is False
+    assert calls == []
+
+
+def test_maybe_predictive_clean_skips_when_disabled(monkeypatch):
+    """预防开关 / 自动清理任一关闭都不提前清理（最小打扰）。"""
+    for kw in ({"predict_clean": False}, {"auto_clean": False}):
+        calls = []
+
+        def _fake_do_clean(reason="自动", preventive=False):
+            calls.append(reason)
+            return {"ok": True, "freed": 0, "level": "conservative",
+                    "escalated": False, "detail": "-", "stats": {"count": 3},
+                    "before": {}, "after": {}}
+
+        monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+        monkeypatch.setattr(tray, "log", lambda m: None)
+
+        g = _guard(_state(phys_pct=79.0))
+        g.cfg = _predict_cfg(**kw)
+        g.history = _rise()
+        assert g._maybe_predictive_clean(1000.0, g.state) is False, kw
+        assert calls == [], kw
+
+
+def test_maybe_predictive_clean_failure_only_logs(monkeypatch):
+    """do_clean 抛异常只记日志：预防式清理失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(reason="自动", preventive=False):
+        raise RuntimeError("clean gone")
+
+    monkeypatch.setattr(tray, "do_clean", _boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state(phys_pct=79.0))
+    g.cfg = _predict_cfg()
+    g.history = _rise()
+
+    assert g._maybe_predictive_clean(1000.0, g.state) is False
+    assert any("预防式清理异常" in m for m in logs)

@@ -65,6 +65,7 @@ def once() -> None:
         print(r["msg"])
         return
     print(f"清理档位: {'激进' if r.get('level') == 'aggressive' else '保守'}"
+          + ("（定向大户）" if r.get("targeted") else "")
           + ("（自动升档）" if r.get("escalated") else ""))
     print(f"清理前可用物理 {gb(r['before']['avail_phys'])}  提交 {r['before']['commit_pct']:.1f}%")
     print(f"清理后可用物理 {gb(r['after']['avail_phys'])}  提交 {r['after']['commit_pct']:.1f}%")

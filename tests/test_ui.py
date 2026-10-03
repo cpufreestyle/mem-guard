@@ -14,7 +14,8 @@ from PIL import ImageTk
 
 from memguard import ui
 from memguard.ui import (_fmt_bytes, _group_rows, _icon_color, _overview_text,
-                          _table_rows, _top_grouped, make_icon,
+                          _table_rows, _top_grouped, apply_advice_actions,
+                          make_icon,
                           show_advice_window, show_overview_window, show_top_window,
                           show_trend_window)
 
@@ -453,3 +454,80 @@ def test_override_failure_keeps_tk_icons(monkeypatch):
 
     monkeypatch.setattr(ui, "set_window_class_icons", boom)
     ui.apply_window_icon(_FakeRoot())          # 不应抛出
+
+
+# ------------------------------------------------------- 优化建议一键应用（自动优化闭环）
+
+def test_apply_advice_actions_applies_each_and_returns_done():
+    """每条 action 的增量都交给 update_config；返回成功应用的动作列表。"""
+    calls = []
+    items = [
+        {"level": "info", "title": "自动清理已关闭", "text": "x",
+         "action": {"label": "开启自动清理", "changes": {"auto_clean": True}}},
+        {"level": "tip", "title": "保守档频繁升档，建议直接改用激进", "text": "y",
+         "action": {"label": "改用激进档", "changes": {"clean_level": "aggressive"}}},
+    ]
+
+    done = apply_advice_actions(items, calls.append)
+
+    assert calls == [{"auto_clean": True}, {"clean_level": "aggressive"}]
+    assert [a["label"] for a in done] == ["开启自动清理", "改用激进档"]
+
+
+def test_apply_advice_actions_skips_failing_entry_only():
+    """某一条写配置失败只跳过它：其余建议照样应用，绝不整体作废。"""
+    calls = []
+
+    def flaky(changes):
+        if changes.get("warn_margin"):
+            raise OSError("disk gone")
+        calls.append(changes)
+
+    items = [
+        {"action": {"label": "开启预警(15%)", "changes": {"warn_margin": 15}}},
+        {"action": {"label": "开启自动清理", "changes": {"auto_clean": True}}},
+        {"action": {"label": "开启自动升档", "changes": {"escalate_clean": True}}},
+    ]
+
+    done = apply_advice_actions(items, flaky)
+
+    assert calls == [{"auto_clean": True}, {"escalate_clean": True}]
+    assert len(done) == 2
+
+
+def test_apply_advice_actions_ignores_items_without_action():
+    """没有 action 的建议（页面文件、权限、进程类）原样忽略，不产生按钮。"""
+    items = [
+        {"level": "warn", "title": "虚拟内存（页面文件）余量极低", "text": "x"},
+        {"level": "tip", "title": "存在高内存占用进程", "text": "y"},
+        "not-a-dict",
+    ]
+
+    assert apply_advice_actions(items, lambda ch: None) == []
+
+
+def test_advice_window_reads_live_config_when_given_callable(monkeypatch):
+    """传 callable 时走「实时配置」：托盘一键应用后刷新必须读到新档位。"""
+    monkeypatch.setitem(sys.modules, "tkinter", None)
+    seen = []
+    monkeypatch.setattr(ui, "analyze", lambda cfg: seen.append(cfg) or [])
+    box = _capture_box(monkeypatch)
+
+    live = {"clean_level": "conservative"}
+    show_advice_window(lambda: live)
+    assert _wait(box["ev"].is_set)
+    live["clean_level"] = "aggressive"      # 模拟一键应用改了配置
+    show_advice_window(lambda: live)
+    assert _wait(lambda: len(seen) >= 2)
+    assert seen[-1]["clean_level"] == "aggressive"
+
+
+def test_advice_window_still_accepts_plain_dict(monkeypatch):
+    """向后兼容：传 dict 也照常工作（测试与其它调用方不需要改）。"""
+    monkeypatch.setitem(sys.modules, "tkinter", None)
+    cfg = {"clean_level": "aggressive"}
+    monkeypatch.setattr(ui, "analyze", lambda c: (cfg is c) and [])
+    box = _capture_box(monkeypatch)
+    show_advice_window(cfg)
+    assert _wait(box["ev"].is_set)
+    assert box["title"] == "MemGuard - 优化建议"

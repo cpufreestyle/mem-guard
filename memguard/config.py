@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.5.1"
+__version__ = "1.8.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -34,6 +34,16 @@ DEFAULT_CONFIG = {
     "cooldown": 300,         # 两次自动清理之间的冷却时间(秒)
     "auto_clean": True,      # 是否开启自动清理
     "escalate_clean": True,  # 保守清理后仍超阈值、或仍低于可用内存下限时，自动补一次激进清理（最多一次、带开关）
+    # ---- 定向清理内存大户（v1.7.0）：仍超阈值时先只按工作集挑最大的几个进程精确清 ----
+    "target_clean": True,     # 开：仍超阈值时先精确清大户口，比直接全量升档打扰小；仍不达标才升档
+    "target_clean_min_mb": 1024,  # 工作集达到该值(MB) 的进程才算「内存大户」
+    "target_clean_top": 3,     # 单次最多精确清空前 N 个工作集最大的进程
+    # ---- 趋势预防式清理（v1.8.0）：按历史采样拟合上升斜率，预判即将触阈就提前清 ----
+    "predict_clean": True,     # 开：预计 predict_window_min 分钟内触及阈值，就提前清一次（仍走保守→定向→升档阶梯）
+    "predict_window_min": 5,   # 预计触阈时间窗口(分钟)：只有窗口内会触阈才预防，越小平稳期越不打扰
+    # ---- 档位自调优（v1.6.0）：保守档频繁升档说明「先温和再彻底」白跑一遍，自动改激进 ----
+    "auto_level_adapt": True,  # 累计清理中 escalated 过半且≥3 次时，自动把清理力度切为激进（一次性）
+    "level_adapt_done": False, # 已自动切过激进的闩：挡住重复覆盖，用户手动切回保守也不再自动评估
     "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
     # conservative=仅清 standby list/修改页/文件缓存（温和，对前台几乎无影响，默认）
     # aggressive  =额外清空各进程工作集（释放更多，但前台程序下次访问需重新读盘，可能卡顿）
@@ -124,6 +134,16 @@ def normalize_config(raw) -> dict:
         cfg.get("advice_refresh_sec"), 15, 600, DEFAULT_CONFIG["advice_refresh_sec"])
     cfg["auto_clean"] = bool(cfg.get("auto_clean", True))
     cfg["escalate_clean"] = bool(cfg.get("escalate_clean", True))
+    cfg["target_clean"] = bool(cfg.get("target_clean", True))
+    cfg["target_clean_min_mb"] = _clamp_int(
+        cfg.get("target_clean_min_mb"), 128, 32768, DEFAULT_CONFIG["target_clean_min_mb"])
+    cfg["target_clean_top"] = _clamp_int(
+        cfg.get("target_clean_top"), 1, 10, DEFAULT_CONFIG["target_clean_top"])
+    cfg["predict_clean"] = bool(cfg.get("predict_clean", True))
+    cfg["predict_window_min"] = _clamp_int(
+        cfg.get("predict_window_min"), 1, 60, DEFAULT_CONFIG["predict_window_min"])
+    cfg["auto_level_adapt"] = bool(cfg.get("auto_level_adapt", True))
+    cfg["level_adapt_done"] = bool(cfg.get("level_adapt_done", False))
     cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
@@ -158,6 +178,13 @@ def normalize_config(raw) -> dict:
     # 而一旦升过档，这个计数必须活过 normalize，否则每次加载都被剥掉、永远显示 0
     if raw_stats.get("escalated"):
         cfg["stats"]["escalated"] = _clamp_int(raw_stats.get("escalated"), 0, 10 ** 9, 0)
+    # targeted（定向清理次数）同样只在非 0 时落键：没定向过的配置保持原两键形状；
+    # 而一旦定向过，这个计数必须活过 normalize，否则统计行永远显示 0
+    if raw_stats.get("targeted"):
+        cfg["stats"]["targeted"] = _clamp_int(raw_stats.get("targeted"), 0, 10 ** 9, 0)
+    # preventive（趋势预防式清理次数）口径同上：非 0 才落键，没预防过的配置保持原形状
+    if raw_stats.get("preventive"):
+        cfg["stats"]["preventive"] = _clamp_int(raw_stats.get("preventive"), 0, 10 ** 9, 0)
     return cfg
 
 

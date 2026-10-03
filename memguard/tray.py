@@ -16,9 +16,9 @@ import time
 import pystray
 
 from . import update
-from .advisor import analyze
-from .clean import do_clean, top_processes_list
-from .config import CONFIG_PATH, __version__, gb, load_config, log
+from .advisor import advice_actions, analyze, frequent_escalation
+from .clean import do_clean, predictive_due, top_processes_list
+from .config import CONFIG_PATH, __version__, gb, load_config, log, update_config
 from .menu import build_menu
 from .ui import (make_icon, show_advice_window, show_overview_window,
                 show_top_window, show_trend_window)
@@ -42,6 +42,7 @@ class Guard:
         self._cfg_mtime = None       # 配置热重载：记录上次 mtime
         self._warned = False         # 是否已就本次接近阈值发过预警（避免反复弹）
         self.advice_count = 0        # 后台低频刷新的「优化建议条数」，供菜单标签零成本读取
+        self.advice_apply_count = 0  # 其中「可一键应用」的条数，供菜单项决定能否点击
         self._advice_at = 0.0        # 上次刷新建议的时间戳（按 advice_refresh_sec 节流）
         self._icon_img = None        # 当前托盘图标正在显示的图像对象，用于跳过无变化的重绘
         self.last_scheduled = time.time()  # 定时清理计时起点（启动后先等一个完整周期）
@@ -68,7 +69,9 @@ class Guard:
             "clean": lambda: do_clean("手动"),
             "top": show_top_window,
             "trend": lambda: show_trend_window(lambda: list(self.history)),
-            "advice": lambda: show_advice_window(self.cfg),
+            # 传 callable 而非 dict：窗口内「一键应用」会经 update_config 换掉
+            # guard.cfg 这个对象，传 callable 才能让窗口刷新读到最新配置。
+            "advice": lambda: show_advice_window(lambda: self.cfg),
         })
 
     # -- 唤窗信号（从任务栏再点一次图标时用）-------------------------------------
@@ -98,11 +101,17 @@ class Guard:
                 break
 
 
-    def _auto_clean(self, now: float, reason: str, s: dict) -> None:
-        """执行一次自动清理并弹通知（各触发源共用；reason 用于日志与通知标题）。"""
+    def _auto_clean(self, now: float, reason: str, s: dict, note: str = "",
+                    preventive: bool = False) -> None:
+        """执行一次自动清理并弹通知（各触发源共用；reason 用于日志与通知标题）。
+
+        note 非空时追加到通知正文末尾：预防式清理用它解释「还没超阈值为什么清」。
+        preventive=True 表示本次是趋势预防式清理，do_clean 会累计 stats.preventive，
+        供统计行展示与 advisor 的自调优建议使用。
+        """
         self.last_clean = now
         self.over_since = None
-        r = do_clean(reason)
+        r = do_clean(reason, preventive=True) if preventive else do_clean(reason)
         if r["ok"]:
             # 统计已在 do_clean 里落盘：顺手同步回内存，否则菜单顶部那行累计统计要等
             # 下一次热重载（间隔由 interval 决定，最长可能等很久）才刷新
@@ -114,16 +123,51 @@ class Guard:
             lvl_txt = "激进" if r.get("level") == "aggressive" else "保守"
             if r.get("escalated"):
                 lvl_txt += "（自动升档）"
+            body = (f"物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
+                    f"已释放 {gb(max(r['freed'], 0))}（{lvl_txt}档）\n"
+                    f"当前占用 Top3:\n{top_txt}")
+            if r.get("targeted"):
+                tgt_txt = "\n".join(
+                    f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in r["targeted"])
+                body += f"\n定向清理大户:\n{tgt_txt}"
+            if note:
+                body += f"\n{note}"
             title = "MemGuard 自动清理" if reason == "自动" else f"MemGuard {reason}清理"
             try:
                 self.icon.notify(
-                    f"物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
-                    f"已释放 {gb(max(r['freed'], 0))}（{lvl_txt}档）\n"
-                    f"当前占用 Top3:\n{top_txt}",
+                    body,
                     title,
                 )
             except Exception:
                 pass
+
+    def _maybe_predictive_clean(self, now: float, s: dict) -> bool:
+        """趋势预防式清理（v1.8.0）：还没超阈值，但按上升斜率很快就要超。
+
+        与触发源 1 互补：超阈值是「反应式」，这里是拿 history 拟合斜率、预判触阈
+        时间，在预测窗口内就提前清一次，让占用始终不真的越线。走的仍是
+        「保守→定向→升档」那套阶梯，打扰不比一次普通自动清理更多。
+        门：开关 + 自动清理 + 冷却 + predictive_due 判定，返回是否已触发清理。
+        """
+        try:
+            cfg = self.cfg
+            if not (cfg.get("predict_clean") and cfg["auto_clean"]):
+                return False
+            if now - self.last_clean <= cfg["cooldown"]:
+                return False
+            pred = predictive_due(self.history, cfg)
+            if not pred:
+                return False
+            note = (f"趋势 {pred['slope_pm']:+.1f}%/分钟，预计 {pred['eta'] / 60:.1f} "
+                    f"分钟后触及{pred['metric']}阈值，已提前清理")
+            log(f"预防式清理 | {note}")
+            self._auto_clean(now, "预防式", s, note=note, preventive=True)
+            # 同一次 tick 不再弹「接近阈值」预警：已经提前处理过了
+            self._warned = True
+            return True
+        except Exception as e:
+            log(f"预防式清理异常: {e!r}")
+            return False
 
     def maybe_reload_config(self) -> None:
         """检查配置文件 mtime，变化则热重载（无需重启托盘）。"""
@@ -141,18 +185,55 @@ class Guard:
             log(f"配置重载检查失败: {e}")
 
     def _refresh_advice(self, now: float) -> None:
-        """按时间节流刷新「优化建议条数」：一次进程扫描同时喂给 analyze。
+        """按时间节流刷新「建议条数 / 可一键应用条数」：一次进程扫描只喂给 analyze。
 
-        菜单标签只读 advice_count，所以这里可以放心低频；扫描失败保留上次的值，
-        且时间戳已前移，不会在监控线程里对失败项发起热重试。
+        菜单标签只读 advice_count / advice_apply_count，所以这里可以放心低频；扫描
+        失败保留上次的值，且时间戳已前移，不会在监控线程里对失败项发起热重试。
         """
         if now - self._advice_at < self.cfg.get("advice_refresh_sec", 60):
             return
         self._advice_at = now
         try:
-            self.advice_count = len(analyze(self.cfg, self.state, top_processes_list(15)))
+            items = analyze(self.cfg, self.state, top_processes_list(15))
+            self.advice_count = len(items)
+            self.advice_apply_count = len(advice_actions(items))
         except Exception:
             pass
+
+    def _maybe_adapt_level(self) -> None:
+        """自调优闭环（v1.6.0）：保守档频繁升档时自动改用激进档，整个生命周期最多一次。
+
+        判据与 advisor 3b 同源（frequent_escalation）：累计清理 escalated 过半且
+        ≥3 次——「先温和再彻底」每次多跑一遍、多打扰一次，不如一次清到位。切换走
+        update_config（读-改-写持锁）并落 level_adapt_done 闩：用户手动切回保守也不会
+        被再次自动覆盖；关掉 auto_level_adapt 则完全不评估。任何异常只记日志，绝不让
+        监控循环崩。
+        """
+        try:
+            cfg = self.cfg
+            if not cfg.get("auto_level_adapt", True) or cfg.get("level_adapt_done"):
+                return
+            if not frequent_escalation(cfg):
+                return
+            st = cfg.get("stats") or {}
+            clean_cnt = int(st.get("count", 0) or 0)
+            esc_cnt = int(st.get("escalated", 0) or 0)
+            self.cfg = update_config({"clean_level": "aggressive",
+                                      "level_adapt_done": True})
+            log(f"自动优化 | 保守档累计 {clean_cnt} 次清理中 {esc_cnt} 次仍不达标需升档，"
+                f"清理力度已自动切换为激进（一次性，不再自动评估，可随时手动改回）")
+            if self.icon:
+                try:
+                    self.icon.notify(
+                        f"保守档 {clean_cnt} 次清理有 {esc_cnt} 次清完仍不达标\n"
+                        f"已自动切换为激进档：一次清到位，少跑一遍少打扰一次\n"
+                        f"（右键菜单可随时改回保守）",
+                        "MemGuard 自动优化",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"自动档位适配异常: {e!r}")
 
     def _refresh_icon(self) -> None:
         """刷新托盘显示；图标内容没变就不赋值给 pystray。
@@ -254,10 +335,14 @@ class Guard:
                 self.history.append((time.time(), s["phys_pct"], s["commit_pct"]))
                 now = time.time()
                 self._refresh_advice(now)
+                self._maybe_adapt_level()
                 self._maybe_check_update(now)
                 self._refresh_icon()
                 over = (s["phys_pct"] >= self.cfg["phys_threshold"]
                         or s["commit_pct"] >= self.cfg["commit_threshold"])
+                # 触发源 4（提前量）：趋势预防式清理，未越线但按斜率即将触阈
+                if not over and self._maybe_predictive_clean(now, s):
+                    self._warned = True
                 # -- 接近阈值预警：只提醒不清理，让人有提前手动干预的机会 --
                 margin = self.cfg.get("warn_margin", 0)
                 if margin and not over and s["phys_pct"] >= self.cfg["phys_threshold"] - margin:
