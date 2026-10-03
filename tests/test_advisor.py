@@ -114,3 +114,33 @@ def test_format_advice_nonempty():
     text = advisor.format_advice([{"level": advisor.LEVEL_TIP, "title": "T", "text": "X"}])
     assert "[建议] T" in text
     assert "X" in text
+
+
+# ---------------------------------------------------------------- 升档统计自调优（v1.5.1）
+
+def test_analyze_advises_aggressive_when_escalation_frequent():
+    """保守清理频繁补激进时，建议直接把清理力度改成激进：少跑一遍、少打扰一次。"""
+    cfg = normalize_config({"stats": {"count": 10, "escalated": 6}})
+    items = advisor.analyze(cfg, _mem())
+    assert any("频繁升档" in i["title"] for i in items)
+
+
+def test_analyze_silent_when_escalation_rare():
+    """升档占比低是正常兜底，不该制造配置调整噪音。"""
+    cfg = normalize_config({"stats": {"count": 100, "escalated": 2}})
+    items = advisor.analyze(cfg, _mem())
+    assert all("频繁升档" not in i["title"] for i in items)
+
+
+def test_analyze_advises_enabling_escalation_when_over_threshold():
+    """关掉自动升档又已超阈值：提醒开启，否则保守清完仍超阈值。"""
+    cfg = normalize_config({"escalate_clean": False})
+    items = advisor.analyze(cfg, _mem(phys_pct=88.0))
+    assert any("自动升档已关闭" in i["title"] for i in items)
+
+
+def test_analyze_silent_when_escalation_disabled_but_healthy():
+    """升档关闭但内存健康：不额外打扰。"""
+    cfg = normalize_config({"escalate_clean": False})
+    items = advisor.analyze(cfg, _mem(phys_pct=40.0))
+    assert all("自动升档已关闭" not in i["title"] for i in items)

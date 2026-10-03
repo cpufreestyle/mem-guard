@@ -112,6 +112,28 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None) -> list
                     "工作集，前台易卡顿。建议改用「保守」或把阈值降到 85–92。",
         })
 
+    # ---- 3b. 升档统计自调优（v1.5.1）：让实测统计反推配置，不必等用户自己悟 ----
+    st = cfg.get("stats") or {}
+    clean_cnt = int(st.get("count", 0) or 0)
+    esc_cnt = int(st.get("escalated", 0) or 0)
+    if (esc_cnt >= 3 and esc_cnt * 2 >= clean_cnt
+            and str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "保守档频繁升档，建议直接改用激进",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {esc_cnt} 次保守清理后仍未达标、"
+                     f"自动补了一次激进清理（占 {esc_cnt * 100 // max(clean_cnt, 1)}%）。"
+                     f"每次「先温和再彻底」等于多跑一遍、多打扰一次；建议把「清理力度」改为激进，"
+                     f"一次清到位（右键托盘 -> 清理力度 -> 激进）。"),
+        })
+    if not cfg.get("escalate_clean", True) and phys_pct >= cfg.get("phys_threshold", 85):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "自动升档已关闭但内存已超阈值",
+            "text": ("当前物理占用已达阈值，却关闭了「清理未达标自动升档」，保守清理后不会再补激进清理。"
+                     "若常出现刚清完又超阈值，建议开启（右键托盘 -> 清理未达标自动升档）。"),
+        })
+
     # ---- 4. 进程 / 白名单 ----
     if top is None:     # 调用方没给采样才现场扫描（要实时数据的场景才付这个代价）
         try:

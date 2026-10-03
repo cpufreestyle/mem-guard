@@ -212,9 +212,29 @@ def test_normalize_config_auto_update_toggles_are_booleans():
     assert cfg["auto_install"] is True
 
 
+def test_normalize_config_escalate_defaults_true():
+    """自动升档清理默认开启（用户要的自动优化内存能力）。"""
+    assert normalize_config({})["escalate_clean"] is True
+
+
+def test_normalize_config_escalate_is_boolean():
+    cfg = normalize_config({"escalate_clean": 0})
+    assert cfg["escalate_clean"] is False
+
+
 def test_normalize_config_last_update_check_tolerates_dirty_values():
     """时间戳是程序自己维护的字段：脏值不能把加载配置这一步带崩。"""
     assert normalize_config({"last_update_check": "not-a-number"})["last_update_check"] == 0.0
     assert normalize_config({"last_update_check": "123.5"})["last_update_check"] == 123.5
     assert normalize_config({"last_update_check": -5})["last_update_check"] == 0.0
     assert normalize_config({"update_notified_tag": None})["update_notified_tag"] == ""
+
+def test_normalize_config_stats_escalated_roundtrip():
+    """升档计数只持久化非 0 值：0/缺失都不落键，统计行按有无决定显示。"""
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "escalated": 2}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "escalated": 2}
+    assert normalize_config({"stats": {"count": 3, "freed": 100,
+                                       "escalated": 0}})["stats"] == {
+        "count": 3, "freed": 100}
+    assert normalize_config({"stats": {"count": 3, "freed": 100}})["stats"] == {
+        "count": 3, "freed": 100}

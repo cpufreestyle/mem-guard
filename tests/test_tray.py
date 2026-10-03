@@ -401,3 +401,59 @@ def test_stop_for_update_releases_icon_and_stops_monitor():
     guard._stop_for_update()
     assert guard.stop.is_set()
     assert guard.icon.stopped is True
+
+def test_scheduled_clean_respects_cooldown():
+    """定时清理也守 cooldown：刚被阈值清理过就跳过，且不推进计时（冷却结束仍到期）。"""
+    g = _guard(_state())
+    g.cfg = config_mod.normalize_config({"scheduled_minutes": 30, "cooldown": 300})
+    now = time.time()
+
+    g.last_scheduled = now - 30 * 60          # 周期已到
+    g.last_clean = now - 60                   # 但冷却内刚清过：跳过
+    assert g._scheduled_due(now) is False
+
+    g.last_clean = now - 301                  # 冷却已过：放行
+    assert g._scheduled_due(now) is True
+
+    g.last_scheduled = now - 29 * 60          # 周期没到：不到期
+    assert g._scheduled_due(now) is False
+
+    g.cfg = config_mod.normalize_config({"scheduled_minutes": 0, "cooldown": 300})
+    g.last_scheduled = now - 30 * 60
+    g.last_clean = now - 3600                 # 定时清理关掉了：永不到期
+    assert g._scheduled_due(now) is False
+
+
+# ---------------------------------------------------------------- 自动清理升档回显（v1.5.1 补测）
+
+def test_auto_clean_notify_marks_escalation(monkeypatch):
+    """自动清理补了激进一次：托盘通知要标「（自动升档）」；没升档时不误导（自动优化主链路）。"""
+    switch = {"esc": True}
+
+    def _fake_do_clean(reason="自动"):
+        return {
+            "ok": True,
+            "freed": 3 * GB,
+            "level": "aggressive" if switch["esc"] else "conservative",
+            "escalated": switch["esc"],
+            "detail": "-",
+            "stats": {"count": 12},
+            "before": {"avail_phys": 4 * GB, "commit_pct": 70.0},
+            "after": {"avail_phys": 7 * GB, "commit_pct": 60.0},
+        }
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
+
+    g = _guard(_state(phys_pct=86.0))
+    notes = []
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._auto_clean(123.0, "自动", g.state)
+    assert notes[0][0] == "MemGuard 自动清理"
+    assert "（激进（自动升档）档）" in notes[0][1]
+
+    switch["esc"] = False
+    g._auto_clean(124.0, "自动", g.state)
+    assert "自动升档" not in notes[1][1]
+    assert "（保守档）" in notes[1][1]

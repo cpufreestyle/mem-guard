@@ -62,17 +62,22 @@ def _wait_avail_rise(before: dict) -> dict:
     return after
 
 
-def _bump_stats(freed: int) -> dict:
+def _bump_stats(freed: int, escalated: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
     或用户手改覆盖掉，直接写回会把别人的改动一起回滚。
+
+    escalated=True 时同步累计「自动升档次数」，用于统计行展示保守清理不达
+    标后补激进清理的触发频次（normalize_config 只持久化非 0 值）。
     """
     with _CONFIG_LOCK:
         cfg = load_config()
         st = cfg.get("stats") or {}
         st["count"] = int(st.get("count", 0)) + 1
         st["freed"] = int(st.get("freed", 0)) + max(freed, 0)
+        if escalated:
+            st["escalated"] = int(st.get("escalated", 0)) + 1
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
@@ -134,6 +139,28 @@ def _run_clean_actions(aggressive: bool, areas: dict, blacklist) -> tuple:
         return detail, core, failed_privs
 
 
+def _still_pressured(m: dict, cfg: dict) -> bool:
+    """清理后是否仍超阈值：物理或提交使用率任一仍越线、或可用物理仍低于
+    「低内存触发」下限（min_avail_mb，0=关闭），就算没清到位。
+
+    用 .get 老老实实取值——部分采样桩/回退路径不含 phys_pct，缺项视为未越线，
+    别在这里 KeyError。阈值缺失同样跳过对应判断（配置总是 normalize 过的，多为兜底）。
+    """
+    pt = cfg.get("phys_threshold")
+    ct = cfg.get("commit_threshold")
+    phys = m.get("phys_pct")
+    commit = m.get("commit_pct")
+    if pt is not None and phys is not None and phys >= pt:
+        return True
+    if ct is not None and commit is not None and commit >= ct:
+        return True
+    floor = cfg.get("min_avail_mb") or 0
+    avail = m.get("avail_phys")
+    if floor and avail is not None and avail < floor * 1024 * 1024:
+        return True
+    return False
+
+
 def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None) -> dict:
     """执行一次清理，返回结果统计（特权在返回前恢复，用完即关）。
 
@@ -164,6 +191,27 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         return {"ok": False, "msg": f"清理失败（{why}）"}
 
     after = _wait_avail_rise(before)
+    escalated = False
+
+    # 自动升档：保守清理后若仍超阈值，立即补一次激进清理（最多一次、带开关、最小打扰）
+    if (not aggressive and bool(cfg.get("escalate_clean", True))
+            and _still_pressured(after, cfg)):
+        detail2, core2, _ = _run_clean_actions(True, areas, bl)
+        # 第二遍核心操作全部失败就不记升档，只在日志里留痕，保留第一次的保守结果
+        if core2 and all(rc != 0 for rc in core2):
+            log(f"{reason}升档未采纳 | 二次激进清理核心操作全部失败 | " + ", ".join(detail2))
+        else:
+            # 采纳升档：再等一次把激进清理的回补计入；整体释放量按 before->最终 after 合计
+            after = _wait_avail_rise(after)
+            escalated = True
+            lvl = "aggressive"
+            detail.append("升档重效(激进)")
+            detail.extend(detail2)
+            if _still_pressured(after, cfg):
+                # 最多一次，不再补第二次；只留痕，让日志能解释「刚清完怎么又超了」
+                log(f"{reason}升档后仍超阈值（最多一次，不再补） | "
+                    f"可用物理 {gb(after['avail_phys'])} | "
+                    f"物理 {after.get('phys_pct', '-')}% / 提交 {after.get('commit_pct', '-')}%")
 
     freed = after["avail_phys"] - before["avail_phys"]
     result = {
@@ -172,11 +220,12 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         "before": before,
         "after": after,
         "level": lvl,
+        "escalated": escalated,
         "detail": ", ".join(detail),
     }
     # 累计统计：只统计真正成功的清理，随配置持久化；写盘失败不影响本次清理结果
     try:
-        result["stats"] = _bump_stats(freed)
+        result["stats"] = _bump_stats(freed, escalated)
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

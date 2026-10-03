@@ -193,7 +193,7 @@ def test_check_update_flag_prints_without_tray(monkeypatch, capsys):
     assert exc.value.code == 0
     assert notifies == [None], "命令行检查不该带气泡回调"
     out = capsys.readouterr().out
-    assert "v9.9.9" in out and "1.5.0" in out
+    assert "v9.9.9" in out and f"v{cli.__version__}" in out
     assert guard.kwargs is None, "检查更新不该启动托盘"
 
 
@@ -236,3 +236,43 @@ def test_update_flags_advertised_in_usage():
     for flag in ("--check-update", "--update"):
         assert flag in cli._KNOWN_ARGS
         assert flag in cli._USAGE
+
+
+# ---------------------------------------------------------------- --once 升档回显（v1.5.1）
+
+def _once_env(monkeypatch, clean_result):
+    """让 once() 完全脱离真实内存采样与真实清理：只验证打印口径。"""
+    monkeypatch.setattr(cli, "get_mem", lambda: {
+        "phys_pct": 88.0, "used_phys": 12 * 1024 ** 3, "total_phys": 16 * 1024 ** 3,
+        "commit_pct": 70.0, "used_commit": 20 * 1024 ** 3, "total_commit": 32 * 1024 ** 3,
+    })
+    monkeypatch.setattr(cli, "is_admin", lambda: True)
+    monkeypatch.setattr(cli, "do_clean", lambda reason="测试": clean_result)
+
+
+def _clean_result(level, escalated):
+    return {
+        "ok": True,
+        "freed": 3 * 1024 ** 3,
+        "level": level,
+        "escalated": escalated,
+        "detail": "-",
+        "before": {"avail_phys": 4 * 1024 ** 3, "commit_pct": 70.0},
+        "after": {"avail_phys": 7 * 1024 ** 3, "commit_pct": 60.0},
+    }
+
+
+def test_once_prints_escalation_marker(monkeypatch, capsys):
+    """fleet/RMM 看 --once 输出：补了激进清理那次必须把「（自动升档）」标出来。"""
+    _once_env(monkeypatch, _clean_result("aggressive", True))
+    cli.once()
+    assert "自动升档" in capsys.readouterr().out
+
+
+def test_once_without_escalation_prints_plain_level(monkeypatch, capsys):
+    """没升档时不要误导：档位行只有「保守」，不出现「（自动升档）」。"""
+    _once_env(monkeypatch, _clean_result("conservative", False))
+    cli.once()
+    out = capsys.readouterr().out
+    assert "自动升档" not in out
+    assert "清理档位: 保守" in out

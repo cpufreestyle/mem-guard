@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
     "interval": 10,          # 检测间隔(秒)
     "cooldown": 300,         # 两次自动清理之间的冷却时间(秒)
     "auto_clean": True,      # 是否开启自动清理
+    "escalate_clean": True,  # 保守清理后仍超阈值、或仍低于可用内存下限时，自动补一次激进清理（最多一次、带开关）
     "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
     # conservative=仅清 standby list/修改页/文件缓存（温和，对前台几乎无影响，默认）
     # aggressive  =额外清空各进程工作集（释放更多，但前台程序下次访问需重新读盘，可能卡顿）
@@ -122,6 +123,7 @@ def normalize_config(raw) -> dict:
     cfg["advice_refresh_sec"] = _clamp_int(
         cfg.get("advice_refresh_sec"), 15, 600, DEFAULT_CONFIG["advice_refresh_sec"])
     cfg["auto_clean"] = bool(cfg.get("auto_clean", True))
+    cfg["escalate_clean"] = bool(cfg.get("escalate_clean", True))
     cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
@@ -152,6 +154,10 @@ def normalize_config(raw) -> dict:
         "count": _clamp_int(raw_stats.get("count"), 0, 10 ** 9, 0),
         "freed": _clamp_int(raw_stats.get("freed"), 0, 10 ** 18, 0),
     }
+    # escalated（自动升档次数）只在非 0 时落键：从没升档过的配置保持原两键形状；
+    # 而一旦升过档，这个计数必须活过 normalize，否则每次加载都被剥掉、永远显示 0
+    if raw_stats.get("escalated"):
+        cfg["stats"]["escalated"] = _clamp_int(raw_stats.get("escalated"), 0, 10 ** 9, 0)
     return cfg
 
 

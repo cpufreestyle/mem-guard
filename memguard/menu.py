@@ -47,10 +47,13 @@ def build_menu(guard) -> pystray.Menu:
         if r.get("stats"):
             guard.cfg["stats"] = r["stats"]   # 与 do_clean 的落盘保持一致，菜单立即刷新
         freed = max(r["freed"], 0)
+        lvl_txt = "激进" if r.get("level") == "aggressive" else "保守"
+        if r.get("escalated"):
+            lvl_txt += "（自动升档）"
         top3 = top_processes_list(3)
         top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
         icon.notify(
-            f"释放 {gb(freed)}  可用物理 {gb(r['after']['avail_phys'])}\n"
+            f"释放 {gb(freed)}  可用物理 {gb(r['after']['avail_phys'])}（{lvl_txt}档）\n"
             f"当前占用 Top3:\n{top_txt}",
             "MemGuard 清理完成",
         )
@@ -153,9 +156,16 @@ def build_menu(guard) -> pystray.Menu:
             {"clean_on_start": not bool(guard.cfg.get("clean_on_start", False))})
         log(f"启动时清理 -> {'开' if guard.cfg['clean_on_start'] else '关'}")
 
+    def on_toggle_escalate(icon, item) -> None:
+        guard.cfg = update_config(
+            {"escalate_clean": not bool(guard.cfg.get("escalate_clean", True))})
+        log(f"清理未达标自动升档 -> {'开' if guard.cfg['escalate_clean'] else '关'}")
+
     def line_stats(_):
         st = guard.cfg.get("stats") or {}
-        return f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
+        esc = int(st.get('escalated', 0))
+        base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
+        return base + (f"（升档 {esc} 次）" if esc else "")
 
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
@@ -305,6 +315,8 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("低内存触发", min_avail_menu()),
         pystray.MenuItem("启动时清理", on_toggle_clean_on_start,
                          checked=lambda i: bool(guard.cfg.get("clean_on_start"))),
+        pystray.MenuItem("清理未达标自动升档", on_toggle_escalate,
+                         checked=lambda i: bool(guard.cfg.get("escalate_clean", True))),
         pystray.MenuItem("开机自启", on_toggle_autostart,
                          checked=lambda i: autostart_enabled()),
         pystray.MenuItem(

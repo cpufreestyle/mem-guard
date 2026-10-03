@@ -112,6 +112,8 @@ class Guard:
             top3 = top_processes_list(3)
             top_txt = "\n".join(f"  {n} {rss / 1024 ** 3:.2f}GB" for n, rss, _ in top3)
             lvl_txt = "激进" if r.get("level") == "aggressive" else "保守"
+            if r.get("escalated"):
+                lvl_txt += "（自动升档）"
             title = "MemGuard 自动清理" if reason == "自动" else f"MemGuard {reason}清理"
             try:
                 self.icon.notify(
@@ -224,6 +226,16 @@ class Guard:
             except Exception:
                 pass
 
+    def _scheduled_due(self, now: float) -> bool:
+        """定时清理是否到期：到期且距上次自动清理已过冷却才返回 True。
+
+        冷却内直接跳过且不推进 last_scheduled，冷却结束后仍能触发，
+        避免与阈值清理背靠背双清双气泡（cooldown 是两次自动清理的冷却）。
+        """
+        sched = self.cfg.get("scheduled_minutes", 0)
+        return bool(sched and now - self.last_scheduled >= sched * 60
+                    and now - self.last_clean > self.cfg["cooldown"])
+
     def monitor(self) -> None:
         self.maybe_reload_config()
         # 启动时清理（对标 Mem Reduct）：放监控线程内做，不阻塞托盘图标出现
@@ -281,8 +293,7 @@ class Guard:
                         and now - self.last_clean > self.cfg["cooldown"]):
                     self._auto_clean(now, "低内存", s)
                 # 触发源 3：定时清理（不看内存占用，按设定间隔触发）
-                sched = self.cfg.get("scheduled_minutes", 0)
-                if sched and now - self.last_scheduled >= sched * 60:
+                if self._scheduled_due(now):
                     self.last_scheduled = now
                     self._auto_clean(now, "定时", s)
             except Exception as e:

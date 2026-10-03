@@ -76,6 +76,23 @@ def test_menu_toggle_writes_current_config(monkeypatch):
     assert guard.cfg["clean_on_start"] is True, "合并结果要立刻回填，勾选态实时生效"
 
 
+def test_menu_toggle_escalate_writes_current_config(monkeypatch):
+    """「清理未达标自动升档」勾选只提交增量 escalate_clean，并即时回填（读写当前配置）。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"escalate_clean": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "清理未达标自动升档")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"escalate_clean": False}], "只提交本次勾选，不带旧快照里的其它字段"
+    assert guard.cfg["escalate_clean"] is False, "合并结果要立刻回填，勾选态实时生效"
+
+
 def test_menu_checked_reads_live_config(monkeypatch):
     """勾选态与子菜单单选态都读当前配置，而不是菜单构建那一刻的值。"""
     guard = _FakeGuard()
@@ -199,3 +216,54 @@ def test_update_now_reads_live_config(monkeypatch):
 
     _find_item(menu_tree, "立即更新到最新版")(guard.icon)
     assert seen and seen[0]["auto_install"] is False
+
+def test_stats_line_shows_escalation_count():
+    """统计行：有升档次数时追加「（升档 N 次）」，一次都没升档时不出现该字样。"""
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "escalated": 3}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "累计清理 5 次" in line
+    assert "（升档 3 次）" in line
+
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
+    line = next(i.text for i in build_menu(guard).items
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "升档" not in line
+
+
+# ---------------------------------------------------------------- 立即清理回显（v1.5.1）
+
+class _FakeIcon:
+    """只提供 on_clean_now 需要的 notify()，不起真实气泡。"""
+
+    def __init__(self):
+        self.messages = []
+
+    def notify(self, text, title=None):
+        self.messages.append((title, text))
+
+
+def test_clean_now_notify_marks_escalation(monkeypatch):
+    """手动清理若补了激进一次，通知要标「（自动升档）」：与托盘自动清理、--once 同口径。"""
+    def _fake_do_clean(reason="手动"):
+        return {
+            "ok": True,
+            "freed": 3 * 1024 ** 3,
+            "level": "aggressive",
+            "escalated": True,
+            "detail": "-",
+            "stats": {"count": 12},
+            "before": {"avail_phys": 4 * 1024 ** 3, "commit_pct": 70.0},
+            "after": {"avail_phys": 7 * 1024 ** 3, "commit_pct": 60.0},
+        }
+
+    monkeypatch.setattr(menu, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
+
+    icon = _FakeIcon()
+    guard = _FakeGuard()
+    _find_item(build_menu(guard), "立即清理")(icon)
+
+    _, body = icon.messages[0]
+    assert "自动升档" in body
+    assert "激进" in body
