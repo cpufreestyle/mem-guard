@@ -17,7 +17,7 @@ from .clean import do_clean, top_processes_list
 from .config import LOG_PATH, __version__, gb, log, update_config
 from .diag import export_diagnostics
 from .ui import show_advice_window, show_top_window, show_trend_window
-from .update import fetch_latest_release
+from .update import fetch_latest_release, install_latest
 from .winapi import is_admin
 
 
@@ -218,6 +218,32 @@ def build_menu(guard) -> pystray.Menu:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_update_now(icon=None, item=None) -> None:
+        """立即更新：后台下载并静默安装，成功则不返回（自动重启到新版本）。"""
+        def worker() -> None:
+            r = install_latest(guard.cfg)
+            if r.get("ok"):
+                return
+            msg = r.get("msg", "更新失败")
+            log(f"立即更新失败: {msg}")
+            if guard.icon:
+                try:
+                    guard.icon.notify(msg, "MemGuard 更新")
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_toggle_auto_update(icon, item) -> None:
+        guard.cfg = update_config(
+            {"auto_update": not bool(guard.cfg.get("auto_update", True))})
+        log(f"自动更新（后台检查） -> {'开' if guard.cfg['auto_update'] else '关'}")
+
+    def on_toggle_auto_install(icon, item) -> None:
+        guard.cfg = update_config(
+            {"auto_install": not bool(guard.cfg.get("auto_install", False))})
+        log(f"下载后自动安装 -> {'开' if guard.cfg['auto_install'] else '关'}")
+
     # -- 菜单结构 ------------------------------------------------
 
     def line_phys(_):
@@ -289,5 +315,10 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("打开日志", on_open_log),
         pystray.MenuItem("导出诊断", on_export),
         pystray.MenuItem(f"检查更新（v{__version__}）", on_check_update),
+        pystray.MenuItem("立即更新到最新版", on_update_now),
+        pystray.MenuItem("自动更新（后台检查）", on_toggle_auto_update,
+                         checked=lambda i: bool(guard.cfg.get("auto_update", True))),
+        pystray.MenuItem("下载后自动安装", on_toggle_auto_install,
+                         checked=lambda i: bool(guard.cfg.get("auto_install", False))),
         pystray.MenuItem("退出", on_quit),
     )

@@ -15,6 +15,7 @@ import time
 
 import pystray
 
+from . import update
 from .advisor import analyze
 from .clean import do_clean, top_processes_list
 from .config import CONFIG_PATH, __version__, gb, load_config, log
@@ -48,6 +49,7 @@ class Guard:
         self.icon: pystray.Icon | None = None
         self._show_event = None       # 唤窗事件句柄：给二次启动的信号用
         self._tray_pin_done = False   # 托盘常驻声明是否已尝试过（只试一次）
+        self._update_checking = False  # 是否已有一次更新检查在途（防重复发起）
 
 
     # -- 循环 ----------------------------------------------------
@@ -173,6 +175,55 @@ class Guard:
         except Exception:
             pass
 
+    def _maybe_check_update(self, now: float) -> None:
+        """后台静默检查更新的节流门：到期且没有在途检查才放行。"""
+        if self._update_checking:
+            return
+        try:
+            if not update.due_for_check(self.cfg, now):
+                return
+            # 先把内存里的时间戳推到当前：interval 可能长达 1 小时，若等 worker
+            # 落盘，这段时间里每个周期都会再次发起检查（弱网时就是连续请求）
+            self.cfg["last_update_check"] = round(now, 3)
+        except Exception as e:
+            log(f"更新检查调度失败: {e!r}")
+            return
+        self._update_checking = True
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self) -> None:
+        """后台线程查一次更新：失败/已最新只写日志，有新版才发一条气泡。
+
+        配了「下载后自动安装」时发现新版会直接进入安装，安装前由
+        _stop_for_update 收掉托盘，保证目标 exe 不被占用。
+        """
+        try:
+            update.check_and_notify(self.cfg, notify=self._notify_update,
+                                    on_ready=self._stop_for_update)
+        except Exception as e:
+            log(f"更新检查异常: {e!r}")
+        finally:
+            self._update_checking = False
+
+    def _notify_update(self, msg: str, title: str) -> None:
+        """更新通知：走托盘气泡，图标还没就绪时静默跳过。"""
+        icon = self.icon
+        if not icon:
+            return
+        try:
+            icon.notify(msg, title)
+        except Exception:
+            pass
+
+    def _stop_for_update(self) -> None:
+        """安装开始前的收尾：停监控循环、收托盘图标，让目标 exe 不被占用。"""
+        self.stop.set()
+        if self.icon:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+
     def monitor(self) -> None:
         self.maybe_reload_config()
         # 启动时清理（对标 Mem Reduct）：放监控线程内做，不阻塞托盘图标出现
@@ -191,6 +242,7 @@ class Guard:
                 self.history.append((time.time(), s["phys_pct"], s["commit_pct"]))
                 now = time.time()
                 self._refresh_advice(now)
+                self._maybe_check_update(now)
                 self._refresh_icon()
                 over = (s["phys_pct"] >= self.cfg["phys_threshold"]
                         or s["commit_pct"] >= self.cfg["commit_threshold"])

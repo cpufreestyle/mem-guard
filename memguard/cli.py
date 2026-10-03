@@ -15,6 +15,7 @@ from .config import (
     _norm_proc_name,
     gb,
     log,
+    load_config,
     normalize_config,
 )
 from .clean import do_clean, top_processes
@@ -23,7 +24,7 @@ from .autostart import autostart_enabled
 from .menu import build_menu
 from .tray import Guard
 from .ui import make_icon, message_box
-from .update import _parse_version
+from .update import _parse_version, check_and_notify, install_latest, pick_asset
 from .winapi import (
     acquire_single_instance,
     get_mem,
@@ -97,6 +98,11 @@ def selftest() -> int:
         f"v1.10.2 > 1.9.9 -> {_parse_version('v1.10.2') > _parse_version('1.9.9')}, "
         f"同版本 -> {_parse_version('1.3.0') == _parse_version('v1.3.0')}"
     ))
+    check("update资产选择", lambda: (
+        f"setup优先->{pick_asset([{'name': 'mem_guard.exe', 'browser_download_url': 'u1'}, {'name': 'MemGuard-Setup-1.5.0.exe', 'browser_download_url': 'u2'}])['name']}, "
+        f"退回便携->{pick_asset([{'name': 'mem_guard.exe', 'browser_download_url': 'u1'}])['name']}, "
+        f"空列表->{pick_asset([])}"
+    ))
     check("advisor", lambda: (
         f"{len(analyze(normalize_config({})))} 条 / "
         f"{len(format_advice(analyze(normalize_config({}))))} 字符"
@@ -144,18 +150,46 @@ def pin_tray_cli() -> int:
     return 1
 
 
+def check_update_cli() -> int:
+    """--check-update：命令行检查一次更新，只打印，不弹窗、不开浏览器。"""
+    r = check_and_notify(load_config(), notify=None)
+    if not r.get("ok"):
+        print(r.get("msg", "检查更新失败"))
+        return 1
+    if r.get("newer"):
+        print(f"发现新版本 {r['tag']}（当前 v{__version__}）")
+        print("可用 --update 直接安装，或右键托盘 → 立即更新到最新版")
+        return 0
+    print(f"已是最新版本（v{__version__}）")
+    return 0
+
+
+def update_cli() -> int:
+    """--update：发现新版本就下载并静默安装；已最新则安静退出。
+
+    安装路径分两种（由 Release 资产决定，见 update.py）：安装版走 Inno 静默
+    升级，便携版等本进程退出后自替换，成功后都会自动拉起新版本。
+    """
+    r = install_latest(load_config())
+    print(r.get("msg", "更新结束"))
+    return 0 if r.get("ok") else 1
+
+
 _USAGE = """MemGuard 用法: mem_guard [选项]
 
 （无参数）   启动托盘常驻程序
 --once      打印一次内存状态并执行一次清理，不进托盘
 --selftest  运行内置自检
 --show      已有实例时静默唤出内存概览窗
+--check-update  检查一次 GitHub Release，只打印不弹窗
+--update    发现新版本则下载并静默安装（完成后自动重启）
 --pin-tray   写 IsPromoted 注册表并重启 Explorer（首装需先手动拖出图标一次，任务栏会闪一下）
 --help/-h   打印本说明
 """
 
 _HELP_FLAGS = ("--help", "-h", "/?")
-_KNOWN_ARGS = ("--once", "--selftest", "--show", "--pin-tray") + _HELP_FLAGS
+_KNOWN_ARGS = ("--once", "--selftest", "--show", "--check-update",
+               "--update", "--pin-tray") + _HELP_FLAGS
 
 
 def _print_usage(stream=None) -> None:
@@ -200,6 +234,10 @@ def main() -> None:
             except Exception:
                 pass
         sys.exit(selftest())
+    elif "--check-update" in sys.argv:
+        sys.exit(check_update_cli())
+    elif "--update" in sys.argv:
+        sys.exit(update_cli())
     elif "--pin-tray" in sys.argv:
         sys.exit(pin_tray_cli())
     else:

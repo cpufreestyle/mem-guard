@@ -172,3 +172,67 @@ def test_pin_tray_advertised_in_usage():
     """漏进 _KNOWN_ARGS 会被当成未知参数拒掉，_USAGE 也要写明白。"""
     assert "--pin-tray" in cli._KNOWN_ARGS
     assert "--pin-tray" in cli._USAGE
+
+
+# ---------------------------------------------------------------- 更新旗标（v1.5.0）
+
+def test_check_update_flag_prints_without_tray(monkeypatch, capsys):
+    """--check-update 只打印结果：不弹气泡、不起托盘。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--check-update"])
+    monkeypatch.setattr(cli, "load_config", lambda: {"auto_update": True})
+    notifies = []
+    monkeypatch.setattr(cli, "check_and_notify",
+                        lambda cfg, notify=None: notifies.append(notify) or
+                        {"ok": True, "newer": True, "tag": "v9.9.9"})
+    guard = _RecordingGuard()
+    monkeypatch.setattr(cli, "Guard", lambda: guard)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert notifies == [None], "命令行检查不该带气泡回调"
+    out = capsys.readouterr().out
+    assert "v9.9.9" in out and "1.5.0" in out
+    assert guard.kwargs is None, "检查更新不该启动托盘"
+
+
+def test_check_update_flag_latest_exits_zero(monkeypatch, capsys):
+    """已是最新：退出码 0，且不出现任何新版本提示。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--check-update"])
+    monkeypatch.setattr(cli, "load_config", lambda: {})
+    monkeypatch.setattr(cli, "check_and_notify",
+                        lambda cfg, notify=None: {"ok": True, "newer": False})
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert "已是最新版本" in capsys.readouterr().out
+
+
+def test_update_flag_installs_without_tray(monkeypatch, capsys):
+    """--update 把安装交给 update 模块：装不成也安静退出，不进 GUI。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--update"])
+    monkeypatch.setattr(cli, "load_config", lambda: {})
+    installs = []
+    monkeypatch.setattr(cli, "install_latest",
+                        lambda cfg: installs.append(cfg) or
+                        {"ok": False, "msg": "已是最新版本（v1.5.0）"})
+    guard = _RecordingGuard()
+    monkeypatch.setattr(cli, "Guard", lambda: guard)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert installs == [{}]
+    assert "已是最新版本" in capsys.readouterr().out
+    assert guard.kwargs is None
+
+
+def test_update_flags_advertised_in_usage():
+    """两个旗标都要在 _KNOWN_ARGS 与 _USAGE 里，否则会被当未知参数拒掉。"""
+    for flag in ("--check-update", "--update"):
+        assert flag in cli._KNOWN_ARGS
+        assert flag in cli._USAGE

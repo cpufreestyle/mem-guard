@@ -290,3 +290,114 @@ def test_declare_tray_pin_swallows_registry_errors(monkeypatch):
     guard._declare_tray_pin()          # 不应抛出
     assert guard._tray_pin_done is True
     assert any("失败" in m for m in logs)
+
+
+# ---------------------------------------------------------------- 后台更新检查（v1.5.0）
+
+class _ThreadRecorder:
+    """只拦 Thread：记录起了哪些后台线程，其余 threading 能力走真的。"""
+
+    def __init__(self):
+        import threading as _real
+        self._real = _real
+        self.started = []
+
+    def Thread(self, target=None, **kw):
+        self.started.append(target)
+        return _NoopThread()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_update_check_dispatches_only_when_due(monkeypatch):
+    """没到期一次检查都不该发起：弱网与 GitHub API 限流都禁不起反复查。"""
+    rec = _ThreadRecorder()
+    monkeypatch.setattr(tray, "threading", rec)
+    monkeypatch.setattr(tray.update, "due_for_check", lambda cfg, now: False)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+    guard = Guard()
+    guard._maybe_check_update(time.time())
+    assert rec.started == []
+    assert guard._update_checking is False
+
+
+def test_update_check_guards_in_flight_and_advances_timestamp(monkeypatch):
+    """到期才发起；在途不重复发起；内存时间戳先推进，防 interval 长达 1h 时连查。"""
+    rec, checks = _ThreadRecorder(), []
+    monkeypatch.setattr(tray, "threading", rec)
+    monkeypatch.setattr(tray.update, "due_for_check", lambda cfg, now: True)
+    monkeypatch.setattr(tray.update, "check_and_notify",
+                        lambda cfg, notify=None, on_ready=None:
+                        checks.append(cfg) or {"ok": True})
+    monkeypatch.setattr(tray, "log", lambda m: None)
+    guard = Guard()
+    now = 1000.0
+    guard._maybe_check_update(now)
+    guard._maybe_check_update(now + 1)          # 在途：不该再起一个
+    assert len(rec.started) == 1, "同一时刻只该有一次更新检查在飞"
+    assert guard.cfg["last_update_check"] == 1000.0
+
+    rec.started[0]()                            # worker 当场跑完
+    assert checks and checks[0] is guard.cfg
+    assert guard._update_checking is False, "跑完要复位，否则再也不会检查"
+
+
+def test_update_check_swallows_scheduler_errors(monkeypatch):
+    """节流判断本身抛异常也不能带崩监控线程。"""
+    def boom(cfg, now):
+        raise RuntimeError("cfg 炸了")
+    rec = _ThreadRecorder()
+    monkeypatch.setattr(tray, "threading", rec)
+    monkeypatch.setattr(tray.update, "due_for_check", boom)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+    guard = Guard()
+    guard._maybe_check_update(time.time())      # 不应抛出
+    assert rec.started == []
+
+
+def test_update_worker_survives_failure(monkeypatch):
+    """检查失败只记日志，托盘继续跑。"""
+    logs = []
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    def boom(*a, **kw):
+        raise ConnectionError("no route")
+    monkeypatch.setattr(tray.update, "check_and_notify", boom)
+    guard = Guard()
+    guard._update_checking = True
+    guard._update_worker()                      # 不应抛出
+    assert guard._update_checking is False
+    assert any("更新检查异常" in m for m in logs)
+
+
+class _NotifyIcon:
+    def __init__(self):
+        self.notes = []
+
+    def notify(self, msg, title=None):
+        self.notes.append((msg, title))
+
+
+def test_notify_update_goes_through_icon(monkeypatch):
+    guard = Guard()
+    guard.icon = _NotifyIcon()
+    guard._notify_update("发现新版本 v9.9.9", "MemGuard 更新")
+    assert guard.icon.notes == [("发现新版本 v9.9.9", "MemGuard 更新")]
+
+    guard.icon = None                           # 图标还没就绪：静默跳过
+    guard._notify_update("x", "y")              # 不应抛出
+
+
+def test_stop_for_update_releases_icon_and_stops_monitor():
+    """安装前必须停监控、收图标，否则目标 exe 被占用、引导批处理覆盖失败。"""
+    class _StopIcon:
+        def __init__(self):
+            self.stopped = False
+        def stop(self):
+            self.stopped = True
+    guard = Guard()
+    guard.icon = _StopIcon()
+    guard._stop_for_update()
+    assert guard.stop.is_set()
+    assert guard.icon.stopped is True

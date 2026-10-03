@@ -36,7 +36,9 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - **配置校验**：越界 / 脏配置会被自动钳制回合法范围，不会让程序跑飞
 - **托盘常驻**：启动时写 `IsPromoted=1` 尝试把图标留在任务栏可见区；`--pin-tray` 会重启 Explorer 立即生效。**实测限制（2026-10-01）**：当前 Windows 构建上 Explorer 不再为程序化登记的图标建注册表条目，首装须在系统托盘设置里手动拖出一次，之后本机制才有着落
 - **托盘自愈**：托盘后端异常退出（如 Explorer 重启）后自动重建图标，避免「程序在跑但图标不见了」
-- **检查更新**：托盘菜单可查询 GitHub 最新 Release，发现新版本会自动打开下载页
+- **自动更新**：托盘后台静默检查 GitHub 最新 Release（默认每 12 小时一次，查询失败或已是最新时
+  完全不打扰）；发现新版本每个版本只弹一次气泡，右键「立即更新到最新版」可一键下载安装，
+  也可开启「下载后自动安装」全自动升级，详见「自动更新」一节
 - **优化建议**：托盘菜单「优化建议」一键分析当前内存状态与配置，给出分级可操作项（页面文件/虚拟内存、权限、阈值合理性、进程高占用与白名单、健康态），无 tkinter 时回退为气泡文本
 - **任务栏按钮有图标**：四个 tkinter 窗口都挂了 MemGuard 自己的品牌图标（蓝底内存颗粒），标题栏 / 任务栏按钮 / Alt-Tab 不再显示 Tk 或 Python 的默认图标；配合 `pin_taskbar.ps1` 可固定到任务栏并建桌面快捷方式，见「任务栏图标与桌面快捷方式」
 
@@ -80,6 +82,8 @@ python mem_guard.py --once       # 打印一次内存状态并执行一次清理
 python mem_guard.py --selftest   # 运行内置自检
 python mem_guard.py --help       # 打印用法；写错的参数会直接报错退出，不会静默启动托盘
 python mem_guard.py --pin-tray   # 写 IsPromoted 注册表 + 重启 Explorer（首装仍需按下方「托盘常驻」手动拖出一次）
+python mem_guard.py --check-update   # 只查一次 GitHub Release 并打印结果，不弹窗、不开浏览器（适合脚本 / 计划任务）
+python mem_guard.py --update         # 发现新版本就下载并静默安装，完成后自动重启到新版本
 python -m pytest -q              # 运行单元测试（先 pip install -r requirements-dev.txt）
 ```
 
@@ -190,6 +194,31 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
 - 判断是否成功：肉眼 / 截图是唯一可信判据。`Shell_NotifyIconGetRect` 会说谎——没有注册表条目的
   活图标照样返回矩形却不渲染（2026-10-01 截图差分证实：slot 零变化），矩形存在不等于图标可见。
 
+## 自动更新
+
+托盘常驻时后台静默检查 GitHub 最新 Release，原则就一条——**能不弹就不弹**：查询失败、网络不通、
+已是最新版本，都只在日志里留一行，不弹窗、不开浏览器、不出下载页。
+
+- **检查节奏**：默认每 12 小时一次（`update_check_hours`，可调 1–168 小时）；托盘启动后立刻查一次，
+  之后由内存时间戳兜着不会重复发起，把 `interval` 改小也不会让检查变密。
+  关掉 `auto_update` 即停掉后台检查（手动菜单项与 CLI 旗标仍可用）。
+- **提醒克制**：同一个新版本只弹**一次**气泡（`update_notified_tag` 记账，重启不重复提醒），
+  文案带手动入口「右键托盘 → 立即更新到最新版」；此前的版本已提醒过就不翻旧账。
+- **手动更新**：右键托盘 → 「立即更新到最新版」，在后台线程里下载安装，**成功不弹任何窗**——
+  引导批处理等本进程退出后原地覆盖 / 静默装 Setup，再自动拉起新版本；只有失败才弹一条气泡说原因。
+  菜单里「检查更新（v1.5.0）」只查不动手，是最新版也一样安静。
+- **全自动**：勾选「下载后自动安装」（`auto_install`）后，检查到新版本会先弹一条「正在下载并安装」
+  的气泡，然后直接走安装流程。默认关闭——更新毕竟是替换掉正在运行的程序，默认交给人确认。
+- **便携版 vs 安装版自动分流**：安装器部署的目录（有 `unins000.exe`）下载 `MemGuard-Setup-x.y.z.exe`，
+  走 /VERYSILENT 原地升级；便携单文件（`dist\mem_guard.exe`）下载便携产物，等进程退出后
+  覆盖自身再重启。下载物落在 %TEMP%，引导批处理用完自删，全程无黑窗。
+  资产挑选走 `pick_asset()`，永远 **setup 优先、便携兜底**；Release 里找不到可用安装包时
+  退回「打开发布页」让人手工下载，不会把用户卡在半截。
+- **源码运行模式不自更新**：`python mem_guard.py` 没有可自替换的 exe，点「立即更新」只打开发布页；
+  命令行 `--update` 同理失败退出，不影响托盘继续跑。
+- **失败不卡死**：下载超时、资产缺失、写脚本失败都在动手之前返回，日志里留可读原因，托盘照常运行，
+  下次到点重新检查。
+
 ## 配置文件
 
 首次运行会在同目录生成 `mem_guard.json`：
@@ -210,6 +239,11 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
 | `scheduled_minutes` | 每隔 N 分钟主动清理一次（不看内存占用），0=关闭 | 0 |
 | `clean_on_start` | 启动后先清理一次 | false |
 | `clean_areas` | 清理区域开关：`standby` / `low_priority_standby` / `modified` / `file_cache` / `working_sets` | 全部 true |
+| `auto_update` | 后台静默检查更新的总开关，关掉后托盘不再自动查询 | true |
+| `update_check_hours` | 后台检查更新的间隔(小时)，限 1–168 | 12 |
+| `auto_install` | 检查到新版本是否直接下载并自动安装（否则只提醒，由你点「立即更新」） | false |
+| `last_update_check` | 上次检查更新的时间戳(秒)，程序自动维护 | 0 |
+| `update_notified_tag` | 已气泡提醒过的最新版本号，用于每版本只提醒一次 | "" |
 | `stats` | 累计统计（清理次数 / 释放量），程序自动维护，菜单顶部可见 | {"count": 0, "freed": 0} |
 
 > 以上数值都会做合法性钳制（如阈值限 50–99、`interval` 限 2–3600 秒），手误写超范围会自动修正，无需担心配置写坏。
@@ -264,7 +298,7 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
 
 ## 版本
 
-当前版本 `1.4.5`。
+当前版本 `1.5.0`。本版新增自动更新（后台静默检查 + 一键 / 自动安装，最小打扰）。
 
 ## 源码结构
 
@@ -280,10 +314,10 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
 | `memguard/ui.py` | 界面层：抗锯齿托盘图标绘制（`make_icon`，4× 超采样）、气泡提示（`message_box`）、内存概览（`show_overview_window`）/ Top10 / 趋势 / 优化建议窗口 |
 | `memguard/autostart.py` | 开机自启：计划任务注册 / 查询 / 卸载（`autostart_enabled` / `install_autostart` / `remove_autostart`） |
 | `memguard/diag.py` | 诊断导出：内存状态 / 进程 / 日志 / 配置打包为 zip（`export_diagnostics`） |
-| `memguard/update.py` | 更新检查：查询 GitHub 最新 Release 并比较版本（`fetch_latest_release` / `_parse_version`） |
+| `memguard/update.py` | 自动更新：查询 GitHub 最新 Release、版本比较、资产挑选、下载与静默安装 / 自替换（`check_and_notify` / `install_latest` / `pick_asset`） |
 | `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（`build_menu(guard)`） |
 | `memguard/tray.py` | 主循环 `Guard`：运行状态、配置热重载、监控循环、托盘图标自愈与常驻声明 |
-| `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、`--pin-tray`、控制台隐藏等启动流处理 |
+| `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、`--check-update`、`--update`、`--pin-tray`、控制台隐藏等启动流处理 |
 | `memguard/advisor.py` | 优化建议引擎：基于内存状态与配置生成分级建议（`analyze` / `format_advice`） |
 | `mem_guard.py` | 薄启动器，仅 `from memguard.cli import main`，保持 `python mem_guard.py` 入口不变 |
 

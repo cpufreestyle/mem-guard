@@ -181,3 +181,40 @@ def test_load_config_reads_plain_utf8(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
 
     assert config.load_config()["clean_level"] == "conservative"
+
+
+# ---------------------------------------------------------------- 自动更新（v1.5.0）
+
+def test_normalize_config_auto_update_defaults():
+    cfg = normalize_config({})
+    assert cfg["auto_update"] is True
+    assert cfg["auto_install"] is False
+    assert cfg["update_check_hours"] == 12
+    assert cfg["last_update_check"] == 0.0
+    assert cfg["update_notified_tag"] == ""
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (0, 1),            # 低于下限 -> 1 小时
+    (99999, 168),      # 高于上限 -> 1 周
+    (36, 36),
+    ("24", 24),
+    ("abc", 12),       # 非数字 -> 默认
+    (None, 12),
+])
+def test_normalize_config_update_check_hours_clamp(raw, expected):
+    assert normalize_config({"update_check_hours": raw})["update_check_hours"] == expected
+
+
+def test_normalize_config_auto_update_toggles_are_booleans():
+    cfg = normalize_config({"auto_update": 0, "auto_install": 1})
+    assert cfg["auto_update"] is False
+    assert cfg["auto_install"] is True
+
+
+def test_normalize_config_last_update_check_tolerates_dirty_values():
+    """时间戳是程序自己维护的字段：脏值不能把加载配置这一步带崩。"""
+    assert normalize_config({"last_update_check": "not-a-number"})["last_update_check"] == 0.0
+    assert normalize_config({"last_update_check": "123.5"})["last_update_check"] == 123.5
+    assert normalize_config({"last_update_check": -5})["last_update_check"] == 0.0
+    assert normalize_config({"update_notified_tag": None})["update_notified_tag"] == ""

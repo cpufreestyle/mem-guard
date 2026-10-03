@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.4.6"
+__version__ = "1.5.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -52,6 +52,12 @@ DEFAULT_CONFIG = {
         "file_cache": True,           # 清空系统文件缓存工作集
         "working_sets": True,         # 清空系统工作集（仅激进档生效）
     },
+    # ---- 自动更新（v1.5.0；最小打扰：只后台检查+每版本一条气泡，安装需显式开）----
+    "auto_update": True,        # 后台静默检查 GitHub Release
+    "update_check_hours": 12,    # 检查间隔(小时)，钳制 1..168
+    "auto_install": False,      # 发现新版自动下载并静默安装（完成后自动重启）
+    "last_update_check": 0,     # 上次检查时间戳(epoch 秒)，程序维护
+    "update_notified_tag": "",  # 已气泡提醒过的版本 tag，去重
     # ---- 累计统计（由 do_clean 维护并持久化）----
     "stats": {"count": 0, "freed": 0},
 }
@@ -129,6 +135,16 @@ def normalize_config(raw) -> dict:
     cfg["clean_areas"] = {
         k: bool(raw_areas.get(k, DEFAULT_CONFIG["clean_areas"][k])) for k in CLEAN_AREA_KEYS
     }
+    # 自动更新：间隔钳制在 1 小时..1 周；两个开关容错为 bool；时间戳容忍脏值
+    cfg["update_check_hours"] = _clamp_int(
+        cfg.get("update_check_hours"), 1, 168, DEFAULT_CONFIG["update_check_hours"])
+    cfg["auto_update"] = bool(cfg.get("auto_update", True))
+    cfg["auto_install"] = bool(cfg.get("auto_install", False))
+    try:
+        cfg["last_update_check"] = max(0.0, float(cfg.get("last_update_check") or 0))
+    except (TypeError, ValueError):
+        cfg["last_update_check"] = 0.0
+    cfg["update_notified_tag"] = str(cfg.get("update_notified_tag") or "")
     # 累计统计：非负整数
     raw_stats = cfg.get("stats")
     raw_stats = raw_stats if isinstance(raw_stats, dict) else {}

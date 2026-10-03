@@ -112,3 +112,90 @@ def test_menu_toggle_persists_without_clobbering(monkeypatch, tmp_path):
     assert on_disk["cooldown"] == 900
     assert on_disk["clean_on_start"] is True, "勾选本身要生效"
     assert guard.cfg["clean_on_start"] is True
+
+
+# ---------------------------------------------------------------- 更新菜单（v1.5.0）
+
+def test_update_menu_items_present_with_live_checked_state():
+    """更新三件套必须出现在菜单里，勾选态读当前配置。"""
+    guard = _FakeGuard()
+    menu_tree = build_menu(guard)
+    assert _find_item(menu_tree, "立即更新到最新版")
+    assert _find_item(menu_tree, "自动更新（后台检查）").checked is True
+    assert _find_item(menu_tree, "下载后自动安装").checked is False
+
+    # 配置被热重载后，勾选态要跟着变
+    guard.cfg = normalize_config({"auto_update": False, "auto_install": True})
+    assert _find_item(menu_tree, "自动更新（后台检查）").checked is False
+    assert _find_item(menu_tree, "下载后自动安装").checked is True
+
+
+def test_update_toggles_submit_increment_only(monkeypatch):
+    """两个更新开关都只提交自己的增量，合并结果立刻回填 guard.cfg。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+    guard = _FakeGuard()
+    menu_tree = build_menu(guard)
+
+    _find_item(menu_tree, "自动更新（后台检查）")(guard.icon)
+    assert merged == [{"auto_update": False}]
+    assert guard.cfg["auto_update"] is False
+
+    _find_item(menu_tree, "下载后自动安装")(guard.icon)
+    assert merged[-1] == {"auto_install": True}
+    assert guard.cfg["auto_install"] is True
+
+
+class _RecordingIcon:
+    def __init__(self):
+        self.notes = []
+
+    def notify(self, msg, title=None):
+        self.notes.append(msg)
+
+
+class _InlineThreading:
+    """把后台线程改成当场跑完，方便同步断言安装结果。"""
+
+    def Thread(self, target=None, **kw):
+        target()
+        return _NoopThread()
+
+
+class _NoopThread:
+    def start(self):
+        pass
+
+
+def test_update_now_only_notifies_on_failure(monkeypatch):
+    """立即更新：成功走安装（进程随后重启）不再打扰，失败才气泡告知。"""
+    monkeypatch.setattr(menu, "threading", _InlineThreading())
+    guard = _FakeGuard()
+    guard.icon = _RecordingIcon()
+    menu_tree = build_menu(guard)
+    item = _find_item(menu_tree, "立即更新到最新版")
+
+    monkeypatch.setattr(menu, "install_latest",
+                        lambda cfg: {"ok": True, "action": "installed"})
+    item(guard.icon)
+    assert guard.icon.notes == [], "安装成功不该再弹气泡"
+
+    monkeypatch.setattr(menu, "install_latest",
+                        lambda cfg: {"ok": False, "msg": "下载失败：网络不通"})
+    item(guard.icon)
+    assert guard.icon.notes == ["下载失败：网络不通"]
+
+
+def test_update_now_reads_live_config(monkeypatch):
+    """安装读的是当前配置（auto_install 等），不是菜单构建那一刻的快照。"""
+    monkeypatch.setattr(menu, "threading", _InlineThreading())
+    seen = []
+    monkeypatch.setattr(menu, "install_latest",
+                        lambda cfg: seen.append(cfg) or {"ok": True})
+    guard = _FakeGuard({"auto_install": True})
+    menu_tree = build_menu(guard)
+    guard.cfg = normalize_config({"auto_install": False})   # 模拟热重载
+
+    _find_item(menu_tree, "立即更新到最新版")(guard.icon)
+    assert seen and seen[0]["auto_install"] is False
