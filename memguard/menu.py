@@ -259,7 +259,9 @@ def build_menu(guard) -> pystray.Menu:
         show_trend_window(lambda: list(guard.history))
 
     def on_advice(icon=None, item=None) -> None:
-        show_advice_window(guard.cfg)
+        # 两个都传 callable：一键应用会经 update_config 换掉 guard.cfg 这个对象，
+        # proc_history 也只在监控线程里长——刷新时现取才不是开窗那一刻的旧快照。
+        show_advice_window(lambda: guard.cfg, lambda: guard.proc_history)
 
     def on_apply_advice(icon=None, item=None) -> None:
         """不弹窗、一键应用当前可落地的优化建议（与建议窗口共用同一套动作表）。
@@ -274,7 +276,7 @@ def build_menu(guard) -> pystray.Menu:
 
         try:
             items = analyze(guard.cfg, guard.state, top_processes_list(15),
-                            leaks=guard.leaks)
+                            leaks=guard.leaks, history=guard.proc_history)
             done = apply_advice_actions(items, _apply)
         except Exception as e:
             log(f"优化建议一键应用异常: {e!r}")

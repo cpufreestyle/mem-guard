@@ -105,7 +105,9 @@ class Guard:
             "trend": lambda: show_trend_window(lambda: list(self.history)),
             # 传 callable 而非 dict：窗口内「一键应用」会经 update_config 换掉
             # guard.cfg 这个对象，传 callable 才能让窗口刷新读到最新配置。
-            "advice": lambda: show_advice_window(lambda: self.cfg),
+            # history 同理：v1.15.0 的覆盖面自调优建议只认 proc_history 这份采样。
+            "advice": lambda: show_advice_window(lambda: self.cfg,
+                                                  lambda: self.proc_history),
         })
 
     # -- 唤窗信号（从任务栏再点一次图标时用）-------------------------------------

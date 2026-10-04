@@ -264,7 +264,8 @@ def test_top_falls_back_to_messagebox_without_tkinter(monkeypatch):
 def test_advice_falls_back_to_messagebox_without_tkinter(monkeypatch):
     monkeypatch.setitem(sys.modules, "tkinter", None)
     monkeypatch.setattr(ui, "analyze",
-                        lambda cfg: [{"level": "tip", "title": "标题", "text": "正文"}])
+                        lambda cfg, history=None: [
+                            {"level": "tip", "title": "标题", "text": "正文"}])
     box = _capture_box(monkeypatch)
     show_advice_window({})
     assert _wait(box["ev"].is_set)
@@ -510,7 +511,7 @@ def test_advice_window_reads_live_config_when_given_callable(monkeypatch):
     """传 callable 时走「实时配置」：托盘一键应用后刷新必须读到新档位。"""
     monkeypatch.setitem(sys.modules, "tkinter", None)
     seen = []
-    monkeypatch.setattr(ui, "analyze", lambda cfg: seen.append(cfg) or [])
+    monkeypatch.setattr(ui, "analyze", lambda cfg, history=None: seen.append(cfg) or [])
     box = _capture_box(monkeypatch)
 
     live = {"clean_level": "conservative"}
@@ -526,8 +527,26 @@ def test_advice_window_still_accepts_plain_dict(monkeypatch):
     """向后兼容：传 dict 也照常工作（测试与其它调用方不需要改）。"""
     monkeypatch.setitem(sys.modules, "tkinter", None)
     cfg = {"clean_level": "aggressive"}
-    monkeypatch.setattr(ui, "analyze", lambda c: (cfg is c) and [])
+    monkeypatch.setattr(ui, "analyze", lambda c, history=None: (cfg is c) and [])
     box = _capture_box(monkeypatch)
     show_advice_window(cfg)
     assert _wait(box["ev"].is_set)
     assert box["title"] == "MemGuard - 优化建议"
+
+
+def test_advice_window_passes_proc_history(monkeypatch):
+    """覆盖面自调优（v1.15.0）要能看到采样：history 必须喂进 analyze。
+
+    窗口刷新与「全部应用」都会重新 analyze；不带 history 时这条建议在用户眼前消失，
+    托盘计数里却算着它——两边说的不是同一回事。
+    """
+    monkeypatch.setitem(sys.modules, "tkinter", None)
+    seen = []
+    monkeypatch.setattr(ui, "analyze",
+                        lambda cfg, history=None: seen.append(history) or [])
+    box = _capture_box(monkeypatch)
+    hist = [(0.0, {1: ("chrome.exe", 1024)})]
+
+    show_advice_window(lambda: {}, lambda: hist)
+    assert _wait(box["ev"].is_set)
+    assert seen and seen[-1] is hist, "callable 形式每次刷新现取 proc_history"

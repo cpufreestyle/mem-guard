@@ -647,12 +647,16 @@ def apply_advice_actions(items: list, apply_fn) -> list:
     return done
 
 
-def show_advice_window(cfg) -> None:
+def show_advice_window(cfg, history=None) -> None:
     """弹出可刷新的优化建议窗口；无 tkinter 时回退到 MessageBox。
 
     cfg 既可以是配置 dict，也可以是返回 dict 的 callable（托盘传后者）：一键应用
     会写配置并让 guard.cfg 换成新 dict，传 callable 才能让「刷新」读到最新配置，
     否则窗口里看到的永远是开窗那一刻的旧快照。
+    history 同理，喂的是 Guard.proc_history（v1.15.0 覆盖面自调优的采样依据）：
+    list/dict 按快照用，callable 则每次刷新现取。托盘计数（_refresh_advice）是带
+    history 的，这里不喂就会出现「菜单说有几条建议、点开却看不到，想应用也没有」
+    的落差，可应用计数还会虚挂不清零。
     """
     global _advice_window_open
     if _advice_window_open:
@@ -662,13 +666,18 @@ def show_advice_window(cfg) -> None:
     def current_cfg() -> dict:
         return cfg() if callable(cfg) else cfg
 
+    def current_history():
+        return history() if callable(history) else history
+
     def worker() -> None:
         global _advice_window_open
         try:
             import tkinter as tk
         except Exception:
             _advice_window_open = False
-            message_box("MemGuard - 优化建议", format_advice(analyze(current_cfg())))
+            message_box("MemGuard - 优化建议",
+                        format_advice(analyze(current_cfg(),
+                                              history=current_history())))
             return
         try:
             root = tk.Tk()
@@ -703,14 +712,15 @@ def show_advice_window(cfg) -> None:
                 return run
 
             def apply_all() -> None:
-                done = apply_advice_actions(analyze(current_cfg()), update_config)
+                done = apply_advice_actions(
+                    analyze(current_cfg(), history=current_history()), update_config)
                 if done:
                     log("优化建议一键应用 | 全部 " +
                         "、".join(str(a.get("label", "应用")) for a in done))
                 refresh()
 
             def refresh() -> None:
-                items = analyze(current_cfg())
+                items = analyze(current_cfg(), history=current_history())
                 body.delete("1.0", "end")
                 if not items:
                     body.insert("end", "未发现明显可优化项，当前配置与内存状态良好。")

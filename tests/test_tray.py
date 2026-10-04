@@ -177,8 +177,11 @@ def test_open_overview_wires_window_hooks(monkeypatch):
                         lambda: seen.setdefault("hits", []).append("top"))
     monkeypatch.setattr(tray, "show_trend_window",
                         lambda _h: seen.setdefault("hits", []).append("trend"))
-    monkeypatch.setattr(tray, "show_advice_window",
-                        lambda _cfg: seen.setdefault("hits", []).append("advice"))
+    def _grab_advice(_cfg, _history=None):
+        seen.setdefault("hits", []).append("advice")
+        seen["advice_args"] = (callable(_cfg), callable(_history))
+
+    monkeypatch.setattr(tray, "show_advice_window", _grab_advice)
 
     guard = Guard()
     guard.open_overview()
@@ -188,6 +191,7 @@ def test_open_overview_wires_window_hooks(monkeypatch):
     seen["trend"]()
     seen["advice"]()
     assert seen["hits"] == ["top", "trend", "advice"]
+    assert seen["advice_args"] == (True, True), "cfg 与 history 都该传 callable：窗口刷新才读到最新配置与采样"
 
 
 def test_guard_icon_left_click_opens_overview():

@@ -30,6 +30,7 @@ class _FakeGuard:
         self.advice_apply_count = 1
         self.history = []
         self.leaks = []
+        self.proc_history = []
         self.icon = None
         self.stop = threading.Event()
 
@@ -364,7 +365,7 @@ def test_menu_one_click_apply_writes_increment_and_logs(monkeypatch):
     monkeypatch.setattr(menu, "log", logged.append)
     monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
     monkeypatch.setattr(menu, "analyze",
-                        lambda cfg, mem=None, top=None, leaks=None: [
+                        lambda cfg, mem=None, top=None, leaks=None, history=None: [
         {"title": "自动清理已关闭",
          "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
         {"title": "预警未开启",
@@ -412,7 +413,7 @@ def test_menu_apply_advice_skips_failing_single_action(monkeypatch):
     monkeypatch.setattr(menu, "log", logged.append)
     monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
     monkeypatch.setattr(menu, "analyze",
-                        lambda cfg, mem=None, top=None, leaks=None: [
+                        lambda cfg, mem=None, top=None, leaks=None, history=None: [
         {"title": "自动清理已关闭",
          "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
         {"title": "预警未开启",
@@ -437,6 +438,49 @@ def test_menu_apply_advice_skips_failing_single_action(monkeypatch):
     assert merged == [dict(auto_clean=True)], "失败那条被跳过，成功那条照写"
     assert guard.advice_apply_count == 1, "计数只减成功的条数"
     assert any("优化建议一键应用 | " in m for m in logged)
+
+
+def test_menu_apply_advice_feeds_proc_history(monkeypatch):
+    """一键应用要把 proc_history 喂给 analyze：覆盖面自调优（v1.15.0）才有据可依。
+
+    托盘计数（_refresh_advice）本来就带 history；一键应用若不带，菜单上说有几条建
+    议、点开却看不到，且 advice_apply_count 扣不完、菜单项永远置不了灰。
+    """
+    seen = {}
+    monkeypatch.setattr(menu, "log", lambda m: None)
+    monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
+
+    def _analyze(cfg, mem=None, top=None, leaks=None, history=None):
+        seen["history"] = history
+        return []
+
+    monkeypatch.setattr(menu, "analyze", _analyze)
+    monkeypatch.setattr(menu, "update_config", lambda ch: dict(ch))
+
+    guard = _FakeGuard()
+    guard.advice_apply_count = 0
+    hist = [(0.0, {1: ("chrome.exe", 1024)})]
+    guard.proc_history = hist
+
+    item = _find_item_by_text(build_menu(guard), "一键应用优化建议")
+    item(guard.icon)
+
+    assert seen.get("history") is hist, "proc_history 必须原样喂进 analyze"
+
+
+def test_menu_advice_window_gets_cfg_and_history(monkeypatch):
+    """建议窗口要拿到「实时配置 + 采样」两个 callable：旧快照会让刷新读过期结论。"""
+    seen = {}
+    monkeypatch.setattr(menu, "show_advice_window",
+                        lambda cfg, history=None: seen.update(
+                            cfg=cfg, history=history))
+
+    guard = _FakeGuard()
+    item = _find_item_by_text(build_menu(guard), "优化建议")
+    item(guard.icon)
+
+    assert callable(seen["cfg"]) and seen["cfg"]() is guard.cfg
+    assert callable(seen["history"]) and seen["history"]() is guard.proc_history
 
 
 def test_menu_toggle_predict_clean_writes_current_config(monkeypatch):
