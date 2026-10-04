@@ -17,10 +17,13 @@ import pystray
 
 from . import update
 from .advisor import (advice_actions, analyze, frequent_escalation,
-                      frequent_short_relief)
-from .clean import (GROWTH_MAX_SAMPLES, do_clean, leak_candidates,
-                    predictive_due, top_processes_list)
-from .config import CONFIG_PATH, __version__, gb, load_config, log, update_config
+                      frequent_short_relief, narrow_top_coverage)
+from .clean import (GROWTH_MAX_SAMPLES, _HEADROOM_MAX, _HEADROOM_STEP,
+                    _MINAVAIL_MAX, _MINAVAIL_STEP,
+                    do_clean, leak_candidates, predictive_due,
+                    top_processes_list)
+from .config import (CONFIG_PATH, TARGET_CLEAN_TOP_MAX, __version__, gb,
+                     load_config, log, update_config)
 from .menu import build_menu
 from .ui import (make_icon, show_advice_window, show_overview_window,
                 show_top_window, show_trend_window)
@@ -36,6 +39,13 @@ TRAY_PIN_WAIT = 15.0
 # ---- 自适应冷却（v1.10.0）：短效复发时把下次最小间隔压缩，连续 hold 住后恢复用户值 ----
 _COOLDOWN_SHRINK = 0.5   # 压缩系数：短效复发后的最小间隔 = max(cooldown * 系数, floor)
 _COOLDOWN_OK_STREAK = 2  # 连续这么多次距上次清理 >= effect_min_relief_sec，就恢复完整 cooldown
+
+# ---- 清理提前量自调优（v1.16.0）：效果连续偏短时把判定阈值提前几个百分点 ----
+_HEADROOM_STRIKES = 2    # 连续这么多次效果偏短，就把 target_headroom_pct 加上 _HEADROOM_STEP 个百分点
+
+
+# ---- 低内存下限自调优（v1.17.0）：绝对下限触发的清理连续偏短时抬高 min_avail_mb ----
+_MINAVAIL_STRIKES = 2    # 连续这么多次「低内存触发且效果偏短」，就把绝对下限抬高 _MINAVAIL_STEP MB
 
 
 class Guard:
@@ -67,7 +77,14 @@ class Guard:
         # 内存压力时置位，下一轮自动清理直接按激进档执行（见 _post_clean_learn）
         self._sticky_aggr = False
         # v1.12.0 阶梯阶段自学习：某阶段连续多次没释放出东西就跳过它（不落盘）
-        self._stage_zero = {"targeted": 0, "bg": 0}
+        # v1.15.0 起加深也算一个可学的阶段：它只跳过撒宽补刀，第一轮定向照跑
+        self._stage_zero = {"targeted": 0, "bg": 0, "deepen": 0}
+
+        # v1.17.0 低内存下限自调优（纯内存态，不落盘）：_last_clean_reason 记住上一次
+        # 自动清理的触发源——_note_relief 度量的是上一次清理的效果，归因要配上它；
+        # _lowmem_short_streak 累计「低内存触发且效果偏短」的连发次数，达标才抬高下限
+        self._last_clean_reason = ""
+        self._lowmem_short_streak = 0
 
 
     # -- 循环 ----------------------------------------------------
@@ -146,12 +163,20 @@ class Guard:
                 f"上次清理未稳住内存（效果偏短）")
         self.last_clean = now
         self._note_relief(relief, low_relief)
+        # _note_relief 度量的是上一次清理的效果，归因要配上一次的触发源，故在它之后
+        # 才更新（这一次的原因留给下一次效果判定用）
+        self._last_clean_reason = reason
+        # 绝对下限触发（可用物理内存低于 min_avail_mb）时给本次清理打上低内存标记，
+        # do_clean 据此累计 stats.low_mem，作为抬高该下限的证据
+        low_mem = (reason == "低内存")
         self.over_since = None
         kw = {}
         if preventive:
             kw["preventive"] = True
         if low_relief:
             kw["low_relief"] = True
+        if low_mem:
+            kw["low_mem"] = True
         # 泄漏进程一起带下去：定向清理会优先清它们（见 do_clean 的 growth_rows）
         sticky_on = self._sticky_aggr and self._sticky_allowed()
         r = do_clean(reason, growth_rows=self.leaks, sticky=sticky_on,
@@ -235,13 +260,25 @@ class Guard:
 
         relief 为 None（上次清理来自手动/CLI，或无上次记录）时不判定；短效累计
         _relief_short_streak，连续 _COOLDOWN_OK_STREAK 次达标清零、恢复完整冷却。
+        v1.17.0 起还驱动低内存下限自调优（_maybe_adapt_min_avail）：只有上一次清理
+        本来就是被绝对下限叫起来的，短效才算它的证据（归因配 _last_clean_reason）。
         """
         if relief is None:
             return
         if low_relief:
             self._relief_ok_streak = 0
             self._relief_short_streak += 1
+            if self._relief_short_streak >= _HEADROOM_STRIKES:
+                self._maybe_adapt_headroom()
+            # 百分比阈值触发的短效归提前量管；只有低内存下限触发的才算它的证据
+            if self._last_clean_reason == "低内存":
+                self._lowmem_short_streak += 1
+                if self._lowmem_short_streak >= _MINAVAIL_STRIKES:
+                    self._maybe_adapt_min_avail()
+            else:
+                self._lowmem_short_streak = 0
         else:
+            self._lowmem_short_streak = 0
             self._relief_ok_streak += 1
             if self._relief_ok_streak >= _COOLDOWN_OK_STREAK:
                 self._relief_short_streak = 0
@@ -261,7 +298,8 @@ class Guard:
         """本轮要跳过的阶梯阶段名集合（stage_learn 关闭或未达标时为空集）。
 
         某阶段连续 stage_learn_strikes 次没释放出东西，说明它对当前这轮压力
-        没用，跳过省时间；只影响 targeted/bg 两个阶梯阶段，升档不受影响。
+        没用，跳过省时间；只影响 targeted/bg/deepen 这几个阶梯阶段（ deepen 被跳过
+        只是不再撒宽加深，第一轮定向大户照跑），升档不受影响。
         """
         if not self.cfg.get("stage_learn", True):
             return set()
@@ -283,12 +321,14 @@ class Guard:
         本轮真的跑了阶梯时更新——粘滞轮整条阶梯都被跳过，没什么可学的。
          v1.13.0 起定向加深的释放量已计入 targeted_freed，这里看到的仍是「定向这
          一级」的总战绩：加深也算这级有用，不会把它误判成该跳过的空转阶段。
+        v1.15.0 起加深另有 deepen_rounds / deepen_freed 单独报量，于是它可以被单独
+        学：连续多轮加深都清不出东西就只跳过加深，别每次都白撒一张更宽的网。
         """
         if not r.get("still"):
             if self._sticky_aggr:
                 log("粘滞激进退出 | 清理后压力已解除，下次自动清理回到保守档起重")
             self._sticky_aggr = False
-            self._stage_zero = {"targeted": 0, "bg": 0}
+            self._stage_zero = {"targeted": 0, "bg": 0, "deepen": 0}
             return ""
         note = ""
         if not r.get("sticky") and not self._sticky_aggr and self._sticky_allowed():
@@ -300,6 +340,10 @@ class Guard:
                 self._bump_stage_zero("targeted", r.get("targeted_freed") or 0)
             if r.get("bg_trim"):
                 self._bump_stage_zero("bg", r.get("bg_freed") or 0)
+            # v1.15.0 加深单学一级：按实际跑过的轮数报量；因收益衰减提前收尾而少跑
+            # 不等于失败，交给 strikes 兜底
+            if r.get("deepen_rounds"):
+                self._bump_stage_zero("deepen", r.get("deepen_freed") or 0)
         return note
 
     def _maybe_predictive_clean(self, now: float, s: dict) -> bool:
@@ -366,7 +410,9 @@ class Guard:
             self.proc_history.append(
                 (now, {int(pid): (name, int(rss)) for name, rss, pid in top}))
             self.leaks = leak_candidates(self.proc_history)
-            items = analyze(self.cfg, self.state, top, leaks=self.leaks)
+            # v1.15.0：history 一并喂给 analyze，让覆盖面自调优建议有据可依
+            items = analyze(self.cfg, self.state, top, leaks=self.leaks,
+                            history=self.proc_history)
             self.advice_count = len(items)
             self.advice_apply_count = len(advice_actions(items))
         except Exception:
@@ -447,6 +493,131 @@ class Guard:
                     pass
         except Exception as e:
             log(f"自动档位适配异常: {e!r}")
+
+    def _maybe_adapt_top(self) -> None:
+        """定向覆盖面自调优（v1.15.0）：大户榜长期钉在同几个进程时，把大户数 +1。
+
+        单次大户数（target_clean_top）定得太小，就会出现「每轮都在清同一批，旁边
+        新长出来的中等进程一直轮不到」。判据与 advisor 3d 同源：narrow_top_coverage
+        用同一份 proc_history 算集中度，达到阈值才算窄。整台机器整个生命周期最多
+        加一次，并落 target_top_adapt_done 闩（用户可手动改 target_clean_top，
+        这个自动增量只负责把「明显偏窄」这一种情况补上）。写盘走 update_config
+        （读-改-写持锁）；任何异常只记日志，绝不让监控循环崩。
+        """
+        try:
+            cfg = self.cfg
+            if not cfg.get("target_top_adapt", True) or cfg.get("target_top_adapt_done"):
+                return
+            if not narrow_top_coverage(cfg, self.proc_history):
+                return
+            top = int(cfg.get("target_clean_top") or 0)
+            if not (0 < top < TARGET_CLEAN_TOP_MAX):
+                return
+            new_top = top + 1
+            self.cfg = update_config({"target_clean_top": new_top,
+                                      "target_top_adapt_done": True})
+            log(f"自动优化 | 定向大户榜长期集中在同几个进程（单次大户数 {top}），"
+                f"已自动加大户数为 {new_top}（可随时手动改回）")
+            if self.icon:
+                try:
+                    self.icon.notify(
+                        f"定向大户榜长期集中在同几个进程\n"
+                        f"单次大户数 {top} → {new_top}：一次多清几个，"
+                        f"旁边新长出来的中等进程也排得上号\n"
+                        f"（右键菜单可随时改回 target_clean_top）",
+                        "MemGuard 自动优化",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"自动覆盖面适配异常: {e!r}")
+
+    def _maybe_adapt_headroom(self) -> None:
+        """清理提前量自调优（v1.16.0）：效果连续偏短时把判定阈值提前几个百分点。
+
+        贴线清理救火不如提前：连续 _HEADROOM_STRIKES 次距上次自动清理不足
+        effect_min_relief_sec（效果偏短），说明阈值贴常态占用太近，每回都是顶到线
+        才被叫起来。把 target_headroom_pct 加上 _HEADROOM_STEP（封顶 _HEADROOM_MAX），
+        判定「仍受压」时阈值先让出这么多，清理就发生在压力顶上来之前。整台机器整个
+        生命周期最多提前一次，并落 headroom_adapt_done 闩（用户可手动改回
+        target_headroom_pct）。写盘走 update_config（读-改-写持锁）；do_clean 每次
+        现读配置，故下一次清理即用新提前量。任何异常只记日志，绝不让监控循环崩。
+        """
+
+        try:
+            cfg = self.cfg
+            if not cfg.get("headroom_adapt", True) or cfg.get("headroom_adapt_done"):
+                return
+            try:
+                hr = int(cfg.get("target_headroom_pct") or 0)
+            except (TypeError, ValueError):
+                return
+            if not (0 <= hr < _HEADROOM_MAX):
+                return
+            new_hr = min(hr + _HEADROOM_STEP, _HEADROOM_MAX)
+            self.cfg = update_config({"target_headroom_pct": new_hr,
+                                      "headroom_adapt_done": True})
+            log(f"自动优化 | 清理效果连续偏短（短效 {self._relief_short_streak} 连发），"
+                f"触发阈值已自动提前 {hr} → {new_hr} 个百分点（可随时手动改回）")
+            if self.icon:
+                try:
+                    self.icon.notify(
+                        f"清理效果连续偏短（短效 {self._relief_short_streak} 连发）\n"
+                        f"触发阈值已自动提前 {hr} → {new_hr} 个百分点："
+                        f"清理发生在压力顶上来之前\n"
+                        f"（右键菜单或 mem_guard.json 可随时改回 "
+                        f"target_headroom_pct）",
+                        "MemGuard 自动优化",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"自动提前量适配异常: {e!r}")
+
+    def _maybe_adapt_min_avail(self) -> None:
+        """低内存下限自调优（v1.17.0）：绝对下限触发的清理连续偏短时抬高 min_avail_mb。
+
+        min_avail_mb 是「可用物理内存低于它就清理」的绝对红线，也是唯一没有「提前」
+        维度的触发输入：压力由它触发时仍是顶到线才被叫起来。连续 _MINAVAIL_STRIKES 次
+        短效说明这条线本身偏低——把它抬高 _MINAVAIL_STEP MB（封顶 _MINAVAIL_MAX，且不许
+        越过总物理内存的四分之一，否则变成「永远在清」），清理发生得更早更温和。整台
+        机器整个生命周期最多抬高一次，并落 min_avail_adapt_done 闩（用户可手动改回
+        min_avail_mb）。写盘走 update_config（读-改-写持锁）；do_clean 每次现读配置，
+        故下一次清理即用新下限。任何异常只记日志，绝不让监控循环崩。
+        """
+
+        try:
+            cfg = self.cfg
+            if not cfg.get("min_avail_adapt", True) or cfg.get("min_avail_adapt_done"):
+                return
+            try:
+                cur = int(cfg.get("min_avail_mb") or 0)
+            except (TypeError, ValueError):
+                return
+            if not (0 < cur < _MINAVAIL_MAX):
+                return
+            new = min(cur + _MINAVAIL_STEP, _MINAVAIL_MAX)
+            # 红线抬过总物理内存的四分之一就成「永远在清」：那类机器交给用户自己定夺
+            if new * 1024 ** 2 > float(self.state.get("total_phys", 0) or 0) * 0.25:
+                return
+            self.cfg = update_config({"min_avail_mb": new,
+                                      "min_avail_adapt_done": True})
+            log(f"自动优化 | 低内存下限触发的清理连续偏短（短效 {self._lowmem_short_streak} 连发），"
+                f"可用内存下限已自动抬高 {cur} → {new} MB（可随时手动改回）")
+            if self.icon:
+                try:
+                    self.icon.notify(
+                        f"低内存下限触发的清理连续偏短（短效 {self._lowmem_short_streak} 连发）\n"
+                        f"可用内存下限已自动抬高 {cur} → {new} MB：\n"
+                        f"清理发生在可用内存见底之前\n"
+                        f"（右键菜单或 mem_guard.json 可随时改回 "
+                        f"min_avail_mb）",
+                        "MemGuard 自动优化",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"自动低内存下限适配异常: {e!r}")
 
     def _refresh_icon(self) -> None:
         """刷新托盘显示；图标内容没变就不赋值给 pystray。
@@ -549,6 +720,7 @@ class Guard:
                 now = time.time()
                 self._refresh_advice(now)
                 self._maybe_adapt_level()
+                self._maybe_adapt_top()
                 self._maybe_check_update(now)
                 self._refresh_icon()
                 over = (s["phys_pct"] >= self.cfg["phys_threshold"]

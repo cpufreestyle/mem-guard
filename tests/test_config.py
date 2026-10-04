@@ -429,3 +429,84 @@ def test_normalize_config_stats_sticky_roundtrip():
     assert zero["stats"] == {"count": 3, "freed": 100}
     plain = normalize_config({"stats": {"count": 3, "freed": 100}})
     assert plain["stats"] == {"count": 3, "freed": 100}
+
+def test_default_config_v15_keys_present():
+    """v1.15.0 三键（加深收益衰减 + 覆盖面自适应及其一次性闩）必须有默认值。"""
+    assert "stage_deepen_diminish_pct" in DEFAULT_CONFIG
+    assert "target_top_adapt" in DEFAULT_CONFIG
+    assert "target_top_adapt_done" in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["stage_deepen_diminish_pct"] == 50
+    assert d["target_top_adapt"] is True
+    assert d["target_top_adapt_done"] is False
+
+
+def test_normalize_config_stage_deepen_diminish_pct_clamped():
+    """加深收益衰减阈值钳在 [0, 100]、缺省 50：越界与脏值都回落。"""
+    assert normalize_config(
+        {"stage_deepen_diminish_pct": 80})["stage_deepen_diminish_pct"] == 80
+    assert normalize_config(
+        {"stage_deepen_diminish_pct": 999})["stage_deepen_diminish_pct"] == 100
+    assert normalize_config(
+        {"stage_deepen_diminish_pct": -5})["stage_deepen_diminish_pct"] == 0
+    assert normalize_config(
+        {"stage_deepen_diminish_pct": None})["stage_deepen_diminish_pct"] == 50
+    assert normalize_config(
+        {"stage_deepen_diminish_pct": "x"})["stage_deepen_diminish_pct"] == 50
+
+
+def test_normalize_config_target_top_adapt_coercion():
+    """覆盖面自适应开关与其一次性闩 bool 强转，语义与其它开关一致。"""
+    assert normalize_config({"target_top_adapt": 0})["target_top_adapt"] is False
+    assert normalize_config({"target_top_adapt": "off"})["target_top_adapt"] is True
+    assert normalize_config({"target_top_adapt_done": 1})["target_top_adapt_done"] is True
+    assert normalize_config(
+        {"target_top_adapt_done": None})["target_top_adapt_done"] is False
+
+
+def test_default_config_v16_keys_present():
+    """v1.16.0 两键（清理提前量自适应及其一次性闩）必须有默认值。"""
+    assert "headroom_adapt" in DEFAULT_CONFIG
+    assert "headroom_adapt_done" in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["headroom_adapt"] is True
+    assert d["headroom_adapt_done"] is False
+
+
+def test_normalize_config_headroom_adapt_coercion():
+    """提前量自适应开关与其一次性闩 bool 强转，语义与其它开关一致。"""
+    assert normalize_config({"headroom_adapt": 0})["headroom_adapt"] is False
+    assert normalize_config({"headroom_adapt": "off"})["headroom_adapt"] is True
+    assert normalize_config({"headroom_adapt_done": 1})["headroom_adapt_done"] is True
+    assert normalize_config(
+        {"headroom_adapt_done": None})["headroom_adapt_done"] is False
+
+
+def test_default_config_v17_keys_present():
+    """v1.17.0 低内存下限自调优键进默认配置：开关默认开、一次性闩默认未落。"""
+    assert "min_avail_adapt" in DEFAULT_CONFIG
+    assert "min_avail_adapt_done" in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["min_avail_adapt"] is True
+    assert d["min_avail_adapt_done"] is False
+
+
+def test_normalize_config_min_avail_adapt_coercion():
+    """低内存下限自适应开关与其一次性闩 bool 强转，语义与其它开关一致。"""
+    assert normalize_config({"min_avail_adapt": 0})["min_avail_adapt"] is False
+    assert normalize_config({"min_avail_adapt": "off"})["min_avail_adapt"] is True
+    assert normalize_config(
+        {"min_avail_adapt_done": 1})["min_avail_adapt_done"] is True
+    assert normalize_config(
+        {"min_avail_adapt_done": None})["min_avail_adapt_done"] is False
+
+
+def test_normalize_config_stats_low_mem_roundtrip():
+    """低内存触发计数只持久化非 0 值：0/缺失都不落键，统计行按有无决定显示。"""
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "low_mem": 2}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "low_mem": 2}
+    zero = normalize_config({"stats": {"count": 3, "freed": 100, "low_mem": 0}})
+    assert zero["stats"] == {"count": 3, "freed": 100}
+    plain = normalize_config({"stats": {"count": 3, "freed": 100}})
+    assert plain["stats"] == {"count": 3, "freed": 100}
+

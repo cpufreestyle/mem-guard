@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.14.0"
+__version__ = "1.17.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -61,6 +61,16 @@ DEFAULT_CONFIG = {
     # ---- 温和阶梯用尽（v1.14.0）：加深可多轮 + 降压余量，把升档前的温和手段用到极限 ----
     "stage_deepen_rounds": 1,   # 定向加深最多撒宽几轮：每轮候选数再翻倍、大户下限再减半（仍只挑没清过的进程），clamp 1..3
     "target_headroom_pct": 0,   # 降压余量(百分点)：判定「仍受压」时物理/提交阈值先让出这么多，清到留有余量才算按住；clamp 0..20，0=关
+    # ---- 加深收益自适应 + 定向覆盖面自调优（v1.15.0）：还要不要继续，交给度量回答 ----
+    "stage_deepen_diminish_pct": 50,  # 加深单轮释放不足上轮这么多(%)就收尾：边际收益衰减，别为撒宽而撒宽；clamp 0..100，0=关
+    "target_top_adapt": True,        # 开：定向大户榜长期钉在同几个进程时，把单次大户数 +1 撒宽覆盖面（一次性）
+    "target_top_adapt_done": False,  # 已自动加过大户数的闩：挡住重复加码，用户可手动改 target_clean_top
+    # ---- 清理提前量自调优（v1.16.0）：效果连续偏短时把判定阈值提前几个百分点 ----
+    "headroom_adapt": True,          # 开：效果连续偏短时把物理/提交阈值自动提前 5 个百分点（一次性）
+    "headroom_adapt_done": False,    # 已自动提前过的闩：挡住重复加码，用户可手动改 target_headroom_pct
+    # ---- 低内存绝对下限自调优（v1.17.0）：连番短效说明 min_avail_mb 这条线本身偏低 ----
+    "min_avail_adapt": True,         # 开：低内存下限触发的清理连续偏短时，把可用内存下限抬高一级（一次性）
+    "min_avail_adapt_done": False,   # 已自动抬高过低内存下限的闩：挡住重复加码，用户可手动改 min_avail_mb
     "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
     # conservative=仅清 standby list/修改页/文件缓存（温和，对前台几乎无影响，默认）
     # aggressive  =额外清空各进程工作集（释放更多，但前台程序下次访问需重新读盘，可能卡顿）
@@ -91,6 +101,9 @@ DEFAULT_CONFIG = {
 }
 
 CLEAN_LEVELS = ("conservative", "aggressive")
+
+# 单次定向清理最多精确清空的进程数（target_clean_top 的钳制上限）
+TARGET_CLEAN_TOP_MAX = 10
 
 # 清理区域开关的合法键（菜单与配置校验共用）
 CLEAN_AREA_KEYS = ("standby", "low_priority_standby", "modified", "file_cache", "working_sets")
@@ -155,7 +168,7 @@ def normalize_config(raw) -> dict:
     cfg["target_clean_min_mb"] = _clamp_int(
         cfg.get("target_clean_min_mb"), 128, 32768, DEFAULT_CONFIG["target_clean_min_mb"])
     cfg["target_clean_top"] = _clamp_int(
-        cfg.get("target_clean_top"), 1, 10, DEFAULT_CONFIG["target_clean_top"])
+        cfg.get("target_clean_top"), 1, TARGET_CLEAN_TOP_MAX, DEFAULT_CONFIG["target_clean_top"])
     cfg["bg_trim"] = bool(cfg.get("bg_trim", True))
     cfg["predict_clean"] = bool(cfg.get("predict_clean", True))
     cfg["predict_window_min"] = _clamp_int(
@@ -178,6 +191,15 @@ def normalize_config(raw) -> dict:
         cfg.get("stage_deepen_rounds"), 1, 3, DEFAULT_CONFIG["stage_deepen_rounds"])
     cfg["target_headroom_pct"] = _clamp_int(
         cfg.get("target_headroom_pct"), 0, 20, DEFAULT_CONFIG["target_headroom_pct"])
+    cfg["stage_deepen_diminish_pct"] = _clamp_int(
+        cfg.get("stage_deepen_diminish_pct"), 0, 100,
+        DEFAULT_CONFIG["stage_deepen_diminish_pct"])
+    cfg["target_top_adapt"] = bool(cfg.get("target_top_adapt", True))
+    cfg["target_top_adapt_done"] = bool(cfg.get("target_top_adapt_done", False))
+    cfg["headroom_adapt"] = bool(cfg.get("headroom_adapt", True))
+    cfg["headroom_adapt_done"] = bool(cfg.get("headroom_adapt_done", False))
+    cfg["min_avail_adapt"] = bool(cfg.get("min_avail_adapt", True))
+    cfg["min_avail_adapt_done"] = bool(cfg.get("min_avail_adapt_done", False))
     cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
@@ -232,6 +254,9 @@ def normalize_config(raw) -> dict:
     # deepen（定向加深次数）口径同上：非 0 才落键，没加深过的配置保持原形状
     if raw_stats.get("deepen"):
         cfg["stats"]["deepen"] = _clamp_int(raw_stats.get("deepen"), 0, 10 ** 9, 0)
+    # low_mem（低内存下限触发次数）口径同上：非 0 才落键，没被绝对下限叫醒过的配置保持原形状
+    if raw_stats.get("low_mem"):
+        cfg["stats"]["low_mem"] = _clamp_int(raw_stats.get("low_mem"), 0, 10 ** 9, 0)
     return cfg
 
 

@@ -9,8 +9,10 @@
 """
 from __future__ import annotations
 
-from .clean import top_processes_list
-from .config import _norm_proc_name, gb
+from .clean import (_FOCUS_RATIO, _HEADROOM_MAX, _HEADROOM_STEP,
+                    _MINAVAIL_MAX, _MINAVAIL_STEP,
+                    top_focus_ratio, top_processes_list)
+from .config import TARGET_CLEAN_TOP_MAX, _norm_proc_name, gb
 from .winapi import get_mem, is_admin
 
 # 激进档下常被清空工作集、导致卡顿的常见程序（建议加入 user_blacklist）
@@ -77,6 +79,63 @@ def frequent_short_relief(cfg: dict) -> bool:
         return False
     return str(cfg.get("clean_level", "conservative")).strip().lower() != "aggressive"
 
+
+def recurrent_short_relief(cfg: dict) -> bool:
+    """清理效果是否「连续偏短」：短效已累计，却还没到「该改用激进」的程度（v1.16.0）。
+
+    v1.9.0 起 stats.short_relief 记录距上次自动清理不足 effect_min_relief_sec
+    的次数。frequent_short_relief 要 short_relief 过半且 ≥3 次——那条证据更该
+    「一次清到位」，由 tray 的档位自调优（_maybe_adapt_level）与 analyze 的 3b
+    覆盖；这里只捡它漏下的那一档：短效 ≥2 次却还没过半，说明是「清得不够早」而非
+    「清得不够狠」，把判定阈值提前几个百分点比加大清理力度更对症。判据与 tray 的
+    自动提前量适配（_maybe_adapt_headroom）同源，两处必须说一样的话。已自动提前
+    过（headroom_adapt_done）、开关关闭、余量已到上限或为脏值一律 False——没有
+    空间就不下结论，让用户自己决定。
+    """
+
+    st = cfg.get("stats") or {}
+    srt_cnt = int(st.get("short_relief", 0) or 0)
+    if srt_cnt < 2:
+        return False
+    if frequent_short_relief(cfg):
+        return False
+    if not cfg.get("headroom_adapt", True) or cfg.get("headroom_adapt_done"):
+        return False
+    try:
+        hr = int(cfg.get("target_headroom_pct", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= hr < _HEADROOM_MAX
+
+def recurrent_lowmem_shortfall(cfg: dict) -> bool:
+    """低内存下限是否「触发得偏晚」：短效已累计，且多半由绝对下限触发（v1.17.0）。
+
+    v1.17.0 起 stats.low_mem 记录可用物理内存低于 min_avail_mb 而触发清理的次数。
+    recurrent_short_relief 把短效归因给「百分比阈值贴线太近」（把判定阈值提前），
+    这里只捡另一半证据：短效 >= 2 次且其中 >= 2 次是低内存下限触发的，说明
+    min_avail_mb 这条绝对线本身偏低——每回都顶到线才被叫起来，清完没多久又见底。
+    把它抬高 _MINAVAIL_STEP MB（封顶 _MINAVAIL_MAX）比加大清理力度更对症。两条判据
+    互斥：recurrent_short_relief 仍适用时先归提前量管，别让同一份短效证据出两条补偿
+    建议。已自动抬高过（min_avail_adapt_done）、开关关闭、下限已到上限或为脏值、
+    frequent_short_relief（那该改用激进）一律 False——没有空间就不下结论。
+    """
+
+    st = cfg.get("stats") or {}
+    srt_cnt = int(st.get("short_relief", 0) or 0)
+    low_cnt = int(st.get("low_mem", 0) or 0)
+    if srt_cnt < 2 or low_cnt < 2:
+        return False
+    if frequent_short_relief(cfg) or recurrent_short_relief(cfg):
+        return False
+    if not cfg.get("min_avail_adapt", True) or cfg.get("min_avail_adapt_done"):
+        return False
+    try:
+        cur = int(cfg.get("min_avail_mb") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 < cur < _MINAVAIL_MAX
+
+
 def frequent_deepen(cfg: dict) -> bool:
     """定向加深是否「频繁」：累计清理里 deepen 过半且至少 3 次。
 
@@ -122,6 +181,29 @@ def aggressive_not_needed(cfg: dict, mem: dict | None = None) -> bool:
     return True
 
 
+def narrow_top_coverage(cfg: dict, history=None) -> bool:
+    """定向大户榜是否「覆盖面偏窄」：长期钉在同几个进程（v1.15.0）。
+
+    单次大户数（target_clean_top）定得太小时，每轮都在清同一批进程，旁边新长出来的
+    中等进程一直排不上号。判据与 tray 的自动覆盖面适配（_maybe_adapt_top）同源：
+    用同一份 proc_history 算 top_focus_ratio，达到 _FOCUS_RATIO 才算窄。关掉定向
+    清理、已是激进档、大户数不在 1..上限之间、或没有采样可看时一律 False——没有
+    证据就不下结论，让用户自己决定。
+    """
+    if not cfg.get("target_clean", True):
+        return False
+    if str(cfg.get("clean_level", "conservative")).strip().lower() == "aggressive":
+        return False
+    try:
+        top = int(cfg.get("target_clean_top") or 0)
+    except (TypeError, ValueError):
+        return False
+    # 大户数已到上限（或脏值）：没得可加，再建议也是空转，与托盘同门的判断
+    if not (0 < top < TARGET_CLEAN_TOP_MAX):
+        return False
+    return top_focus_ratio(history, top) >= _FOCUS_RATIO
+
+
 def advice_actions(items: list) -> list:
     """从建议列表抽出「可一键应用」的动作：按出现顺序去重，返回 [{"label", "changes"}]。
 
@@ -145,13 +227,15 @@ def advice_actions(items: list) -> list:
 
 
 def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
-            leaks: list | None = None) -> list:
+            leaks: list | None = None, history=None) -> list:
     """返回建议列表，每条为 {"level", "title", "text"}。
 
     mem / top 可外部传入（便于测试，或让监控线程复用同一份采样，避免每轮刷新都扫全进程）；
     省略时现场取值。任何单条建议计算失败都不应阻断其它建议，故逐段 try 容错。
     leaks 是 clean.leak_candidates() 的返回（疑似泄漏进程），传入时多一条泄漏
     提醒；省略（cli / 一次性自检）时不出这条建议。
+    history 是 Guard.proc_history 采样列表，传入时多一条 v1.15.0 的定向覆盖面
+    自调优建议（大户榜长期集中在同几个进程）；省略时不出这条建议。
     """
     items: list = []
     try:
@@ -303,6 +387,59 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
             "text": ("当前物理占用已达阈值，却关闭了「清理未达标自动升档」，保守清理后不会再补激进清理。"
                      "若常出现刚清完又超阈值，建议开启（右键托盘 -> 清理未达标自动升档）。"),
             "action": {"label": "开启自动升档", "changes": {"escalate_clean": True}},
+        })
+
+    # ---- 3d. 定向覆盖面自调优（v1.15.0）：大户榜太窄，加一个就够 ----
+    if narrow_top_coverage(cfg, history):
+        focus = top_focus_ratio(history, int(cfg.get("target_clean_top") or 0))
+        top_now = int(cfg.get("target_clean_top") or 0)
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "定向大户榜长期集中在同几个进程",
+            "text": (f"最近的进程采样里，长期排在定向大户榜上的名字占了 "
+                     f"{focus * 100:.0f}% 的位次：每轮都在清同一批，旁边新长出来的"
+                     f"中等进程一直轮不到。把单次大户数 {top_now} → {top_now + 1}，"
+                     f"一次多清几个就能覆盖到，不必为此把清理力度改成激进"
+                     f"（建议窗口可一键应用）。"),
+            "action": {"label": f"大户数 {top_now}→{top_now + 1}",
+                       "changes": {"target_clean_top": min(top_now + 1,
+                                                          TARGET_CLEAN_TOP_MAX)}},
+        })
+
+    # ---- 3e. 清理提前量自调优（v1.16.0）：短效连续但没到激进，把阈值提前 ----
+    if recurrent_short_relief(cfg):
+        hr = int(cfg.get("target_headroom_pct") or 0)
+        new_hr = min(hr + _HEADROOM_STEP, _HEADROOM_MAX)
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "清理效果连续偏短，建议把阈值提前几个百分点",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {srt_cnt} 次距上次自动清理不足 "
+                     f"效果下限（效果偏短）——上次清完没多久内存又被顶回去。若还没到"
+                     f"「该改用激进」的程度，更可能是阈值贴线太近：把物理/提交判定阈值"
+                     f"提前 {hr} → {new_hr} 个百分点，清理发生在压力顶上来之前，"
+                     f"不必为此加大清理力度（建议窗口可一键应用）。"),
+            "action": {"label": f"提前量 {hr}→{new_hr}",
+                       "changes": {"target_headroom_pct": new_hr,
+                                   "headroom_adapt_done": True}},
+        })
+
+    # ---- 3f. 低内存下限自调优（v1.17.0）：短效多半由绝对下限触发，把红线抬高一点 ----
+    if recurrent_lowmem_shortfall(cfg):
+        low_cnt = int((cfg.get("stats") or {}).get("low_mem", 0) or 0)
+        cur = int(cfg.get("min_avail_mb") or 0)
+        new_mb = min(cur + _MINAVAIL_STEP, _MINAVAIL_MAX)
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "可用内存下限偏低，建议把清理触发线下移一点",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {srt_cnt} 次距上次自动清理不足 "
+                     f"效果下限（效果偏短），且 {low_cnt} 次是可用内存低于 "
+                     f"min_avail_mb 触发的——这条绝对下限本身偏低，每回都顶到线才被叫起来，"
+                     f"清完没多久又见底。把它抬高 {cur} → {new_mb} MB（封顶 "
+                     f"{_MINAVAIL_MAX}），清理发生在可用内存见底之前，不必为此加大清理力度"
+                     f"（建议窗口可一键应用）。"),
+            "action": {"label": f"下限 {cur}→{new_mb}MB",
+                       "changes": {"min_avail_mb": new_mb,
+                                   "min_avail_adapt_done": True}},
         })
 
     # ---- 4. 进程 / 白名单 ----

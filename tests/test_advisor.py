@@ -267,6 +267,89 @@ def test_analyze_silent_when_short_relief_rare():
     assert all("清理效果不佳" not in i["title"] for i in items)
 
 
+# -------------------------------------------- 清理提前量自调优判据（v1.16.0）
+
+
+def test_recurrent_short_relief_needs_floor_but_not_majority():
+    """短效累计 ≥2 但还没过半：建议提前阈值；过半则交给 3b 的「改用激进」。"""
+    base = {"clean_level": "conservative", "stats": {"count": 10, "short_relief": 2}}
+    assert advisor.recurrent_short_relief(base) is True
+    once = {**base, "stats": {"count": 10, "short_relief": 1}}
+    assert advisor.recurrent_short_relief(once) is False
+    # 过半（6/10）：frequent_short_relief 已覆盖，别让同一份证据出两条建议
+    majority = {**base, "stats": {"count": 10, "short_relief": 6}}
+    assert advisor.recurrent_short_relief(majority) is False
+    assert advisor.recurrent_short_relief({**base, "stats": {}}) is False
+    assert advisor.recurrent_short_relief({**base, "headroom_adapt": False}) is False
+    assert advisor.recurrent_short_relief(
+        {**base, "headroom_adapt_done": True}) is False
+    assert advisor.recurrent_short_relief(
+        {**base, "target_headroom_pct": advisor._HEADROOM_MAX}) is False
+    # 脏余量走不到有效区间：没证据就不下结论
+    assert advisor.recurrent_short_relief(
+        {**base, "target_headroom_pct": "x"}) is False
+
+
+def test_analyze_advises_headroom_when_short_relief_recurrent():
+    """短效连续但未过半：建议把判定阈值提前几个百分点，带一键应用动作。"""
+    cfg = normalize_config({"stats": {"count": 5, "short_relief": 2}})
+    items = advisor.analyze(cfg, _mem())
+    hit = [i for i in items if "清理效果连续偏短" in i["title"]]
+    assert len(hit) == 1
+    assert hit[0]["level"] == advisor.LEVEL_TIP
+    assert hit[0]["action"] == {"label": "提前量 0→5",
+                                "changes": {"target_headroom_pct": 5,
+                                            "headroom_adapt_done": True}}
+    assert "2" in hit[0]["text"] and "0 → 5" in hit[0]["text"]
+
+
+def test_recurrent_lowmem_shortfall_needs_low_mem_evidence():
+    """短效里至少 2 次由绝对下限触发才算「下限偏低」；与提前量判据互斥。"""
+    base = {"clean_level": "conservative",
+            "stats": {"count": 10, "short_relief": 2, "low_mem": 2},
+            "min_avail_mb": 1024, "headroom_adapt_done": True}
+    assert advisor.recurrent_lowmem_shortfall(base) is True
+    # 没有低内存触发的证据：短效该归提前量管
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "stats": {"count": 10, "short_relief": 2}}) is False
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "stats": {"count": 10, "short_relief": 2, "low_mem": 1}}) is False
+    # 短效一次都不算连发：没证据就不下结论
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "stats": {"count": 10, "short_relief": 1, "low_mem": 2}}) is False
+    # 短效过半：那该改用激进，不是抬下限
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "stats": {"count": 10, "short_relief": 6, "low_mem": 2}}) is False
+    # 提前量判据仍适用：同一份短效证据只出一条建议，先归提前量管
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "headroom_adapt_done": False}) is False
+    # 开关关闭 / 已抬高过 / 已到上限 / 脏值 / 下限关闭：没有空间就不下结论
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "min_avail_adapt": False}) is False
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "min_avail_adapt_done": True}) is False
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "min_avail_mb": advisor._MINAVAIL_MAX}) is False
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "min_avail_mb": "x"}) is False
+    assert advisor.recurrent_lowmem_shortfall(
+        {**base, "min_avail_mb": 0}) is False
+
+
+def test_analyze_advises_min_avail_when_lowmem_shortfall_recurrent():
+    """短效多半由绝对下限触发：建议把可用内存下限抬高一级，带一键应用动作。"""
+    cfg = normalize_config({"stats": {"count": 5, "short_relief": 2, "low_mem": 2},
+                            "min_avail_mb": 1024, "headroom_adapt_done": True})
+    items = advisor.analyze(cfg, _mem())
+    hit = [i for i in items if "可用内存下限偏低" in i["title"]]
+    assert len(hit) == 1
+    assert hit[0]["level"] == advisor.LEVEL_TIP
+    assert hit[0]["action"] == {"label": "下限 1024→1280MB",
+                                "changes": {"min_avail_mb": 1280,
+                                            "min_avail_adapt_done": True}}
+    assert "2" in hit[0]["text"] and "1024 → 1280" in hit[0]["text"]
+
+
 def test_frequent_deepen_requires_majority_and_floor():
     """加深占比过半且至少 3 次才算「频繁」；档位已激进则无上升空间，返回 False。"""
     base = {"clean_level": "conservative", "stats": {"count": 10, "deepen": 6}}
@@ -317,3 +400,61 @@ def test_analyze_silent_when_no_leak_candidates():
     assert all("疑似泄漏" not in i["title"] for i in items)
     assert all("疑似泄漏" not in i["title"]
                for i in advisor.analyze(normalize_config({}), _mem(), [], leaks=[]))
+
+# ------------- 3d. 定向覆盖面自调优（v1.15.0：大户榜集中在同几个进程才建议加宽）
+
+
+def _narrow_history():
+    """6 份采样里大户榜每次都是同三个进程（跨度 500s）：集中度 1.0。"""
+    return [(1000.0 + i * 100.0,
+             {1: ("a.exe", 4 * GB), 2: ("b.exe", 3 * GB), 3: ("c.exe", 1 * GB)})
+            for i in range(6)]
+
+
+def test_narrow_top_coverage_requires_target_clean_and_evidence():
+    """关定向 / 已是激进档 / 大户数到顶或非正 / 没有采样：一律判「不窄」。"""
+    hist = _narrow_history()
+    assert advisor.narrow_top_coverage(normalize_config({"target_clean_top": 3}),
+                                       hist) is True
+    assert advisor.narrow_top_coverage(
+        normalize_config({"target_clean": False}), hist) is False
+    assert advisor.narrow_top_coverage(
+        normalize_config({"clean_level": "aggressive"}), hist) is False
+    assert advisor.narrow_top_coverage(
+        normalize_config({"target_clean_top": advisor.TARGET_CLEAN_TOP_MAX}),
+        hist) is False
+    # 脏 top 走不到采样：裸 dict 不做 clamp，0 直接判负
+    assert advisor.narrow_top_coverage(
+        {"target_clean": True, "target_clean_top": 0}, hist) is False
+    assert advisor.narrow_top_coverage(
+        normalize_config({"target_clean_top": 3}), None) is False
+    assert advisor.narrow_top_coverage(
+        normalize_config({"target_clean_top": 3}), []) is False
+
+    # 大户数已到上限：连建议都不出，改不动的东西不占建议位
+    cfg = normalize_config({"target_clean_top": advisor.TARGET_CLEAN_TOP_MAX})
+    items = advisor.analyze(cfg, _mem(), [], history=hist)
+    assert not any("集中在同几个进程" in i["title"] for i in items)
+
+
+def test_analyze_advises_wider_top_when_names_cluster():
+    """集中度够了就建议大户数 +1：带一键应用动作，文案点明占比与目标值。"""
+    cfg = normalize_config({"target_clean_top": 3})
+    items = advisor.analyze(cfg, _mem(), [], history=_narrow_history())
+    hit = [i for i in items if "集中在同几个进程" in i["title"]]
+    assert len(hit) == 1
+    assert hit[0]["level"] == advisor.LEVEL_TIP
+    assert hit[0]["action"] == {"label": "大户数 3→4",
+                                "changes": {"target_clean_top": 4}}
+    assert "3 → 4" in hit[0]["text"] and "100% 的位次" in hit[0]["text"]
+
+
+def test_analyze_silent_when_top_coverage_wide():
+    """大户每份都在换人（只有一份长期在榜）：集中度不够，不给这条建议。"""
+    hist = [(1000.0 + i * 100.0,
+             {1: ("keep.exe", 4 * GB), 2: (f"big{i}.exe", 3 * GB)})
+            for i in range(6)]
+    cfg = normalize_config({"target_clean_top": 2})
+    items = advisor.analyze(cfg, _mem(), [], history=hist)
+    assert not any("集中在同几个进程" in i["title"] for i in items)
+

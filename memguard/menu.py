@@ -201,6 +201,24 @@ def build_menu(guard) -> pystray.Menu:
             {"bg_trim": not bool(guard.cfg.get("bg_trim", True))})
         log(f"后台进程工作集清理 -> {'开' if guard.cfg['bg_trim'] else '关'}")
 
+    def on_toggle_target_top_adapt(icon, item) -> None:
+        guard.cfg = update_config(
+            {"target_top_adapt": not bool(guard.cfg.get("target_top_adapt", True))})
+        log(f"定向覆盖面自适应(大户数不足时+1) -> "
+            f"{'开' if guard.cfg['target_top_adapt'] else '关'}")
+
+    def on_toggle_headroom_adapt(icon, item) -> None:
+        guard.cfg = update_config(
+            {"headroom_adapt": not bool(guard.cfg.get("headroom_adapt", True))})
+        log(f"清理提前量自适应(效果偏短时阈值提前) -> "
+            f"{'开' if guard.cfg['headroom_adapt'] else '关'}")
+
+    def on_toggle_min_avail_adapt(icon, item) -> None:
+        guard.cfg = update_config(
+            {"min_avail_adapt": not bool(guard.cfg.get("min_avail_adapt", True))})
+        log(f"低内存下限自适应(可用内存偏低时抬高) -> "
+            f"{'开' if guard.cfg['min_avail_adapt'] else '关'}")
+
     def on_toggle_predict_clean(icon, item) -> None:
         guard.cfg = update_config(
             {"predict_clean": not bool(guard.cfg.get("predict_clean", True))})
@@ -215,6 +233,7 @@ def build_menu(guard) -> pystray.Menu:
         bgt = int(st.get('bg_trimmed', 0))
         stk = int(st.get('sticky', 0))
         dpn = int(st.get('deepen', 0))
+        lm = int(st.get('low_mem', 0))
         base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
         return (base + (f"（升档 {esc} 次）" if esc else "")
                 + (f"（定向 {tgt} 次）" if tgt else "")
@@ -222,7 +241,8 @@ def build_menu(guard) -> pystray.Menu:
                 + (f"（预防 {prev} 次）" if prev else "")
                 + (f"（短效 {srt} 次）" if srt else "")
                 + (f"（后台 {bgt} 次）" if bgt else "")
-                + (f"（粘滞 {stk} 次）" if stk else ""))
+                + (f"（粘滞 {stk} 次）" if stk else "")
+                + (f"（低内存 {lm} 次）" if lm else ""))
 
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
@@ -414,6 +434,18 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("stage_learn", True))),
         pystray.MenuItem("定向清理加深(不达标前再撒宽一轮)", on_toggle_stage_deepen,
                          checked=lambda i: bool(guard.cfg.get("stage_deepen", True))),
+        pystray.MenuItem("定向覆盖面自适应(大户数不足时+1)",
+                         on_toggle_target_top_adapt,
+                         checked=lambda i: bool(
+                             guard.cfg.get("target_top_adapt", True))),
+        pystray.MenuItem("清理提前量自适应(效果偏短时阈值提前)",
+                         on_toggle_headroom_adapt,
+                         checked=lambda i: bool(
+                             guard.cfg.get("headroom_adapt", True))),
+        pystray.MenuItem("低内存下限自适应(可用内存偏低时抬高)",
+                         on_toggle_min_avail_adapt,
+                         checked=lambda i: bool(
+                             guard.cfg.get("min_avail_adapt", True))),
         pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
                          checked=lambda i: bool(guard.cfg.get("predict_clean", True))),
         pystray.MenuItem("开机自启", on_toggle_autostart,

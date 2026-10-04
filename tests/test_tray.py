@@ -87,7 +87,7 @@ def test_advice_refresh_is_time_gated(monkeypatch):
                         lambda n=15: scans.append(n) or [("a.exe", 5 * GB, 1)])
     passed = {}
 
-    def fake_analyze(cfg, mem=None, top=None, leaks=None):
+    def fake_analyze(cfg, mem=None, top=None, leaks=None, history=None):
         passed["top"] = top
         return [{"level": "tip"}, {"level": "warn"}]
 
@@ -119,7 +119,8 @@ def test_advice_survives_scan_failure(monkeypatch):
 def test_advice_refresh_counts_applyable_actions(monkeypatch):
     """一次刷新同时给出「总条数」与「可一键应用条数」，后者供菜单项置灰。"""
     monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
-    monkeypatch.setattr(tray, "analyze", lambda cfg, mem=None, top=None, leaks=None: [
+    monkeypatch.setattr(tray, "analyze",
+                         lambda cfg, mem=None, top=None, leaks=None, history=None: [
         {"title": "自动清理已关闭",
          "action": {"label": "开启自动清理", "changes": dict(auto_clean=True)}},
         {"title": "未以管理员身份运行"},
@@ -141,7 +142,8 @@ def test_hot_reload_resets_advice_throttle(monkeypatch, tmp_path):
     monkeypatch.setattr(tray, "top_processes_list",
                         lambda n=15: scans.append(n) or [("a.exe", 5 * GB, 1)])
     monkeypatch.setattr(tray, "analyze",
-                        lambda cfg, mem=None, top=None, leaks=None: [{"level": "tip"}])
+                        lambda cfg, mem=None, top=None, leaks=None,
+                        history=None: [{"level": "tip"}])
 
     guard = Guard()
     guard.cfg["advice_refresh_sec"] = 600          # 周期拉长到 10 分钟，方便验证清零
@@ -1051,7 +1053,7 @@ def test_advice_refresh_identifies_leak_processes(monkeypatch):
     monkeypatch.setattr(tray, "top_processes_list", _top)
     got = {}
 
-    def _analyze(cfg, mem=None, top=None, leaks=None):
+    def _analyze(cfg, mem=None, top=None, leaks=None, history=None):
         got["leaks"] = leaks
         return []
 
@@ -1189,6 +1191,8 @@ def test_auto_clean_skips_stage_after_zero_release_streak(monkeypatch):
     monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
     monkeypatch.setattr(tray, "top_processes_list", lambda n=15: [])
     monkeypatch.setattr(tray, "log", lambda m: None)
+    # 隔离变量：只验阶段跳过；提前量自调优会写盘并回填 cfg，与本次无关
+    monkeypatch.setattr(tray.Guard, "_maybe_adapt_headroom", lambda self: None)
 
     g = _guard(_state(phys_pct=86.0))
     g.cfg["stage_learn_strikes"] = 2
@@ -1223,3 +1227,340 @@ def test_auto_clean_notify_marks_sticky_and_stage_release(monkeypatch):
     assert "持续高压：粘滞激进" in body
     assert "分阶段释放: 升档 2.5GB" in body
     assert "定向" not in body, "没清到东西的阶段不必列出来"
+
+# --------------------- 加深独立可学（v1.15.0：deepen 是单独一级，不是 targeted 附属）
+
+
+def test_post_clean_learn_counts_deepen_as_its_own_stage(monkeypatch):
+    """加深按轮数与释放量单独报量：连续撒宽都白干，才只跳过加深这一级。"""
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    def _learn(deepen_freed):
+        g = _guard(_state())
+        g.cfg["sticky_aggressive"] = False      # 隔离变量：不进粘滞，只验阶段计数
+        g._post_clean_learn({"still": True, "sticky": False, "deepen_rounds": 1,
+                             "deepen_freed": deepen_freed})
+        return g._stage_zero["deepen"]
+
+    assert _learn(0) == 1, "跑了加深却没清出东西：记一次零释放"
+    assert _learn(2 * GB) == 0, "加深清到了：对应计数清零"
+
+
+def test_post_clean_learn_resets_deepen_counter_when_relieved(monkeypatch):
+    """压力解除：三个阶段的零释放计数一并清零，别把高压期的记忆带过来。"""
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g.cfg["sticky_aggressive"] = False
+    g._stage_zero = {"targeted": 3, "bg": 2, "deepen": 1}
+    note = g._post_clean_learn({"still": False, "sticky": False, "deepen_rounds": 1,
+                                "deepen_freed": 0})
+    assert g._stage_zero == {"targeted": 0, "bg": 0, "deepen": 0}
+    assert note == ""
+
+
+# --------------------- 定向覆盖面自调优（v1.15.0：集中度过高就把大户数 +1）
+
+
+def _top_adapt_cfg(**kw):
+    """构造一份「覆盖面自适应开着、还没加过码」的归一化配置，可按关键字覆盖单项。"""
+    base = {"target_top_adapt": True, "target_top_adapt_done": False,
+            "target_clean": True, "clean_level": "conservative",
+            "target_clean_top": 3}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_auto_top_adapt_bumps_top_once(monkeypatch):
+    """大户榜长期集中：大户数 +1 并落闩，一次生效、有日志有通知。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or {
+                             "target_clean_top": 4, "target_top_adapt_done": True})
+    monkeypatch.setattr(tray, "narrow_top_coverage", lambda cfg, history=None: True)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _top_adapt_cfg()
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_top()
+    assert changes == [{"target_clean_top": 4, "target_top_adapt_done": True}]
+    assert g.cfg["target_clean_top"] == 4
+    assert g.cfg["target_top_adapt_done"] is True
+    assert any("自动优化" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+
+    g._maybe_adapt_top()
+    assert len(changes) == 1, "闩 target_top_adapt_done 生效：不反复加码"
+
+
+def test_auto_top_adapt_skips_when_off_latched_or_capped(monkeypatch):
+    """开关关闭 / 已加过码 / 已到上限 / 覆盖面不窄：四种情形都不写配置。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+    monkeypatch.setattr(tray, "narrow_top_coverage", lambda cfg, history=None: True)
+
+    for kw in ({"target_top_adapt": False}, {"target_top_adapt_done": True},
+               {"target_clean_top": config_mod.TARGET_CLEAN_TOP_MAX}):
+        g = _guard(_state())
+        g.cfg = _top_adapt_cfg(**kw)
+        g._maybe_adapt_top()
+        assert changes == [], kw
+
+    # 覆盖面不窄（集中度没到阈值）：不因为一次集中就加大网
+    monkeypatch.setattr(tray, "narrow_top_coverage", lambda cfg, history=None: False)
+    g = _guard(_state())
+    g.cfg = _top_adapt_cfg()
+    g._maybe_adapt_top()
+    assert changes == []
+
+
+def test_auto_top_adapt_failure_only_logs(monkeypatch):
+    """update_config 抛异常只记日志：自调优失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(_changes):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tray, "update_config", _boom)
+    monkeypatch.setattr(tray, "narrow_top_coverage", lambda cfg, history=None: True)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _top_adapt_cfg()
+    g._maybe_adapt_top()
+    assert any("自动覆盖面适配异常" in m for m in logs)
+
+
+# --------------------- 清理提前量自调优（v1.16.0：效果连续偏短就把阈值提前）
+
+
+def _headroom_adapt_cfg(**kw):
+    """构造一份「提前量自适应开着、还没提前过」的归一化配置，可按关键字覆盖单项。"""
+    base = {"headroom_adapt": True, "headroom_adapt_done": False,
+            "target_headroom_pct": 0, "effect_track": True}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_auto_headroom_adapt_bumps_pct_once(monkeypatch):
+    """效果连续偏短：阈值提前一步并落闩，一次生效、有日志有通知。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or {
+                             "target_headroom_pct": 5, "headroom_adapt_done": True})
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _headroom_adapt_cfg()
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_headroom()
+    assert changes == [{"target_headroom_pct": 5, "headroom_adapt_done": True}]
+    assert g.cfg["target_headroom_pct"] == 5
+    assert g.cfg["headroom_adapt_done"] is True
+    assert any("自动优化" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+
+    g._maybe_adapt_headroom()
+    assert len(changes) == 1, "闩 headroom_adapt_done 生效：不反复提前"
+
+
+def test_auto_headroom_adapt_skips_when_off_latched_or_max(monkeypatch):
+    """开关关闭 / 已提前过 / 余量已到上限：三种情形都不写配置。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    for kw in ({"headroom_adapt": False}, {"headroom_adapt_done": True},
+               {"target_headroom_pct": tray._HEADROOM_MAX}):
+        g = _guard(_state())
+        g.cfg = _headroom_adapt_cfg(**kw)
+        g._maybe_adapt_headroom()
+        assert changes == [], kw
+
+
+def test_note_relief_fires_headroom_adapt_on_consecutive_short(monkeypatch):
+    """连续短效接上自动提前：第一次只记数，第二次落配置，之后不再叠加。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g.cfg = _headroom_adapt_cfg()
+
+    g._note_relief(100, True)
+    assert changes == [], "短效一次只累计，还没到连发门槛"
+
+    g._note_relief(100, True)
+    assert changes == [{"target_headroom_pct": 5, "headroom_adapt_done": True}]
+
+    g._note_relief(900, False)
+    g._note_relief(900, False)
+    assert g._relief_short_streak == 0, "连续达标：短效连发计数清零"
+
+    g._note_relief(100, True)
+    assert len(changes) == 1, "闩已在：短效再连发也不会重复提前"
+
+
+def test_auto_headroom_adapt_failure_only_logs(monkeypatch):
+    """update_config 抛异常只记日志：自调优失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(_changes):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tray, "update_config", _boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _headroom_adapt_cfg()
+    g._maybe_adapt_headroom()
+    assert any("自动提前量适配异常" in m for m in logs)
+
+
+# --------------------- 低内存下限自调优（v1.17.0：绝对下限连续短效就把下限抬高）
+
+
+def _minavail_adapt_cfg(**kw):
+    """构造一份「低内存下限自适应开着、还没抬高过」的归一化配置，可按关键字覆盖单项。"""
+    # headroom_adapt 关掉：短效连发的证据只归低内存下限管，别让提前量适配抢跑
+    base = {"min_avail_adapt": True, "min_avail_adapt_done": False,
+            "min_avail_mb": 1024, "headroom_adapt": False, "effect_track": True}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_auto_min_avail_adapt_bumps_floor_once(monkeypatch):
+    """低内存下限触发的清理连续偏短：下限抬高一级并落闩，一次生效、有日志有通知。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or {
+                             "min_avail_mb": 1280, "min_avail_adapt_done": True})
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _minavail_adapt_cfg()
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_min_avail()
+    assert changes == [{"min_avail_mb": 1280, "min_avail_adapt_done": True}]
+    assert g.cfg["min_avail_mb"] == 1280
+    assert g.cfg["min_avail_adapt_done"] is True
+    assert any("自动优化" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+
+    g._maybe_adapt_min_avail()
+    assert len(changes) == 1, "闩 min_avail_adapt_done 生效：不反复抬高"
+
+
+def test_auto_min_avail_adapt_skips_when_off_latched_max_or_huge(monkeypatch):
+    """开关关闭 / 已抬高过 / 已到上限 / 抬升越过总物理内存四分之一：都不写配置。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    for kw in ({"min_avail_adapt": False}, {"min_avail_adapt_done": True},
+               {"min_avail_mb": tray._MINAVAIL_MAX},
+               # 16GB 总内存的四分之一 = 4096MB：从 4000 抬到 4256 就越界，抬不得
+               {"min_avail_mb": 4000}):
+        g = _guard(_state())
+        g.cfg = _minavail_adapt_cfg(**kw)
+        g._maybe_adapt_min_avail()
+        assert changes == [], kw
+
+
+def test_auto_min_avail_adapt_ignores_dirty_or_closed_floor(monkeypatch):
+    """下限是脏值 / 为 0（绝对下限关闭）：没证据可依，一律不抬高。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    for kw in ({"min_avail_mb": 0}, {"min_avail_mb": "x"}):
+        g = _guard(_state())
+        g.cfg = _minavail_adapt_cfg(**kw)
+        g._maybe_adapt_min_avail()
+        assert changes == [], kw
+
+
+def test_note_relief_fires_min_avail_adapt_on_lowmem_short(monkeypatch):
+    """只有「上一次被低内存下限叫起来」的短效才累计：两次才落配置，别的触发源不算。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or {**g.cfg, **ch})
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g.cfg = _minavail_adapt_cfg()
+
+    g._last_clean_reason = "自动"
+    g._note_relief(100, True)
+    g._note_relief(100, True)
+    assert changes == [], "百分比阈值触发的短效归提前量管，不算低内存下限的证据"
+    assert g._lowmem_short_streak == 0
+
+    g._last_clean_reason = "低内存"
+    g._note_relief(100, True)
+    assert changes == [], "低内存短效一次只累计，还没到连发门槛"
+
+    g._note_relief(100, True)
+    assert changes == [{"min_avail_mb": 1280, "min_avail_adapt_done": True}]
+
+    g._note_relief(900, False)
+    assert g._lowmem_short_streak == 0, "达标即清零：低内存短效连发计数归零"
+
+    g._last_clean_reason = "低内存"
+    g._note_relief(100, True)
+    assert len(changes) == 1, "闩已在：低内存短效再连发也不会重复抬高"
+
+
+def test_auto_clean_marks_low_mem_and_records_reason(monkeypatch):
+    """低内存下限触发的自动清理：给 do_clean 打 low_mem 标记，并记住归因供下次判定。"""
+    seen = {}
+
+    def _fake_do_clean(reason="自动", growth_rows=None, sticky=False, skip=(), **kw):
+        seen.clear()
+        seen["reason"] = reason
+        seen.update(kw)
+        return {"ok": False, "freed": 0, "level": "conservative",
+                "escalated": False, "detail": "-", "stats": {},
+                "before": {}, "after": {}}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+    g = _guard(_state())
+    g.cfg = _minavail_adapt_cfg()
+
+    g._auto_clean(1000.0, "低内存", g.state)
+    assert seen["reason"] == "低内存"
+    assert seen["low_mem"] is True
+    assert "low_relief" not in seen and "preventive" not in seen
+    assert g._last_clean_reason == "低内存", "归因留给下一次效果判定用"
+
+    g._auto_clean(2000.0, "自动", g.state)
+    assert "low_mem" not in seen, "别的触发源不打低内存标记"
+    assert g._last_clean_reason == "自动"
+
+
+def test_auto_min_avail_adapt_failure_only_logs(monkeypatch):
+    """update_config 抛异常只记日志：自调优失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(_changes):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tray, "update_config", _boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _minavail_adapt_cfg()
+    g._maybe_adapt_min_avail()
+    assert any("自动低内存下限适配异常" in m for m in logs)
+

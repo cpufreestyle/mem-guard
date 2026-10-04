@@ -591,3 +591,54 @@ def test_stats_line_shows_sticky_count():
     line = next(i.text for i in build_menu(guard).items
                  if isinstance(i.text, str) and "累计清理" in i.text)
     assert "粘滞" not in line
+
+def test_menu_toggle_target_top_adapt_writes_current_config(monkeypatch):
+    """「定向覆盖面自适应」勾选只提交增量 target_top_adapt，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"target_top_adapt": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "定向覆盖面自适应(大户数不足时+1)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"target_top_adapt": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["target_top_adapt"] is False
+
+
+def test_menu_toggle_headroom_adapt_writes_current_config(monkeypatch):
+    """「清理提前量自适应」勾选只提交增量 headroom_adapt，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"headroom_adapt": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "清理提前量自适应(效果偏短时阈值提前)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"headroom_adapt": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["headroom_adapt"] is False
+
+
+def test_menu_toggle_min_avail_adapt_writes_current_config(monkeypatch):
+    """「低内存下限自适应」勾选只提交增量 min_avail_adapt，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"min_avail_adapt": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "低内存下限自适应(可用内存偏低时抬高)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"min_avail_adapt": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["min_avail_adapt"] is False
+

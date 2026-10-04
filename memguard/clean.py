@@ -24,7 +24,8 @@ from .actions import (
     purge_standby_list,
     purge_working_sets,
 )
-from .config import CLEAN_LEVELS, _CONFIG_LOCK, gb, load_config, log, save_config
+from .config import (CLEAN_LEVELS, _CONFIG_LOCK, _norm_proc_name, gb, load_config, log,
+                     save_config)
 from .privileges import clean_privileges
 from .winapi import get_mem, is_admin, process_working_sets, visible_window_pids
 
@@ -60,6 +61,26 @@ _DEEPEN_MAX_ROUNDS = 3      # 加深轮数上限：normalize 把 stage_deepen_ro
 # 那么多，清到留有余量才算按住——贴着 85% 线办事，前台一波小高峰就又把 Guard 叫起来，
 # 反而更打扰。min_avail_mb 是绝对量，让不出「百分之几」，原样不动。
 _HEADROOM_MAX = 20          # 降压余量上限(百分点)：余量再大等于永久激进化，别给
+
+# 清理提前量自调优（v1.16.0）：贴线清理救火不如提前——效果连续偏短说明阈值贴常态
+# 占用太近，每回都是顶到线才被叫起来。把余量按这一步加上几个百分点，清理发生在压力
+# 顶上来之前；整个生命周期最多加一次，由 tray 落 headroom_adapt_done 闩。
+_HEADROOM_STEP = 5           # 提前量自调优每次加的点数：刚好越过「小幅抖动」的量级
+
+# 低内存下限自调优（v1.17.0）：绝对下限是唯一没有「提前」维度的触发输入——压力由它
+# 触发时，仍然是顶到 min_avail_mb 这条线才被叫起来。连番短效说明这条线本身偏低，
+# 把它抬高这一步 MB：清理发生得更早更温和，而不是等可用内存见底才救火。整个生命周期
+# 最多抬高一次，由 tray 落 min_avail_adapt_done 闩；抬升不许越过总物理内存的四分之一，
+# 否则变成「永远在清」，那种机器该由用户自己定夺。
+_MINAVAIL_STEP = 256         # 低内存下限自调优每次抬高的 MB 数：够越过「小幅抖动」的量级
+_MINAVAIL_MAX = 8192         # 低内存下限上限(MB)：再高就与机器实际容量脱节了
+
+# 定向覆盖面自调优（v1.15.0）：大户榜长期钉在同几个进程时，说明单次大户数偏小——
+# 每轮都在清同一批，旁边新长出来的中等进程一直轮不到。集中度 = 长期在榜名字占据的
+# 位次数 / 实际总位次数（按各采样真实取到的名字数求和，别拿 top*份数 凑数）。
+_FOCUS_MIN_SAMPLES = 5      # 至少这么多份采样才谈「长期在榜」，刚启动的噪声不作数
+_FOCUS_MIN_SPAN = 300.0     # 采样至少要覆盖这么长时间(秒)，五分钟内的抖动不算长期
+_FOCUS_RATIO = 0.8          # 集中度达到这么多就认为覆盖面偏窄，该把单次大户数 +1
 
 
 def _status(rc: int) -> str:
@@ -97,7 +118,7 @@ def _wait_avail_rise(before: dict) -> dict:
 def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
                 preventive: bool = False, short_relief: bool = False,
                 bg_trimmed: bool = False, sticky: bool = False,
-                deepen_rounds: int = 0) -> dict:
+                deepen_rounds: int = 0, low_mem: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -118,6 +139,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
     deepen_rounds=N 时同步累计 N 次「定向加深」：v1.13.0 起定向清理释放到了东西但
     压力没完全按住、把挑选网撒宽再清的触发频次；v1.14.0 起加深可多轮，按实际跑过
     的轮数累加（一次加深 2 轮就 +2），口径同上。
+    low_mem=True 时同步累计「低内存下限触发次数」：v1.17.0 起可用物理内存低于
+    min_avail_mb 这一绝对下限而触发清理的频次，作为抬高该下限的证据（口径同上）。
     """
     with _CONFIG_LOCK:
         cfg = load_config()
@@ -136,6 +159,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
             st["bg_trimmed"] = int(st.get("bg_trimmed", 0)) + 1
         if sticky:
             st["sticky"] = int(st.get("sticky", 0)) + 1
+        if low_mem:
+            st["low_mem"] = int(st.get("low_mem", 0)) + 1
         if deepen_rounds:
             st["deepen"] = int(st.get("deepen", 0)) + int(deepen_rounds)
         cfg["stats"] = st
@@ -240,6 +265,20 @@ def _deepen_rounds(cfg: dict) -> int:
     except (TypeError, ValueError):
         return 1
     return max(1, min(rounds, _DEEPEN_MAX_ROUNDS))
+
+
+def _deepen_diminish_pct(cfg: dict) -> int:
+    """加深「收益衰减」判据：单轮释放不足上轮的这么多百分比就收尾（v1.15.0）。
+
+    读 stage_deepen_diminish_pct（clamp 0..100）；0=关，此时仍只受 v1.14.0 的三条
+    收尾条件约束（已按住 / 没有还没碰过的候选 / 这一轮没清动）。加深是度量式补刀：
+    网撒到收益衰减区就停，别为了「再宽一点」多清一批无关紧要的中等进程。
+    """
+    try:
+        pct = int(cfg.get("stage_deepen_diminish_pct") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(pct, 100))
 
 
 def _still_pressured(m: dict, cfg: dict) -> bool:
@@ -462,8 +501,65 @@ def leak_candidates(history) -> list:
     return out
 
 
+def top_focus_ratio(history, top) -> float:
+    """定向大户榜的集中度：长期在榜的名字占了多少个位次（v1.15.0）。
+
+    history 是 (t, {pid: (name, rss_bytes)}) 采样列表（即 Guard.proc_history），
+    top 是本次的单次大户数（target_clean_top）。逐采样按 rss 取前 top 个名字并
+    归一化（_norm_proc_name），出现于过半可用采样的名字算「长期在榜」；集中度 =
+    这些名字累计占据的位次数 / 实际总位次数（各采样真实取到的名字数之和，不是
+    top*份数——取的没这么多就是没这么多，别自己凑）。返回 0.0~1.0，越大越集中。
+
+    采样不足 / 跨度过短 / top<=0 / 一份有效采样都没有，一律 0.0：证据不够就不下
+    结论，让调用方照常走人工建议。集中度不是「该清谁」，而是「网撒得够不够宽」——
+    窄到八成位次都钉在同几个进程时，旁边新长出来的中等进程就一直排不上号。
+    纯函数，便于单测。
+    """
+    try:
+        top = int(top)
+    except (TypeError, ValueError):
+        return 0.0
+    samples = list(history or [])
+    if top <= 0 or len(samples) < _FOCUS_MIN_SAMPLES:
+        return 0.0
+    try:
+        if float(samples[-1][0]) - float(samples[0][0]) < _FOCUS_MIN_SPAN:
+            return 0.0
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+    seen_times = {}
+    slots = 0
+    usable = 0
+    for sample in samples:
+        try:
+            _, snap = sample
+        except (TypeError, ValueError, IndexError):
+            continue
+        rows = []
+        for _, item in (snap or {}).items():
+            try:
+                name, rss = item
+                rows.append((_norm_proc_name(name), int(rss)))
+            except (TypeError, ValueError):
+                continue
+        if not rows:
+            continue
+        usable += 1
+        rows.sort(key=lambda r: r[1], reverse=True)
+        names = [n for n, _ in rows[:top]]
+        slots += len(names)
+        for name in set(names):
+            seen_times[name] = seen_times.get(name, 0) + 1
+    if slots <= 0 or usable <= 0:
+        return 0.0
+    sticky = usable / 2.0
+    focus = sum(c for c in seen_times.values() if c >= sticky)
+    return min(1.0, focus / float(slots))
+
+
 def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None,
                 preventive: bool = False, low_relief: bool = False,
+                low_mem: bool = False,
                 growth_rows=None, sticky: bool = False, skip=()) -> dict:
     """执行一次清理，返回结果统计（特权在返回前恢复，用完即关）。
 
@@ -476,19 +572,26 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     low_relief=True 表示本次距上次自动清理不足 effect_min_relief_sec（v1.9.0
     效果闭环）：只多累计一个 stats.short_relief 计数供统计行、通知与 advisor
     自调优使用，清理动作本身完全一样。
+    low_mem=True 表示本次由「低内存下限」触发——可用物理内存低于 min_avail_mb 这
+    条绝对下限（v1.17.0）：只多累计一个 stats.low_mem 计数，供统计与 advisor
+    抬高该下限的自调优使用，清理动作本身完全一样。
     growth_rows 是 leak_candidates() 的返回（疑似泄漏进程）：与大户采样合并后
     作为定向清理的优先候选，泄漏初期还没长成大户也能第一时间掐住。
     sticky=True 表示「持续压力粘滞激进」（v1.12.0）：上一轮走完整条阶梯仍没压住
     内存压力，这轮不再从保守档重跑，直接按激进档执行并回传 sticky 标记，供托盘
     进入/退出粘滞态；阶梯各级本就只在 not aggressive 时跑，粘滞即天然跳过整条阶梯。
     skip 是本轮跳过的阶段名集合（「targeted」「bg」 的子集），来源托盘的阶段自
-    学习：某一级连续多次没释放出东西就跳过它，只影响阶梯阶段、不影响升档本身。
+    学习（v1.15.0 起含「deepen」）：某一级连续多次没释放出东西就跳过它，只影响阶梯
+    阶段、不影响升档本身；加深被跳过只省掉撒宽补刀，第一轮定向大户照跑。
     v1.13.0 起定向清理证明有效（释放到了东西）但压力没完全按住时，会按 stage_deepen
     把挑选网撒宽再清一次「定向加深」，仍不达标才轮到后台级与升档全清；v1.14.0 起
     加深可多轮（stage_deepen_rounds，默认 1 轮即 v1.13.0 行为），每轮只挑还没碰过
     的进程，没候选/没清动/已按住都会提前收尾。加深的释放量计入 targeted_freed，另
     以回传键 deepened（加深清掉的进程数）/ deepen_freed / deepen_rounds（实际跑了几
     轮）报给通知与统计（stats.deepen 按轮累计）。
+    v1.15.0 起加深还会看「收益衰减」：单轮释放不足上轮的 stage_deepen_diminish_pct
+    这么多（默认 50%，0=关）就收尾——网撒到收益衰减区就停，别为「再宽一点」多清
+    一批无关紧要的中等进程（明细里点明「收益衰减」）。
     """
     if not is_admin():
         return {"ok": False, "msg": "需要管理员权限才能清理内存"}
@@ -553,18 +656,24 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             else:
                 detail.append(f"定向清理大户({names}): 未成功")
 
-    # 定向加深（v1.13.0 阶梯第一级半，v1.14.0 起可多轮）：定向清理确实释放到了东西、
-    # 但压力没完全按住时，把同一张网撒宽再清一轮——候选数翻倍、大户下限减半，且只挑
-    # 之前还没碰过的进程。仍不达标才轮到后面的后台级与升档全清：能用小幅加深按住，
-    # 就不必清空每个进程的工作集。stage_deepen_rounds 给轮数上限（默认 1 轮，即
-    # v1.13.0 行为）；每轮开头先确认「现在还压着、上轮真清出了东西」，任何一条不
-    # 成立就收尾——加深是度量式补刀，不是加码竞赛。
+    # 定向加深（v1.13.0 阶梯第一级半，v1.14.0 起可多轮，v1.15.0 起会看收益收尾）：
+    # 定向清理确实释放到了东西、但压力没完全按住时，把同一张网撒宽再清一轮——候选数
+    # 翻倍、大户下限减半，且只挑之前还没碰过的进程。仍不达标才轮到后面的后台级与升档
+    # 全清：能用小幅加深按住，就不必清空每个进程的工作集。stage_deepen_rounds 给轮数
+    # 上限（默认 1 轮，即 v1.13.0 行为）；每轮开头先确认「现在还压着、上轮真清出了
+    # 东西」，然后每轮收尾再确认「收益还没衰减」，任何一条不成立就收尾——加深是度量式
+    # 补刀，不是加码竞赛。
     # 加深度量计入 targeted_freed：阶段自学习看到的仍是「定向这一级」的总战绩。
     # 不排除有可见窗口的进程——那会让加深变成后台级的子集（bg 已全覆盖不可见进程），
     # 加深的意义恰恰在于按工作集大小再往上数几个中等进程。
+    # 「deepen」由托盘阶段自学习单独给出：只跳过加深，定向第一轮照跑。
     if (targeted and targeted_freed > 0 and not aggressive and "targeted" not in skip
-            and bool(cfg.get("stage_deepen", True))):
+            and "deepen" not in skip and bool(cfg.get("stage_deepen", True))):
         cap = _deepen_rounds(cfg)
+        diminish = _deepen_diminish_pct(cfg)
+        # 收益基线取首次定向那轮的释放量：加深是「上一轮确实有效」的补刀，比较对象
+        # 自然就是那个让它获准开工的数字
+        prev_freed = targeted_freed
         for rnd in range(1, cap + 1):
             if not _still_pressured(after, cfg):
                 break               # 上一轮已经按住：加深到此为止，别再多撒网
@@ -590,6 +699,17 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             targeted_freed += round_freed
             deepened += n
             deepen_rounds += 1
+            # v1.15.0 收益衰减收尾：这一轮网撒得更宽，却只清出上轮的不足这么多——
+            # 边际收益见底，再宽下去只是在清一批无关紧要的中等进程。最后一轮没有
+            # 「下一轮」可省，照常收尾，别在即将停止时还改口。
+            if (diminish > 0 and prev_freed > 0 and rnd < cap
+                    and round_freed * 100 < prev_freed * diminish):
+                detail.append(f"定向加深: 收益衰减(本轮 {gb(round_freed)} < 上轮 "
+                              f"{gb(prev_freed)} 的 {diminish}%)，收尾")
+                log(f"{reason}加深收尾 | 收益衰减 | 本轮 {gb(round_freed)} < 上轮 "
+                    f"{gb(prev_freed)} 的 {diminish}%")
+                break
+            prev_freed = round_freed
             # 轮次只在真的跑了多轮时写进明细：默认 1 轮的配置里别多一行噪声
             rnd_txt = f"第 {rnd} 轮, " if rnd > 1 else ""
             names = "、".join(f"{name} {gb(rss)}" for name, rss, _ in extra)
@@ -673,7 +793,8 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     # 累计统计：只统计真正成功的清理，随配置持久化；写盘失败不影响本次清理结果
     try:
         result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive,
-                                     low_relief, bool(bg_trimmed), sticky, deepen_rounds)
+                                     low_relief, bool(bg_trimmed), sticky,
+                                     deepen_rounds, low_mem)
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

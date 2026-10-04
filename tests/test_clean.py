@@ -294,7 +294,7 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     monkeypatch.setattr(clean, "_bump_stats",
                         lambda freed, escalated=False, targeted=False, preventive=False,
                         short_relief=False, bg_trimmed=False, sticky=False,
-                        deepen_rounds=0:
+                        deepen_rounds=0, low_mem=False:
                             {"count": 9, "freed": freed})
     monkeypatch.setattr(clean, "log", lambda msg: None)   # 别往真实日志文件里写测试噪声
 
@@ -469,7 +469,7 @@ def test_do_clean_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False, sticky=False, deepened=False:
+               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -486,7 +486,7 @@ def test_do_clean_no_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False, sticky=False, deepened=False:
+               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -609,7 +609,7 @@ def test_do_clean_target_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False):
         seen.append(targeted)
         return {"count": 9, "freed": freed}
 
@@ -771,7 +771,7 @@ def test_do_clean_deepen_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False):
         seen.append(deepen_rounds)
         return {"count": 9, "freed": freed}
 
@@ -872,7 +872,7 @@ def test_do_clean_deepen_stats_count_rounds(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False):
         seen.append(deepen_rounds)
         return {"count": 9, "freed": freed}
 
@@ -1135,7 +1135,7 @@ def test_do_clean_passes_preventive_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False):
         seen.append(preventive)
         return {"count": 9, "freed": freed}
 
@@ -1165,8 +1165,9 @@ def test_do_clean_passes_low_relief_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False):
-        seen.append(short_relief)
+                   short_relief=False, bg_trimmed=False, sticky=False,
+                   deepened=False, low_mem=False):
+        seen.append((short_relief, low_mem))
         return {"count": 9, "freed": freed}
 
     _admin_env(monkeypatch)
@@ -1174,7 +1175,36 @@ def test_do_clean_passes_low_relief_to_stats(monkeypatch):
     r = clean.do_clean("短效", low_relief=True)
 
     assert r["ok"] is True
-    assert seen == [True]
+    assert seen == [(True, False)], "low_mem 默认 False，不污染短效口径"
+
+
+def test_bump_stats_counts_low_mem(monkeypatch, tmp_path):
+    """low_mem 只在传入 True 时累计；没被绝对下限叫醒过的配置不落这个键。"""
+    cfg_file = tmp_path / "mem_guard.json"
+    cfg_file.write_text(json.dumps({"stats": {"count": 1, "freed": 0}}),
+                        encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    assert clean._bump_stats(10, low_mem=True)["low_mem"] == 1
+    assert clean._bump_stats(10)["low_mem"] == 1, "没低内存触发过不能凭空累计"
+
+
+def test_do_clean_passes_low_mem_to_stats(monkeypatch):
+    """low_mem=True 要一路透传到 _bump_stats：抬高绝对下限的自调优建议靠它。"""
+    seen = []
+
+    def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
+                   short_relief=False, bg_trimmed=False, sticky=False,
+                   deepened=False, low_mem=False):
+        seen.append((short_relief, low_mem))
+        return {"count": 9, "freed": freed}
+
+    _admin_env(monkeypatch)
+    monkeypatch.setattr(clean, "_bump_stats", _fake_bump)
+    r = clean.do_clean("低内存", low_mem=True)
+
+    assert r["ok"] is True
+    assert seen == [(False, True)], "低内存触发要打上 low_mem 标记"
 
 # ------------------------------------ 后台进程工作集清理 / 泄漏识别（v1.11.0）
 
@@ -1298,7 +1328,7 @@ def test_do_clean_passes_bg_trimmed_to_stats(monkeypatch):
     ]
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False):
         seen.append(bg_trimmed)
         return {"count": 9, "freed": freed}
 
@@ -1552,7 +1582,7 @@ def test_do_clean_sticky_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False):
         seen.append(sticky)
         return {"count": 9, "freed": freed}
 
@@ -1615,3 +1645,199 @@ def test_do_clean_reports_per_stage_release(monkeypatch):
     assert r["freed"] == 4096
     # 阶梯各级加起来就是「保守第一遍之后」又释放的部分，另 2048 来自第一遍本身
     assert r["targeted_freed"] + r["bg_freed"] + r["escalated_freed"] == 2048
+
+# ---------------- 加深收益衰减（v1.15.0：边际收益见底就收尾，别加码竞赛）
+
+
+def test_do_clean_deepen_stops_when_returns_diminish(monkeypatch):
+    """加深第一轮只清出首轮定向的不足一半：收益见底，停止撒网照常走后面的级。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},   # 保守后仍受压
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},   # 定向 +1024（基线）
+        {"avail_phys": base + 2448, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深 +400 < 1024 的 50%
+        {"avail_phys": base + 6144, "phys_pct": 60.0, "commit_pct": 40.0},   # 升档后回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 3, "stage_deepen_diminish_pct": 50})
+    r = clean.do_clean("测试")
+
+    assert r["deepen_rounds"] == 1
+    assert r["deepen_freed"] == 400
+    assert r["targeted_freed"] == 1024 + 400      # 基线就是首轮定向那 1024
+    assert "定向加深: 收益衰减" in r["detail"] and "收尾" in r["detail"]
+    assert "第 2 轮" not in r["detail"]             # 衰减轮只记账，不写常规加深行
+    assert calls.count("esw") == 2                # 定向一轮 + 加深一轮就停
+    assert calls.count("wait") == 4
+    assert r["escalated"] is True                 # 没按住，仍照常升档
+
+
+def test_do_clean_deepen_diminish_compares_previous_round(monkeypatch):
+    """对比对象是「上一轮」而非始终对比首轮：加深1 的 600 ≥ 512，就该继续撒。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},   # 定向 +1024
+        {"avail_phys": base + 2648, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深1 +600（≥50%）
+        {"avail_phys": base + 2848, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深2 +200（<600 的 50%）
+        {"avail_phys": base + 6848, "phys_pct": 60.0, "commit_pct": 40.0},   # 升档后回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 3, "stage_deepen_diminish_pct": 50})
+    r = clean.do_clean("测试")
+
+    assert r["deepen_rounds"] == 2
+    assert r["deepen_freed"] == 600 + 200
+    assert r["targeted_freed"] == 1024 + 800
+    assert "定向加深(d.exe" in r["detail"]         # 第 1 轮正常记账
+    assert "收益衰减" in r["detail"] and "收尾" in r["detail"]
+    assert "第 3 轮" not in r["detail"]
+    assert calls.count("esw") == 3 and calls.count("wait") == 5
+    assert r["escalated"] is True
+
+
+def test_do_clean_deepen_last_round_never_reports_diminish(monkeypatch):
+    """最后一轮即便收益衰减也不改口：没有「下一轮」可省，明细照常记账。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},   # 定向 +1024
+        {"avail_phys": base + 2648, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深1 +600（继续）
+        {"avail_phys": base + 2848, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深2 +200（末轮不报）
+        {"avail_phys": base + 6848, "phys_pct": 60.0, "commit_pct": 40.0},   # 升档后回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 2, "stage_deepen_diminish_pct": 50})
+    r = clean.do_clean("测试")
+
+    assert r["deepen_rounds"] == 2
+    assert "收益衰减" not in r["detail"] and "收尾" not in r["detail"]
+    assert "第 2 轮, g.exe" in r["detail"]
+    assert calls.count("esw") == 3 and calls.count("wait") == 5
+    assert r["escalated"] is True
+
+
+def test_do_clean_no_diminish_stop_when_disabled(monkeypatch):
+    """stage_deepen_diminish_pct=0：判据整体关闭，三轮加深照旧跑满再升档。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2248, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深1 +200
+        {"avail_phys": base + 2398, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深2 +150
+        {"avail_phys": base + 2498, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深3 +100
+        {"avail_phys": base + 6498, "phys_pct": 60.0, "commit_pct": 40.0},   # 升档后回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 3, "stage_deepen_diminish_pct": 0})
+    r = clean.do_clean("测试")
+
+    assert r["deepen_rounds"] == 3
+    assert r["deepen_freed"] == 200 + 150 + 100
+    assert "收益衰减" not in r["detail"] and "第 2 轮" in r["detail"]
+    assert calls.count("esw") == 4 and calls.count("wait") == 6
+    assert r["escalated"] is True
+
+
+def test_do_clean_no_deepen_when_stage_learning_skips_deepen(monkeypatch):
+    """阶段自学习只跳过加深：定向第一轮与升档照跑，加深一行都不留。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 6144, "phys_pct": 60.0, "commit_pct": 40.0},
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_wide_rows())
+    r = clean.do_clean("测试", skip={"deepen"})
+
+    assert "定向加深" not in r["detail"]
+    assert r["deepen_rounds"] == 0 and r["deepen_freed"] == 0
+    assert [n for n, _, _ in r["targeted"]] == ["a.exe", "b.exe", "c.exe"]
+    assert calls.count("esw") == 1 and calls.count("epw") == 1
+    assert calls.count("wait") == 3
+
+
+def test_deepen_diminish_pct_clamps_and_ignores_dirty_values():
+    """衰减阈值 clamp 0..100、缺省 50；脏值/缺键一律 0（关），不为配置抽风加码。"""
+    assert clean._deepen_diminish_pct(normalize_config({})) == 50
+    assert clean._deepen_diminish_pct(
+        normalize_config({"stage_deepen_diminish_pct": 80})) == 80
+    assert clean._deepen_diminish_pct(
+        normalize_config({"stage_deepen_diminish_pct": 999})) == 100
+    assert clean._deepen_diminish_pct(
+        normalize_config({"stage_deepen_diminish_pct": -5})) == 0
+    # 裸 dict 里的脏值（normalize 会兜底成 50，所以这里故意不 normalize）
+    assert clean._deepen_diminish_pct({"stage_deepen_diminish_pct": "x"}) == 0
+    assert clean._deepen_diminish_pct({}) == 0
+
+
+
+# ---------------- 定向大户榜集中度（v1.15.0 top_focus_ratio 纯函数分支）
+
+
+def _focus_history(snaps, step=100.0, t0=1000.0):
+    """把若干份 {pid: (name, rss_bytes)} 打包成 Guard.proc_history 形状的采样列表。"""
+    return [(t0 + i * step, snap) for i, snap in enumerate(snaps)]
+
+
+def test_top_focus_ratio_full_and_half_concentration():
+    """集中度 = 长期在榜名字占据的位次 / 实际位次，不是按采样份数凑。"""
+    clustered = [(1000.0 + i * 100.0,
+                  {1: ("a.exe", 4 * 1024 ** 3), 2: ("b.exe", 3 * 1024 ** 3),
+                   3: ("c.exe", 2 * 1024 ** 3)}) for i in range(6)]
+    assert clean.top_focus_ratio(clustered, 2) == 1.0     # a/b 每份都在榜，位次全被钉住
+
+    # 同一份 a 长期在榜，其余大户每份都在换：只剩一半位次是「老面孔」
+    mixed = [
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("b.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("c.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("d.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("e.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("f.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("f.exe", 3 * 1024 ** 3)},
+    ]
+    assert clean.top_focus_ratio(_focus_history(mixed), 2) == 0.5
+
+
+def test_top_focus_ratio_counts_slots_actually_filled():
+    """top 大于每份真实名字数时按实际名字数算：别自己凑成 top*份数。"""
+    snaps = [{1: ("a.exe", 4 * 1024 ** 3), 2: ("b.exe", 3 * 1024 ** 3),
+              3: ("c.exe", 2 * 1024 ** 3)} for _ in range(6)]
+    # top=5 但每份只有 3 个名字、三个都在榜 → 仍是 1.0（若按 5*6=30 算会掉到 0.2）
+    assert clean.top_focus_ratio(_focus_history(snaps), 5) == 1.0
+
+
+def test_top_focus_ratio_returns_zero_without_enough_evidence():
+    """证据不够就不下结论：份数不足 / 跨度过短 / top 非正，一律 0.0。"""
+    good = [(1000.0 + i * 100.0,
+             {1: ("a.exe", 4 * 1024 ** 3), 2: ("b.exe", 3 * 1024 ** 3)})
+            for i in range(6)]
+    assert clean.top_focus_ratio(good[:4], 2) == 0.0        # 少于 5 份采样
+    assert clean.top_focus_ratio(
+        _focus_history([{1: ("a.exe", 4 * 1024 ** 3)} for _ in range(6)],
+                       step=10.0), 2) == 0.0                # 跨度 50s，够不上 300s
+    for bad in (0, -2, "x", None, []):
+        assert clean.top_focus_ratio(good, bad) == 0.0
+
+
+def test_top_focus_ratio_skips_dirty_samples():
+    """脏采样（解包失败 / 空快照 / 条目不可用）跳过且不计 usable，不污染结论。"""
+    good = [{1: ("a.exe", 4 * 1024 ** 3), 2: ("b.exe", 3 * 1024 ** 3)}
+            for _ in range(6)]
+    dirty = [(1,), None, (3, {}), (4, {5: ("c.exe",)})]
+    hist = _focus_history(good[:3]) + dirty + _focus_history(good[3:], t0=2000.0)
+    assert clean.top_focus_ratio(hist, 2) == 1.0
+
+
+def test_top_focus_ratio_normalizes_names():
+    """大小写与 .exe 后缀归一后算同一个进程：别把 a.exe / A.EXE 当两个大户。"""
+    snaps = [{1: ("a.exe", 4 * 1024 ** 3), 2: ("A.EXE", 3 * 1024 ** 3),
+              3: ("b.exe", 2 * 1024 ** 3)} for _ in range(6)]
+    # 每份 top=2 取到的两个名字归一后都是 a：只有一个长期在榜 → 0.5
+    assert clean.top_focus_ratio(_focus_history(snaps), 2) == 0.5
+
