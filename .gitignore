@@ -1,5 +1,6 @@
 # 运行时日志
 mem_guard.log
+mem_guard.json
 
 # 构建产物（PyInstaller）
 dist/
@@ -24,3 +25,4 @@ __pycache__/
 
 # local IDE cache (Qoder generated)
 .qoder/
+.pytest_cache/

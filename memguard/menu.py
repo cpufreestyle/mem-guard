@@ -219,6 +219,33 @@ def build_menu(guard) -> pystray.Menu:
         log(f"低内存下限自适应(可用内存偏低时抬高) -> "
             f"{'开' if guard.cfg['min_avail_adapt'] else '关'}")
 
+    def on_toggle_min_mb_adapt(icon, item) -> None:
+        guard.cfg = update_config(
+            {"min_mb_adapt": not bool(guard.cfg.get("min_mb_adapt", True))})
+        log(f"定向大户下限自适应(榜上够不着下限时减半) -> "
+            f"{'开' if guard.cfg['min_mb_adapt'] else '关'}")
+
+    def on_toggle_deepen_rounds_adapt(icon, item) -> None:
+        guard.cfg = update_config(
+            {"deepen_rounds_adapt":
+             not bool(guard.cfg.get("deepen_rounds_adapt", True))})
+        log(f"加深轮数自适应(加深卡住时+1轮) -> "
+            f"{'开' if guard.cfg['deepen_rounds_adapt'] else '关'}")
+
+    def on_toggle_predict_window_adapt(icon, item) -> None:
+        guard.cfg = update_config(
+            {"predict_window_adapt":
+             not bool(guard.cfg.get("predict_window_adapt", True))})
+        log(f"预防窗口自适应(没防住时加宽窗口) -> "
+            f"{'开' if guard.cfg['predict_window_adapt'] else '关'}")
+
+    def on_toggle_threshold_adapt(icon, item) -> None:
+        guard.cfg = update_config(
+            {"threshold_adapt":
+             not bool(guard.cfg.get("threshold_adapt", True))})
+        log(f"触发线自适应(短效反复且温和手段用尽时提前) -> "
+            f"{'开' if guard.cfg['threshold_adapt'] else '关'}")
+
     def on_toggle_predict_clean(icon, item) -> None:
         guard.cfg = update_config(
             {"predict_clean": not bool(guard.cfg.get("predict_clean", True))})
@@ -448,6 +475,22 @@ def build_menu(guard) -> pystray.Menu:
                          on_toggle_min_avail_adapt,
                          checked=lambda i: bool(
                              guard.cfg.get("min_avail_adapt", True))),
+        pystray.MenuItem("定向大户下限自适应(榜上够不着下限时减半)",
+                         on_toggle_min_mb_adapt,
+                         checked=lambda i: bool(
+                             guard.cfg.get("min_mb_adapt", True))),
+        pystray.MenuItem("加深轮数自适应(加深卡住时+1轮)",
+                         on_toggle_deepen_rounds_adapt,
+                         checked=lambda i: bool(
+                             guard.cfg.get("deepen_rounds_adapt", True))),
+        pystray.MenuItem("预防窗口自适应(没防住时加宽窗口)",
+                         on_toggle_predict_window_adapt,
+                         checked=lambda i: bool(
+                             guard.cfg.get("predict_window_adapt", True))),
+        pystray.MenuItem("触发线自适应(短效反复且温和手段用尽时提前)",
+                         on_toggle_threshold_adapt,
+                         checked=lambda i: bool(
+                             guard.cfg.get("threshold_adapt", True))),
         pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
                          checked=lambda i: bool(guard.cfg.get("predict_clean", True))),
         pystray.MenuItem("开机自启", on_toggle_autostart,

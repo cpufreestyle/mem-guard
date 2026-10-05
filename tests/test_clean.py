@@ -294,7 +294,7 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     monkeypatch.setattr(clean, "_bump_stats",
                         lambda freed, escalated=False, targeted=False, preventive=False,
                         short_relief=False, bg_trimmed=False, sticky=False,
-                        deepen_rounds=0, low_mem=False:
+                        deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False:
                             {"count": 9, "freed": freed})
     monkeypatch.setattr(clean, "log", lambda msg: None)   # 别往真实日志文件里写测试噪声
 
@@ -469,7 +469,7 @@ def test_do_clean_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False:
+               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -486,7 +486,7 @@ def test_do_clean_no_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False:
+               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -609,7 +609,7 @@ def test_do_clean_target_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
         seen.append(targeted)
         return {"count": 9, "freed": freed}
 
@@ -771,7 +771,7 @@ def test_do_clean_deepen_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False):
         seen.append(deepen_rounds)
         return {"count": 9, "freed": freed}
 
@@ -872,7 +872,7 @@ def test_do_clean_deepen_stats_count_rounds(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False):
         seen.append(deepen_rounds)
         return {"count": 9, "freed": freed}
 
@@ -1135,7 +1135,7 @@ def test_do_clean_passes_preventive_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
         seen.append(preventive)
         return {"count": 9, "freed": freed}
 
@@ -1166,7 +1166,7 @@ def test_do_clean_passes_low_relief_to_stats(monkeypatch):
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
-                   deepened=False, low_mem=False):
+                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
         seen.append((short_relief, low_mem))
         return {"count": 9, "freed": freed}
 
@@ -1195,7 +1195,7 @@ def test_do_clean_passes_low_mem_to_stats(monkeypatch):
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
-                   deepened=False, low_mem=False):
+                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
         seen.append((short_relief, low_mem))
         return {"count": 9, "freed": freed}
 
@@ -1205,6 +1205,25 @@ def test_do_clean_passes_low_mem_to_stats(monkeypatch):
 
     assert r["ok"] is True
     assert seen == [(False, True)], "低内存触发要打上 low_mem 标记"
+
+def test_do_clean_passes_predictive_missed_to_stats(monkeypatch):
+    """predictive_missed=True 要一路透传到 _bump_stats：放宽预测窗口的自调优靠它。"""
+    seen = []
+
+    def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
+                   short_relief=False, bg_trimmed=False, sticky=False,
+                   deepened=False, low_mem=False, deepen_capped=False,
+                   predictive_missed=False):
+        seen.append(predictive_missed)
+        return {"count": 9, "freed": freed}
+
+    _admin_env(monkeypatch)
+    monkeypatch.setattr(clean, "_bump_stats", _fake_bump)
+    r = clean.do_clean("预防式", predictive_missed=True)
+
+    assert r["ok"] is True
+    assert seen == [True], "没防住要打上 predictive_missed 标记"
+
 
 # ------------------------------------ 后台进程工作集清理 / 泄漏识别（v1.11.0）
 
@@ -1328,7 +1347,7 @@ def test_do_clean_passes_bg_trimmed_to_stats(monkeypatch):
     ]
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
         seen.append(bg_trimmed)
         return {"count": 9, "freed": freed}
 
@@ -1582,7 +1601,7 @@ def test_do_clean_sticky_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
         seen.append(sticky)
         return {"count": 9, "freed": freed}
 
@@ -1841,3 +1860,175 @@ def test_top_focus_ratio_normalizes_names():
     # 每份 top=2 取到的两个名字归一后都是 a：只有一个长期在榜 → 0.5
     assert clean.top_focus_ratio(_focus_history(snaps), 2) == 0.5
 
+
+# ---------------- focused_top_rss / _long_term_names（v1.19.0：大户下限自调优的取数）
+
+
+def test_focused_top_rss_median_even_averages_middles():
+    """偶数份取中间两个的均值、奇数份取正中值：中位数抗一次性尖峰。"""
+    even = [{1: ("a.exe", 400 * 1024 ** 2), 2: ("b.exe", 300 * 1024 ** 2)}
+            for _ in range(6)]
+    assert clean.focused_top_rss(_focus_history(even), 2) == 350 * 1024 ** 2
+    odd = [{1: ("a.exe", 400 * 1024 ** 2)} for _ in range(5)]
+    assert clean.focused_top_rss(_focus_history(odd), 1) == 400 * 1024 ** 2
+
+
+def test_focused_top_rss_counts_samples_out_of_top():
+    """跌出大户榜那份采样里的值也计入：中位数看的是进程本身，不是它排第几。"""
+    snaps = [{1: ("a.exe", 400 * 1024 ** 2), 2: ("b.exe", 300 * 1024 ** 2)}
+             for _ in range(5)]
+    # 最后一份 c.exe 反超，a.exe 跌出 top=2；但 50MB 这个值仍要算进中位数
+    snaps.append({1: ("a.exe", 50 * 1024 ** 2), 2: ("b.exe", 300 * 1024 ** 2),
+                  3: ("c.exe", 200 * 1024 ** 2)})
+    assert clean.focused_top_rss(_focus_history(snaps), 2) == 300 * 1024 ** 2
+
+
+def test_focused_top_rss_none_without_enough_evidence():
+    """证据不够就不下结论：top 非正 / 份数不足 / 跨度过短 / 没有长期在榜，一律 None。"""
+    good = [{1: ("a.exe", 400 * 1024 ** 2), 2: ("b.exe", 300 * 1024 ** 2)}
+            for _ in range(6)]
+    for bad_top in (0, -2, "x", None):
+        assert clean.focused_top_rss(_focus_history(good), bad_top) is None
+    assert clean.focused_top_rss(_focus_history(good[:4]), 2) is None
+    assert clean.focused_top_rss(
+        _focus_history(good, step=10.0), 2) is None
+    rotating = [{1: (f"p{i}.exe", 400 * 1024 ** 2)} for i in range(6)]
+    assert clean.focused_top_rss(_focus_history(rotating), 1) is None
+    for empty in (None, []):
+        assert clean.focused_top_rss(empty, 2) is None
+
+
+def test_long_term_names_sticky_gate_and_real_slots():
+    """长期在榜按过半采样算门槛；位次数按各份真实取到的名字数求和，别拿 top 乘份数凑。"""
+    snaps = [
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("b.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("b.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("x2.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("x3.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("x4.exe", 3 * 1024 ** 3)},
+        {1: ("a.exe", 4 * 1024 ** 3), 2: ("x5.exe", 3 * 1024 ** 3)},
+    ]
+    # 脏采样（解不开 / 空快照）跳过且不计 usable：不污染在榜结论
+    hist = (_focus_history(snaps[:3]) + [(1,), (2, None)]
+            + _focus_history(snaps[3:], t0=2000.0))
+    names, slots = clean._long_term_names(hist, 2)
+    assert names == {"a": 6}          # b 只在 2/6 份在榜，够不着过半门槛
+    assert slots == 12
+    assert clean._long_term_names([], 2) == ({}, 0)
+    # top=0 时每份都取不到名字：一个位次都没有，证据不足
+    assert clean._long_term_names(_focus_history(snaps), 0) == ({}, 0)
+# ------------------------ 定向加深轮数自调优（v1.20.0：加深被轮数上限卡住，轮数 +1）
+
+
+def test_do_clean_deepen_capped_when_rounds_exhausted_and_pressured(monkeypatch):
+    """跑满轮数上限、末轮仍在释放、收尾仍受压：报 deepen_capped 让自调优把轮数 +1。"""
+    base = 8 * 1024 ** 3
+    calls = []
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},   # 保守后仍受压
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},   # 定向后仍受压
+        {"avail_phys": base + 3072, "phys_pct": 92.0, "commit_pct": 40.0},   # 第 1 轮仍受压
+        {"avail_phys": base + 4096, "phys_pct": 92.0, "commit_pct": 40.0},   # 第 2 轮仍受压
+        {"avail_phys": base + 5120, "phys_pct": 92.0, "commit_pct": 40.0},   # 第 3 轮跑满仍受压
+        {"avail_phys": base + 8192, "phys_pct": 60.0, "commit_pct": 40.0},   # 升档后才回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 3})
+    r = clean.do_clean("测试")
+
+    assert r["deepen_rounds"] == 3 and r["deepen_capped"] is True
+    assert "定向加深: 轮数跑满(3 轮)仍释放且压力未按住" in r["detail"]
+    # 卡住只是给自调优的信号：该走的后台级与升档一级都不少
+    assert r["escalated"] is True and calls.count("epw") == 1
+
+
+def test_do_clean_deepen_not_capped_when_relieved_below_cap(monkeypatch):
+    """提前按住：循环是 break 出来的，上限都没跑到，谈不上被轮数卡住。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 3072, "phys_pct": 60.0, "commit_pct": 40.0},   # 第 1 轮后就按住
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 3})
+    r = clean.do_clean("测试")
+
+    assert r["deepen_rounds"] == 1 and r["deepen_capped"] is False
+    assert "轮数跑满" not in r["detail"]
+
+
+def test_do_clean_deepen_not_capped_when_last_round_frees_nothing(monkeypatch):
+    """末轮没清动：候选枯竭，不是轮数不够——加轮数也变不出新候选。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 6144, "phys_pct": 60.0, "commit_pct": 40.0},
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 3})
+    esw_pids = []
+
+    def _esw(pids, bl):
+        esw_pids.append(list(pids))
+        return (1, 0) if len(esw_pids) == 1 else (0, 0)
+
+    monkeypatch.setattr(clean, "empty_selected_working_sets", _esw)
+    r = clean.do_clean("测试")
+
+    assert esw_pids == [[1, 2, 3], [4, 5, 6]]
+    assert r["deepen_capped"] is False and "轮数跑满" not in r["detail"]
+
+
+def test_do_clean_deepen_not_capped_when_returns_diminish(monkeypatch):
+    """收益衰减收尾：末轮确实清出了东西，但停手是因为边际收益见底。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2448, "phys_pct": 92.0, "commit_pct": 40.0},   # 加深只 +400
+        {"avail_phys": base + 6144, "phys_pct": 60.0, "commit_pct": 40.0},
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 3, "stage_deepen_diminish_pct": 50})
+    r = clean.do_clean("测试")
+
+    assert r["deepen_freed"] == 400 and r["deepen_capped"] is False
+    assert "收益衰减" in r["detail"] and "轮数跑满" not in r["detail"]
+
+
+def test_bump_stats_counts_deepen_capped(monkeypatch, tmp_path):
+    """deepen_capped 只在传入 True 时累计；没被卡住过的配置不落这个键。"""
+    cfg_file = tmp_path / "mem_guard.json"
+    cfg_file.write_text(json.dumps({"stats": {"count": 1, "freed": 0}}),
+                        encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    assert clean._bump_stats(10, deepen_capped=True)["deepen_capped"] == 1
+    assert clean._bump_stats(10)["deepen_capped"] == 1, "没卡住过不能凭空累计"
+
+
+def test_do_clean_passes_deepen_capped_to_stats(monkeypatch):
+    """跑满卡住要一路透传到 _bump_stats：加深轮数自调优靠它数次数。"""
+    seen = []
+
+    def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
+                   short_relief=False, bg_trimmed=False, sticky=False,
+                   deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False):
+        seen.append(deepen_capped)
+        return {"count": 9, "freed": freed}
+
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 2048, "phys_pct": 92.0, "commit_pct": 40.0},
+        {"avail_phys": base + 3072, "phys_pct": 60.0, "commit_pct": 40.0},
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, top_rows=_wide_rows(),
+               cfg_over={"stage_deepen_rounds": 3})
+    monkeypatch.setattr(clean, "_bump_stats", _fake_bump)
+    r = clean.do_clean("测试")
+
+    assert r["deepen_capped"] is False
+    assert seen == [False]

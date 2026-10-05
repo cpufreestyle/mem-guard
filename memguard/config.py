@@ -12,7 +12,7 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.18.0"
+__version__ = "1.22.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -63,14 +63,26 @@ DEFAULT_CONFIG = {
     "target_headroom_pct": 0,   # 降压余量(百分点)：判定「仍受压」时物理/提交阈值先让出这么多，清到留有余量才算按住；clamp 0..20，0=关
     # ---- 加深收益自适应 + 定向覆盖面自调优（v1.15.0）：还要不要继续，交给度量回答 ----
     "stage_deepen_diminish_pct": 50,  # 加深单轮释放不足上轮这么多(%)就收尾：边际收益衰减，别为撒宽而撒宽；clamp 0..100，0=关
-    "target_top_adapt": True,        # 开：定向大户榜长期钉在同几个进程时，把单次大户数 +1 撒宽覆盖面（一次性）
-    "target_top_adapt_done": False,  # 已自动加过大户数的闩：挡住重复加码，用户可手动改 target_clean_top
+    "target_top_adapt": True,        # 开：定向大户榜长期钉在同几个进程时，把单次大户数 +1 撒宽覆盖面
+    "target_top_adapt_done": 0,      # 已自动加过大户数的次数（0=从未）：仍窄就继续加到顶（爬山），到顶即停
     # ---- 清理提前量自调优（v1.16.0）：效果连续偏短时把判定阈值提前几个百分点 ----
     "headroom_adapt": True,          # 开：效果连续偏短时把物理/提交阈值自动提前 5 个百分点（一次性）
     "headroom_adapt_done": False,    # 已自动提前过的闩：挡住重复加码，用户可手动改 target_headroom_pct
     # ---- 低内存绝对下限自调优（v1.17.0）：连番短效说明 min_avail_mb 这条线本身偏低 ----
     "min_avail_adapt": True,         # 开：低内存下限触发的清理连续偏短时，把可用内存下限抬高一级（一次性）
     "min_avail_adapt_done": False,   # 已自动抬高过低内存下限的闩：挡住重复加码，用户可手动改 min_avail_mb
+    # ---- 定向大户下限自调优（v1.19.0）：榜上有人却够不着下限，说明这条线本身偏高 ----
+    "min_mb_adapt": True,          # 开：长期在榜的进程够不着 target_clean_min_mb 时，把大户下限减半（一次性）
+    "min_mb_adapt_done": False,    # 已自动降过大户下限的闩：挡住重复降码，用户可手动改 target_clean_min_mb
+    # ---- 定向加深轮数自调优（v1.20.0）：加深被轮数卡住时把上限 +1（可爬到 clean._DEEPEN_MAX_ROUNDS）----
+    "deepen_rounds_adapt": True,   # 开：加深把 stage_deepen_rounds 跑满仍在释放且仍受压时，轮数上限 +1
+    "deepen_rounds_adapt_done": 0, # 已自动爬到的轮数（0=从未）：支持 1→2→3 逐级爬坡，到顶即停
+    # ---- 预防窗口自调优（v1.21.0）：预防式清理没防住压力时，把预测窗口放宽一档 ----
+    "predict_window_adapt": True,  # 开：预防式清理后仍很快复发（没防住）时，把 predict_window_min 加宽
+    "predict_window_adapt_done": 0, # 已自动爬到的窗口分钟数（0=从未）：可逐级加到 _PREDICT_WINDOW_MAX，到顶即停
+    # ---- 触发阈值自适应（v1.22.0）：温和阶梯用尽仍效果偏短时，把两条触发线各降一档 ----
+    "threshold_adapt": True,  # 开：超阈值触发的清理连续偏短且温和手段用尽时，phys/commit 阈值各降一级
+    "threshold_adapt_done": 0, # 已自动下调的次数（0=从未）：最多下调两次，到兜底下限即停
     "debounce_sec": 0,       # 内存持续超阈值的宽限秒数(防抖)，0=立即触发
     # conservative=仅清 standby list/修改页/文件缓存（温和，对前台几乎无影响，默认）
     # aggressive  =额外清空各进程工作集（释放更多，但前台程序下次访问需重新读盘，可能卡顿）
@@ -195,11 +207,35 @@ def normalize_config(raw) -> dict:
         cfg.get("stage_deepen_diminish_pct"), 0, 100,
         DEFAULT_CONFIG["stage_deepen_diminish_pct"])
     cfg["target_top_adapt"] = bool(cfg.get("target_top_adapt", True))
-    cfg["target_top_adapt_done"] = bool(cfg.get("target_top_adapt_done", False))
+    # target_top_adapt_done 从 v1.21.0 起是「已加过的次数」（int，爬山计数）；老配置
+    # 里的 bool 经 _clamp_int 天然兼容（True→1、False→0），到 target_clean_top 上限即停
+    cfg["target_top_adapt_done"] = _clamp_int(
+        cfg.get("target_top_adapt_done"), 0, TARGET_CLEAN_TOP_MAX,
+        DEFAULT_CONFIG["target_top_adapt_done"])
     cfg["headroom_adapt"] = bool(cfg.get("headroom_adapt", True))
     cfg["headroom_adapt_done"] = bool(cfg.get("headroom_adapt_done", False))
     cfg["min_avail_adapt"] = bool(cfg.get("min_avail_adapt", True))
     cfg["min_avail_adapt_done"] = bool(cfg.get("min_avail_adapt_done", False))
+    cfg["min_mb_adapt"] = bool(cfg.get("min_mb_adapt", True))
+    cfg["min_mb_adapt_done"] = bool(cfg.get("min_mb_adapt_done", False))
+    # 加深轮数自调优开关口径同上；done 是 int（已爬到的轮数，0=从未），clamp 到
+    # 0..3（不许超过 clean._DEEPEN_MAX_ROUNDS），脏值归 0
+    cfg["deepen_rounds_adapt"] = bool(cfg.get("deepen_rounds_adapt", True))
+    cfg["deepen_rounds_adapt_done"] = _clamp_int(
+        cfg.get("deepen_rounds_adapt_done"), 0, 3,
+        DEFAULT_CONFIG["deepen_rounds_adapt_done"])
+    # 预防窗口自调优开关口径同上；done 是 int（已爬到的窗口分钟数，0=从未），clamp 到
+    # 0..30（不许超过 clean._PREDICT_WINDOW_MAX，config 不依赖 clean 故写死）
+    cfg["predict_window_adapt"] = bool(cfg.get("predict_window_adapt", True))
+    cfg["predict_window_adapt_done"] = _clamp_int(
+        cfg.get("predict_window_adapt_done"), 0, 30,
+        DEFAULT_CONFIG["predict_window_adapt_done"])
+    # 触发阈值自调优开关口径同上；done 是 int（已下调次数，0=从未），clamp 到
+    # 0..2（不许超过 clean._THRESHOLD_MAX_DROPS，config 不依赖 clean 故写死），脏值归 0
+    cfg["threshold_adapt"] = bool(cfg.get("threshold_adapt", True))
+    cfg["threshold_adapt_done"] = _clamp_int(
+        cfg.get("threshold_adapt_done"), 0, 2,
+        DEFAULT_CONFIG["threshold_adapt_done"])
     cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
@@ -257,6 +293,14 @@ def normalize_config(raw) -> dict:
     # low_mem（低内存下限触发次数）口径同上：非 0 才落键，没被绝对下限叫醒过的配置保持原形状
     if raw_stats.get("low_mem"):
         cfg["stats"]["low_mem"] = _clamp_int(raw_stats.get("low_mem"), 0, 10 ** 9, 0)
+    # deepen_capped（加深被轮数上限卡住次数）口径同上：非 0 才落键，没被卡住的配置保持原形状
+    if raw_stats.get("deepen_capped"):
+        cfg["stats"]["deepen_capped"] = _clamp_int(raw_stats.get("deepen_capped"), 0, 10 ** 9, 0)
+    # preventive_missed（预防式清理没防住次数）口径同上：v1.21.0 起预防式清理后压力
+    # 仍很快复发（距上次清理比当时预测的 eta 还短）就记一次，作为放宽预测窗口的证据
+    if raw_stats.get("preventive_missed"):
+        cfg["stats"]["preventive_missed"] = _clamp_int(
+            raw_stats.get("preventive_missed"), 0, 10 ** 9, 0)
     return cfg
 
 

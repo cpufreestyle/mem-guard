@@ -7,6 +7,8 @@
 import os
 import time
 
+from memguard import advisor as advisor_mod
+from memguard import clean as clean_mod
 from memguard import config as config_mod
 import memguard.tray as tray
 from memguard.tray import Guard, _GuardIcon
@@ -1263,12 +1265,70 @@ def test_post_clean_learn_resets_deepen_counter_when_relieved(monkeypatch):
     assert note == ""
 
 
-# --------------------- 定向覆盖面自调优（v1.15.0：集中度过高就把大户数 +1）
+def test_rearm_skipped_stages_after_rearm_rounds(monkeypatch):
+    """被跳过的阶段连续 _STAGE_REARM_ROUNDS 轮没上场，重新给一次试验机会。"""
+    logs = []
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g._stage_zero = {"targeted": 4, "bg": 0, "deepen": 0}
+    for _ in range(tray._STAGE_REARM_ROUNDS - 1):
+        g._rearm_skipped_stages({"targeted"})
+    assert g._stage_zero["targeted"] == 4, "还差一轮：零释放计数不动"
+    assert logs == [], "没攒够轮数不重试、不留日志"
+
+    g._rearm_skipped_stages({"targeted"})
+    assert g._stage_zero["targeted"] == 0, "攒够轮数：清计数，下一轮重新试一次"
+    assert g._stage_skip["targeted"] == 0, "重试计数随之归零，重新从 0 数"
+    assert any("阶段自学习重试" in m for m in logs)
+
+
+def test_rearm_skipped_stages_counts_per_stage(monkeypatch):
+    """各阶段独立计数：只跳过 targeted 的轮次不算 bg，bg 逃过一役计数清零。"""
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    for _ in range(tray._STAGE_REARM_ROUNDS - 1):
+        g._rearm_skipped_stages({"targeted", "bg"})
+    g._stage_zero = {"targeted": 9, "bg": 9, "deepen": 0}
+    # 第 _STAGE_REARM_ROUNDS 轮只跳过 targeted：bg 这轮上了场，连跳计数清零
+    g._rearm_skipped_stages({"targeted"})
+    assert g._stage_skip["bg"] == 0
+    assert g._stage_zero["targeted"] == 0, "targeted 攒够轮数：重新给一次试验机会"
+    assert g._stage_zero["bg"] == 9, "bg 没攒够：零释放计数原样保留"
+
+
+def test_post_clean_learn_rearms_via_skipped_set(monkeypatch):
+    """非粘滞轮把 skipped 传进去：攒够轮数后阶段清零，日志留痕。"""
+    logs = []
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg["sticky_aggressive"] = False
+    g._stage_zero = {"targeted": 9, "bg": 0, "deepen": 0}
+    for _ in range(tray._STAGE_REARM_ROUNDS - 1):
+        g._post_clean_learn({"still": True, "sticky": False}, {"targeted"})
+    assert g._stage_zero["targeted"] == 9, "还差一轮：计数不动"
+
+    g._post_clean_learn({"still": True, "sticky": False}, {"targeted"})
+    assert g._stage_zero["targeted"] == 0, "非粘滞轮驱动重试：攒够轮数清计数"
+    assert any("阶段自学习重试" in m for m in logs)
+
+
+def test_skip_stages_empty_when_stage_learn_off():
+    """阶段自学习关掉：跳过集为空集，被学废的阶段也不再挡路。"""
+    g = _guard(_state())
+    g.cfg["stage_learn"] = False
+    g._stage_zero = {"targeted": 99, "bg": 99, "deepen": 99}
+    assert g._skip_stages() == set()
+
+
+# --------------------- 定向覆盖面自调优（v1.15.0 集中度过高就 +1；v1.21.0 起爬山）
 
 
 def _top_adapt_cfg(**kw):
     """构造一份「覆盖面自适应开着、还没加过码」的归一化配置，可按关键字覆盖单项。"""
-    base = {"target_top_adapt": True, "target_top_adapt_done": False,
+    base = {"target_top_adapt": True, "target_top_adapt_done": 0,
             "target_clean": True, "clean_level": "conservative",
             "target_clean_top": 3}
     base.update(kw)
@@ -1276,11 +1336,11 @@ def _top_adapt_cfg(**kw):
 
 
 def test_auto_top_adapt_bumps_top_once(monkeypatch):
-    """大户榜长期集中：大户数 +1 并落闩，一次生效、有日志有通知。"""
+    """大户榜长期集中：大户数 +1 并记一次爬山，有日志有通知。"""
     changes, logs, notes = [], [], []
     monkeypatch.setattr(tray, "update_config",
                          lambda ch: changes.append(dict(ch)) or {
-                             "target_clean_top": 4, "target_top_adapt_done": True})
+                             "target_clean_top": 4, "target_top_adapt_done": 1})
     monkeypatch.setattr(tray, "narrow_top_coverage", lambda cfg, history=None: True)
     monkeypatch.setattr(tray, "log", logs.append)
 
@@ -1289,30 +1349,63 @@ def test_auto_top_adapt_bumps_top_once(monkeypatch):
     g.icon.notify = lambda text, title=None: notes.append((title, text))
 
     g._maybe_adapt_top()
-    assert changes == [{"target_clean_top": 4, "target_top_adapt_done": True}]
+    assert changes == [{"target_clean_top": 4, "target_top_adapt_done": 1}]
     assert g.cfg["target_clean_top"] == 4
-    assert g.cfg["target_top_adapt_done"] is True
+    assert g.cfg["target_top_adapt_done"] == 1
     assert any("自动优化" in m for m in logs)
+    assert any("第 1 次撒宽" in m for m in logs), "日志要点明这是第几次撒宽"
     assert notes and notes[0][0] == "MemGuard 自动优化"
 
+
+def test_auto_top_adapt_climbs_until_top_cap(monkeypatch):
+    """v1.21.0 爬山：仍窄就继续 +1，每步都记一次撒宽，直到 target_clean_top 上限。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "narrow_top_coverage", lambda cfg, history=None: True)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g.cfg = _top_adapt_cfg()
+    start = g.cfg["target_clean_top"]
+    top = start
+    for done in range(1, config_mod.TARGET_CLEAN_TOP_MAX - start + 1):
+        g._maybe_adapt_top()
+        top += 1
+        assert changes[-1] == {"target_clean_top": top,
+                              "target_top_adapt_done": done}
+        # update_config 原样回写：模拟真正落盘后的配置，下一轮照着继续爬
+        g.cfg["target_clean_top"] = top
+        g.cfg["target_top_adapt_done"] = done
+
+    assert top == config_mod.TARGET_CLEAN_TOP_MAX, "爬到 target_clean_top 上限即停"
+    before = len(changes)
     g._maybe_adapt_top()
-    assert len(changes) == 1, "闩 target_top_adapt_done 生效：不反复加码"
+    assert len(changes) == before, "已到上限：再怎么窄也不加码"
 
 
-def test_auto_top_adapt_skips_when_off_latched_or_capped(monkeypatch):
-    """开关关闭 / 已加过码 / 已到上限 / 覆盖面不窄：四种情形都不写配置。"""
+def test_auto_top_adapt_skips_when_off_or_capped(monkeypatch):
+    """开关关闭 / 已到上限 / 大户数脏值 / 覆盖面不窄：都不写配置。"""
     changes = []
     monkeypatch.setattr(tray, "update_config",
                          lambda ch: changes.append(dict(ch)) or dict(ch))
     monkeypatch.setattr(tray, "log", lambda m: None)
     monkeypatch.setattr(tray, "narrow_top_coverage", lambda cfg, history=None: True)
 
-    for kw in ({"target_top_adapt": False}, {"target_top_adapt_done": True},
-               {"target_clean_top": config_mod.TARGET_CLEAN_TOP_MAX}):
+    for kw in ({"target_top_adapt": False},
+               {"target_clean_top": config_mod.TARGET_CLEAN_TOP_MAX,
+                "target_top_adapt_done": config_mod.TARGET_CLEAN_TOP_MAX}):
         g = _guard(_state())
         g.cfg = _top_adapt_cfg(**kw)
         g._maybe_adapt_top()
         assert changes == [], kw
+
+    # 大户数是脏值 0（normalize 会钳到 1，这里手工置 0 模拟外部写坏）：不撒宽
+    g = _guard(_state())
+    g.cfg = _top_adapt_cfg()
+    g.cfg["target_clean_top"] = 0
+    g._maybe_adapt_top()
+    assert changes == []
 
     # 覆盖面不窄（集中度没到阈值）：不因为一次集中就加大网
     monkeypatch.setattr(tray, "narrow_top_coverage", lambda cfg, history=None: False)
@@ -1338,6 +1431,136 @@ def test_auto_top_adapt_failure_only_logs(monkeypatch):
     g._maybe_adapt_top()
     assert any("自动覆盖面适配异常" in m for m in logs)
 
+# --------------------- 预防窗口自调优（v1.21.0：连续没防住就把预测窗口放宽一档）
+
+
+def _predict_window_cfg(**kw):
+    """构造「预防窗口自适应开着、窗口还没放宽过」的归一化配置，可按关键字覆盖单项。"""
+    base = {"predict_clean": True, "predict_window_adapt": True,
+            "predict_window_min": 5, "predict_window_adapt_done": 0,
+            "clean_level": "conservative",
+            "stats": {"preventive_missed": advisor_mod._PREDICT_MISS_MIN}}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_predict_window_adapt_widens_on_miss_streak(monkeypatch):
+    """连续没防住：预测窗口放宽一档，done 记新窗口，有日志有通知。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or {
+                             "predict_window_min": 10,
+                             "predict_window_adapt_done": 10})
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _predict_window_cfg()
+    g._predict_miss_streak = tray._PREDICT_MISS_STRIKES
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_predict_window()
+    assert changes == [{"predict_window_min": 10, "predict_window_adapt_done": 10}]
+    assert g.cfg["predict_window_min"] == 10
+    assert g.cfg["predict_window_adapt_done"] == 10
+    assert any("自动优化" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+
+
+def test_predict_window_adapt_skips_when_off_or_no_headroom(monkeypatch):
+    """开关关 / 趋势预防关 / 激进档 / missed 不够 / 窗口已到顶：一律不写配置。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    for kw in ({"predict_window_adapt": False},
+               {"predict_clean": False},
+               {"clean_level": "aggressive"},
+               {"predict_window_min": clean_mod._PREDICT_WINDOW_MAX},
+               {"predict_window_adapt_done": clean_mod._PREDICT_WINDOW_MAX},
+               {"stats": {"preventive_missed":
+                          advisor_mod._PREDICT_MISS_MIN - 1}}):
+        g = _guard(_state())
+        g.cfg = _predict_window_cfg(**kw)
+        g._predict_miss_streak = tray._PREDICT_MISS_STRIKES
+        g._maybe_adapt_predict_window()
+        assert changes == [], kw
+
+
+def test_predict_window_adapt_failure_only_logs(monkeypatch):
+    """update_config 抛异常只记日志：放宽失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(_changes):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tray, "update_config", _boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _predict_window_cfg()
+    g._predict_miss_streak = tray._PREDICT_MISS_STRIKES
+    g._maybe_adapt_predict_window()
+    assert any("自动预防窗口适配异常" in m for m in logs)
+
+
+def test_note_relief_fires_predict_window_adapt_on_miss_streak(monkeypatch):
+    """预防式清理后压力比 eta 还早复发：第一次只累计，第二次连发就放宽窗口。"""
+    changes = []
+
+    def _fake_update(ch):
+        changes.append(dict(ch))
+        cfg = dict(g.cfg)
+        cfg.update(ch)
+        return cfg
+
+    monkeypatch.setattr(tray, "update_config", _fake_update)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g.cfg = _predict_window_cfg()
+    g.icon.notify = lambda text, title=None: None
+    eta = 300
+
+    g._predictive_eta = eta
+    g._note_relief(eta - 1, False)
+    assert changes == [], "未中一次只累计，还没到连发门槛"
+    assert g._predict_miss_streak == 1
+    assert g._predict_miss_pending is True, "要让下一次清理把 missed 落进统计"
+    assert g._predictive_eta is None, "eta 只判一次：判完就撤标记"
+
+    g._predictive_eta = eta
+    g._note_relief(1, False)
+    assert changes == [{"predict_window_min": 10, "predict_window_adapt_done": 10}]
+    assert g.cfg["predict_window_min"] == 10
+
+    # 撑住了（比 eta 还久）：连发计数清零，窗口不再加宽
+    g._predictive_eta = eta
+    g._note_relief(eta + 10, False)
+    assert g._predict_miss_streak == 0
+
+
+def test_auto_clean_marks_predictive_miss_from_pending(monkeypatch):
+    """没防住之后下一次自动清理把 predictive_missed 带给 do_clean，读完即撤。"""
+    seen = []
+
+    def _fake_do_clean(reason, **kw):
+        seen.append(kw.get("predictive_missed"))
+        return {"ok": True, "freed": 0, "detail": ""}
+
+    monkeypatch.setattr(tray, "do_clean", _fake_do_clean)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g.cfg = config_mod.normalize_config({})
+    g.icon = None
+
+    g._predict_miss_pending = True
+    g._auto_clean(time.time() - 1000.0, "自动", _state())
+    assert seen == [True], "没防住要打上 predictive_missed 标记"
+
+    g._auto_clean(time.time() - 1000.0, "自动", _state())
+    assert seen == [True, False], "pending 只生效一次，不能重复累计"
 
 # --------------------- 清理提前量自调优（v1.16.0：效果连续偏短就把阈值提前）
 
@@ -1568,3 +1791,490 @@ def test_auto_min_avail_adapt_failure_only_logs(monkeypatch):
     g._maybe_adapt_min_avail()
     assert any("自动低内存下限适配异常" in m for m in logs)
 
+
+# --------------------- 定向大户下限自调优（v1.19.0：榜上够不着下限，把大户下限降一档）
+
+
+def _minmb_history():
+    """6 份采样里大户榜每次都是同三个进程（400/300/200MB，跨度 500s）：中位数 300MB。"""
+    return [(1000.0 + i * 100.0,
+             {1: ("a.exe", 400 * 1024 ** 2), 2: ("b.exe", 300 * 1024 ** 2),
+              3: ("c.exe", 200 * 1024 ** 2)})
+            for i in range(6)]
+
+
+def _minmb_cfg(**kw):
+    """构造一份「定向大户下限自适应开着、还没降过」的归一化配置，可按关键字覆盖单项。"""
+    base = {"target_clean": True, "target_clean_top": 3,
+            "target_clean_min_mb": 1024, "min_mb_adapt": True,
+            "min_mb_adapt_done": False,
+            "stats": {"count": 3, "freed": 0, "bg_trimmed": 1}}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_auto_min_mb_adapt_halves_once(monkeypatch):
+    """榜上有人却够不着下限：下限减半并落闩，一次生效、有日志有通知。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or {
+                             "target_clean_min_mb": 512,
+                             "min_mb_adapt_done": True})
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _minmb_cfg()
+    g.proc_history = _minmb_history()
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_min_mb()
+    assert changes == [{"target_clean_min_mb": 512, "min_mb_adapt_done": True}]
+    assert g.cfg["target_clean_min_mb"] == 512
+    assert g.cfg["min_mb_adapt_done"] is True
+    assert any("自动优化" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+
+    g._maybe_adapt_min_mb()
+    assert len(changes) == 1, "闩 min_mb_adapt_done 生效：不反复降码"
+
+
+def test_auto_min_mb_adapt_skips_when_off_latched_floor_or_level(monkeypatch):
+    """开关关闭 / 已降过 / 下限已在兜底值或踩得着 / 判据不过：都不写配置。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    hist = _minmb_history()
+    for kw in ({"min_mb_adapt": False}, {"min_mb_adapt_done": True},
+               {"target_clean_min_mb": 128},
+               # 中位数 300MB 正好踩线：够得着，不是够不着
+               {"target_clean_min_mb": 300},
+               {"target_clean": False},
+               {"clean_level": "aggressive"},
+               {"stats": {"count": 3, "targeted": 1}},
+               {"stats": {"count": 2}},
+               {"stats": {"count": 3}}):
+        g = _guard(_state())
+        g.cfg = _minmb_cfg(**kw)
+        g.proc_history = hist
+        g._maybe_adapt_min_mb()
+        assert changes == [], kw
+
+    # 脏大户数走不到采样：归一化会兜底，故覆盖在归一化之后的 dict 上
+    for dirty_top in (0, 11, "x"):
+        g = _guard(_state())
+        g.cfg = dict(_minmb_cfg(), target_clean_top=dirty_top)
+        g.proc_history = hist
+        g._maybe_adapt_min_mb()
+        assert changes == [], dirty_top
+
+    # 大户每份都在换人 + 没有采样：没证据可依，一律不动
+    rotating = [(1000.0 + i * 100.0, {1: (f"p{i}.exe", 400 * 1024 ** 2)})
+                for i in range(6)]
+    for empty in (rotating, None, []):
+        g = _guard(_state())
+        g.cfg = _minmb_cfg()
+        g.proc_history = empty
+        g._maybe_adapt_min_mb()
+        assert changes == []
+
+
+def test_auto_min_mb_adapt_failure_only_logs(monkeypatch):
+    """update_config 抛异常只记日志：自调优失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(_changes):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tray, "update_config", _boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _minmb_cfg()
+    g.proc_history = _minmb_history()
+    g._maybe_adapt_min_mb()
+    assert any("自动大户下限适配异常" in m for m in logs)
+
+
+def test_monitor_runs_min_mb_adapt_each_loop(monkeypatch):
+    """监控每轮都跑大户下限适配：顺序排在覆盖面适配之后、更新检查之前。"""
+    calls = []
+
+    def _rec(name):
+        def _f(*a, **kw):
+            calls.append(name)
+            if name == "_maybe_adapt_min_mb":
+                guard.stop.set()
+            return None
+        return _f
+
+    guard = _guard(_state())
+    guard.cfg = config_mod.normalize_config(
+        {"interval": 0, "warn_margin": 0, "min_avail_mb": 0,
+         "scheduled_minutes": 0, "clean_on_start": False})
+    for name in ("maybe_reload_config", "refresh", "_refresh_advice",
+                 "_maybe_adapt_level", "_maybe_adapt_top", "_maybe_adapt_min_mb",
+                 "_maybe_check_update", "_refresh_icon", "_maybe_predictive_clean"):
+        monkeypatch.setattr(Guard, name, _rec(name))
+
+    guard.monitor()
+    assert "_maybe_adapt_min_mb" in calls
+    assert (calls.index("_maybe_adapt_top")
+            < calls.index("_maybe_adapt_min_mb")
+            < calls.index("_maybe_check_update"))
+
+# -------- 定向加深轮数自调优（v1.20.0：加深被轮数上限卡住，轮数上限 +1）
+
+
+def _rsat_cfg(**kw):
+    """构造一份「加深轮数自适应开着、还没加过」的归一化配置，可按关键字覆盖单项。"""
+    base = {"target_clean": True, "stage_deepen": True,
+            "stage_deepen_rounds": 1, "deepen_rounds_adapt": True,
+            "deepen_rounds_adapt_done": 0,
+            "stats": {"count": 5, "freed": 0, "deepen_capped": 3}}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_auto_deepen_rounds_adapt_bumps_once(monkeypatch):
+    """加深反复被轮数卡住：轮数上限 +1 并落档，有日志有通知。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or {
+                             "stage_deepen_rounds": 2,
+                             "deepen_rounds_adapt_done": 2})
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _rsat_cfg()
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_deepen_rounds()
+    assert changes == [{"stage_deepen_rounds": 2,
+                        "deepen_rounds_adapt_done": 2}]
+    assert g.cfg["stage_deepen_rounds"] == 2
+    assert g.cfg["deepen_rounds_adapt_done"] == 2
+    assert any("自动优化" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+
+
+def test_auto_deepen_rounds_adapt_skips_when_off_capped_or_rare(monkeypatch):
+    """开关关闭 / 已爬到顶 / 判据不过：都不写配置。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    for kw in ({"deepen_rounds_adapt": False},
+               # 已在最高轮数：没有更高可加，也不该反复加码
+               {"stage_deepen_rounds": 3, "deepen_rounds_adapt_done": 3},
+               {"deepen_rounds_adapt_done": 3},
+               {"target_clean": False}, {"stage_deepen": False},
+               {"clean_level": "aggressive"},
+               {"stats": {"count": 5, "deepen_capped": 2}},
+               {"stats": {"count": 5}}):
+        g = _guard(_state())
+        g.cfg = _rsat_cfg(**kw)
+        g._maybe_adapt_deepen_rounds()
+        assert changes == [], kw
+
+
+def test_auto_deepen_rounds_adapt_failure_only_logs(monkeypatch):
+    """update_config 抛异常只记日志：自调优失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(_changes):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tray, "update_config", _boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _rsat_cfg()
+    g._maybe_adapt_deepen_rounds()
+    assert any("自动加深轮数适配异常" in m for m in logs)
+
+
+def test_monitor_runs_deepen_rounds_adapt_each_loop(monkeypatch):
+    """监控每轮都跑加深轮数适配：顺序排在大户下限适配之后、更新检查之前。"""
+    calls = []
+
+    def _rec(name):
+        def _f(*a, **kw):
+            calls.append(name)
+            if name == "_maybe_adapt_deepen_rounds":
+                guard.stop.set()
+            return None
+        return _f
+
+    guard = _guard(_state())
+    guard.cfg = config_mod.normalize_config(
+        {"interval": 0, "warn_margin": 0, "min_avail_mb": 0,
+         "scheduled_minutes": 0, "clean_on_start": False})
+    for name in ("maybe_reload_config", "refresh", "_refresh_advice",
+                 "_maybe_adapt_level", "_maybe_adapt_top", "_maybe_adapt_min_mb",
+                 "_maybe_adapt_deepen_rounds", "_maybe_check_update",
+                 "_refresh_icon", "_maybe_predictive_clean"):
+        monkeypatch.setattr(Guard, name, _rec(name))
+
+    guard.monitor()
+    assert "_maybe_adapt_deepen_rounds" in calls
+    assert (calls.index("_maybe_adapt_min_mb")
+            < calls.index("_maybe_adapt_deepen_rounds")
+            < calls.index("_maybe_check_update"))
+
+
+def test_monitor_runs_predict_window_adapt_each_loop(monkeypatch):
+    """监控每轮都跑预防窗口适配：顺序排在加深轮数适配之后、更新检查之前。"""
+    calls = []
+
+    def _rec(name):
+        def _f(*a, **kw):
+            calls.append(name)
+            if name == "_maybe_adapt_predict_window":
+                guard.stop.set()
+            return None
+        return _f
+
+    guard = _guard(_state())
+    guard.cfg = config_mod.normalize_config(
+        {"interval": 0, "warn_margin": 0, "min_avail_mb": 0,
+         "scheduled_minutes": 0, "clean_on_start": False})
+    for name in ("maybe_reload_config", "refresh", "_refresh_advice",
+                 "_maybe_adapt_level", "_maybe_adapt_top", "_maybe_adapt_min_mb",
+                 "_maybe_adapt_deepen_rounds", "_maybe_adapt_predict_window",
+                 "_maybe_check_update", "_refresh_icon", "_maybe_predictive_clean"):
+        monkeypatch.setattr(Guard, name, _rec(name))
+
+    guard.monitor()
+    assert "_maybe_adapt_predict_window" in calls
+    assert (calls.index("_maybe_adapt_deepen_rounds")
+            < calls.index("_maybe_adapt_predict_window")
+            < calls.index("_maybe_check_update"))
+
+
+# --------------------- 触发阈值自调优（v1.22.0：温和手段用尽仍偏短，两条触发线各降一档）
+
+
+def _thresh_cfg(**kw):
+    """构造「触发线自适应开着、还没降过」的归一化配置，可按关键字覆盖单项。
+
+    隔离三条互斥判据：短效未过半（那条该改用激进）、提前量已落闩（那条该提前判定）、
+    没有低内存证据（那条该抬下限）——同一份短效证据只剩「动触发线」这一条出路。
+    """
+    base = {"phys_threshold": 85, "commit_threshold": 90,
+            "threshold_adapt": True, "threshold_adapt_done": 0,
+            "headroom_adapt_done": True,
+            "stats": {"count": 10, "freed": 0, "short_relief": 3,
+                      "escalated": 1}}
+    base.update(kw)
+    return config_mod.normalize_config(base)
+
+
+def test_auto_threshold_adapt_drops_both_lines_once(monkeypatch):
+    """粘滞激进 + 连发短效：两条触发线各降一档，done 记 1，有日志有通知。"""
+    changes, logs, notes = [], [], []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or {
+                             "phys_threshold": 80, "commit_threshold": 85,
+                             "threshold_adapt_done": 1})
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _thresh_cfg()
+    g._sticky_aggr = True
+    g._last_clean_escalated = False
+    g.icon.notify = lambda text, title=None: notes.append((title, text))
+
+    g._maybe_adapt_threshold()
+    assert changes == [{"phys_threshold": 80, "commit_threshold": 85,
+                        "threshold_adapt_done": 1}]
+    assert g.cfg["phys_threshold"] == 80
+    assert g.cfg["commit_threshold"] == 85
+    assert g.cfg["threshold_adapt_done"] == 1
+    assert any("自动优化" in m for m in logs)
+    assert notes and notes[0][0] == "MemGuard 自动优化"
+
+
+def test_auto_threshold_adapt_accepts_escalate_attribution(monkeypatch):
+    """没进粘滞但上一次升过档也算温和手段用尽：够证据就降线。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g.cfg = _thresh_cfg(stats={"count": 10, "short_relief": 3, "sticky": 1})
+    g._sticky_aggr = False
+    g._last_clean_escalated = True
+    g.icon.notify = lambda text, title=None: None
+
+    g._maybe_adapt_threshold()
+    assert changes == [{"phys_threshold": 80, "commit_threshold": 85,
+                        "threshold_adapt_done": 1}]
+
+
+def test_auto_threshold_adapt_skips_when_off_latched_or_floored(monkeypatch):
+    """开关关 / 已降满两次 / 任一条线会破兜底 / 证据不足：一律不写配置。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    for kw in ({"threshold_adapt": False},
+               # 已经降满两次：两次还压不住就该上激进档或用户介入
+               {"threshold_adapt_done": 2},
+               # 物理线再降一步就跌破兜底下限：这类机器交给用户自己定夺
+               {"phys_threshold": 64},
+               # 提交线再降一步就跌破兜底下限
+               {"commit_threshold": 69},
+               # 温和阶梯从没用尽：没有 escalated / sticky 证据
+               {"stats": {"count": 10, "short_relief": 3}},
+               # 短效次数不够：一次偏短只是抖动
+               {"stats": {"count": 10, "short_relief": 1, "escalated": 1}},
+               # 短效过半：那份证据更该「一次清到位」，不由触发线管
+               {"stats": {"count": 5, "short_relief": 4, "escalated": 1}}):
+        g = _guard(_state())
+        g.cfg = _thresh_cfg(**kw)
+        g._sticky_aggr = True
+        g._last_clean_escalated = True
+        g.icon.notify = lambda text, title=None: None
+        g._maybe_adapt_threshold()
+        assert changes == [], kw
+
+
+def test_auto_threshold_adapt_skips_without_exhausted_ladder(monkeypatch):
+    """既没粘滞也没升过档 / 自动清理关：都不构成动触发线的理由。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    # 既没粘滞也没升过档：温和阶梯并没有用尽，先别动总触发线
+    g = _guard(_state())
+    g.cfg = _thresh_cfg()
+    g._sticky_aggr = False
+    g._last_clean_escalated = False
+    g.icon.notify = lambda text, title=None: None
+    g._maybe_adapt_threshold()
+    assert changes == []
+
+    # 自动清理关掉：没人会被这两条线叫醒，降它没有意义
+    g = _guard(_state())
+    g.cfg = _thresh_cfg(auto_clean=False)
+    g._sticky_aggr = True
+    g._last_clean_escalated = True
+    g._maybe_adapt_threshold()
+    assert changes == []
+
+
+def test_auto_threshold_adapt_waits_for_headroom_to_run_out(monkeypatch):
+    """提前量还有空间时不动触发线：先提前判定阈值，那是更温和的一步。"""
+    changes = []
+    monkeypatch.setattr(tray, "update_config",
+                         lambda ch: changes.append(dict(ch)) or dict(ch))
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    def _run(**kw):
+        g = _guard(_state())
+        g.cfg = _thresh_cfg(**kw)
+        g._sticky_aggr = True
+        g._last_clean_escalated = True
+        g.icon.notify = lambda text, title=None: None
+        g._maybe_adapt_threshold()
+
+    # 目标余量还有空间：先提前判定阈值，那一步更温和，这里一律不动
+    for kw in ({"headroom_adapt_done": False, "target_headroom_pct": 0},
+               {"headroom_adapt_done": False, "target_headroom_pct": 5}):
+        _run(**kw)
+        assert changes == [], kw
+
+    # 提前量确实没了空间（已到上限 / 开关关掉 / 脏值读不出）：这才轮到动触发线
+    for kw in ({"headroom_adapt_done": False,
+                "target_headroom_pct": clean_mod._HEADROOM_MAX},
+               # 提前量开关关掉即算用尽；其余门照旧
+               {"headroom_adapt": False, "headroom_adapt_done": False,
+                "target_headroom_pct": 5},
+               # 闩已落：提前量这条路已经走完了
+               {"headroom_adapt_done": True}):
+        _run(**kw)
+        assert changes == [{"phys_threshold": 80, "commit_threshold": 85,
+                            "threshold_adapt_done": 1}], kw
+        changes.clear()
+
+    # 提前量是脏值（裸 dict，未过归一化）：读不出余量也算用尽
+    g = _guard(_state())
+    g.cfg = {"headroom_adapt": True, "headroom_adapt_done": False,
+             "target_headroom_pct": "x"}
+    assert g._headroom_exhausted() is True
+
+
+def test_auto_threshold_adapt_failure_only_logs(monkeypatch):
+    """update_config 抛异常只记日志：降线失败绝不能带崩监控循环。"""
+    logs = []
+
+    def _boom(_changes):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(tray, "update_config", _boom)
+    monkeypatch.setattr(tray, "log", logs.append)
+
+    g = _guard(_state())
+    g.cfg = _thresh_cfg()
+    g._sticky_aggr = True
+    g._maybe_adapt_threshold()
+    assert any("自动触发阈值适配异常" in m for m in logs)
+
+
+def test_note_relief_fires_threshold_adapt_on_short_streak(monkeypatch):
+    """超阈值触发的清理连续偏短：连发到门槛才降线；别的原因归别处管。"""
+    changes = []
+
+    def _fake_update(ch):
+        changes.append(dict(ch))
+        cfg = dict(g.cfg)
+        cfg.update(ch)
+        return cfg
+
+    monkeypatch.setattr(tray, "update_config", _fake_update)
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g.cfg = _thresh_cfg()
+    g.icon.notify = lambda text, title=None: None
+    g._last_clean_escalated = True
+    g._last_clean_reason = "自动"
+
+    g._note_relief(120, True)
+    assert changes == [], "偏短一次只累计，还没到连发门槛"
+    assert g._threshold_short_streak == 1
+
+    g._note_relief(120, True)
+    g._note_relief(120, True)
+    assert changes == [{"phys_threshold": 80, "commit_threshold": 85,
+                        "threshold_adapt_done": 1}]
+    assert g._threshold_short_streak == tray._THRESHOLD_STRIKES
+
+    # 撑住了：连发计数清零，不再降线
+    g._note_relief(3600, False)
+    assert g._threshold_short_streak == 0
+    assert len(changes) == 1
+
+    # 归因不是超阈值（低内存下限 / 预防式）：短效不记到触发线账上
+    for reason in ("低内存", "预防式"):
+        g._last_clean_reason = reason
+        g._note_relief(120, True)
+        assert g._threshold_short_streak == 0, reason
+        assert len(changes) == 1, reason
+
+
+def test_post_clean_learn_records_escalation_attribution(monkeypatch):
+    """动触发线前要确认温和阶梯确曾用尽：升过档这一位连压力解除轮也要记。"""
+    monkeypatch.setattr(tray, "log", lambda m: None)
+
+    g = _guard(_state())
+    g._post_clean_learn({"escalated": True, "still": False})
+    assert g._last_clean_escalated is True, "早退轮也要记，不能漏掉升过档又看住的那一轮"
+    g._post_clean_learn({"escalated": False, "still": True})
+    assert g._last_clean_escalated is False

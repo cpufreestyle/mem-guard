@@ -82,6 +82,33 @@ _FOCUS_MIN_SAMPLES = 5      # 至少这么多份采样才谈「长期在榜」�
 _FOCUS_MIN_SPAN = 300.0     # 采样至少要覆盖这么长时间(秒)，五分钟内的抖动不算长期
 _FOCUS_RATIO = 0.8          # 集中度达到这么多就认为覆盖面偏窄，该把单次大户数 +1
 
+# 定向大户下限自调优（v1.19.0）：榜上有人却够不着下限——target_clean_min_mb 定得偏高时，
+# 长期在榜进程的 rss 怎么也过不了这条线，每轮定向清理都挑不中它们，只剩后台撒宽在兜底。
+# 把大户下限除以这一档，清理重新够得着；整个生命周期最多降一次，由 tray 落
+# min_mb_adapt_done 闩。下限不许跌破兜底值：再低就跟普通进程没差别，定向就没意义了。
+_MINMB_DIV = 2              # 大户下限自调优每次的除数：下限偏高多半是翻倍量级，减半就够回落
+_MINMB_FLOOR_MB = 128       # 大户下限兜底(MB)：与 config 对 target_clean_min_mb 的钳制下限一致
+
+# 预防窗口自调优（v1.21.0）：预防式清理是「还没触阈就按斜率提前清」，它的价值全押在
+# 「提前得够早」上。若预防式清理之后压力仍很快复发（距上次清理不足
+# effect_min_relief_sec，见 tray._note_relief 的 eta 判定），说明这条上升曲线比
+# predict_window_min 预判的更陡——把预测窗口放宽这一步分钟，预防式清理就能在更早的
+# 斜率上报警、提前动手。整个生命周期最多放宽到 _PREDICT_WINDOW_MAX，由 tray 落
+# predict_window_adapt_done 闩。
+_PREDICT_WINDOW_STEP = 5    # 预防窗口自调优每次放宽的分钟数：刚好越过「差一点没防住」的量级
+_PREDICT_WINDOW_MAX = 30    # 预防窗口上限(分钟)：config 对 predict_window_min 的钳制上限是 60，取一半更稳
+
+# 触发阈值自适应（v1.22.0）：两条触发线（phys/commit_threshold）本身从不自适应——
+# 线内的温和阶梯（提前量/加深/覆盖面/大户下限/低内存下限/预测窗口）挨个试过，
+# 清理仍顶到线才被叫起、清完没多久又超，说明线本身画得偏高。把两条线各降这一档
+# 百分点，清理发生在压力顶上来之前；整个生命周期最多降 _THRESHOLD_MAX_DROPS 次，
+# 由 tray 落 threshold_adapt_done 闩。各自兜底下限不许跌破：再低就变成
+# 「永远在清」，那类机器交给用户自己定夺。
+_THRESHOLD_STEP = 5          # 触发阈值自调优每次下调的百分点：与提前量步长同档，改动可感知但不突兀
+_THRESHOLD_MAX_DROPS = 2     # 整个生命周期最多下调几次：两次还压不住就该上激进档或用户介入
+_THRESHOLD_PHYS_FLOOR = 60   # 物理阈值兜底下限(%)：低于它就成常态清理，失去「阈值」意义
+_THRESHOLD_COMMIT_FLOOR = 65 # 提交阈值兜底下限(%)：同上，提交线本就比物理线宽松一档
+
 
 def _status(rc: int) -> str:
     """把 NTSTATUS 渲染为可读文案。"""
@@ -118,7 +145,9 @@ def _wait_avail_rise(before: dict) -> dict:
 def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
                 preventive: bool = False, short_relief: bool = False,
                 bg_trimmed: bool = False, sticky: bool = False,
-                deepen_rounds: int = 0, low_mem: bool = False) -> dict:
+                deepen_rounds: int = 0, low_mem: bool = False,
+                deepen_capped: bool = False,
+                predictive_missed: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -141,6 +170,12 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
     的轮数累加（一次加深 2 轮就 +2），口径同上。
     low_mem=True 时同步累计「低内存下限触发次数」：v1.17.0 起可用物理内存低于
     min_avail_mb 这一绝对下限而触发清理的频次，作为抬高该下限的证据（口径同上）。
+    deepen_capped=True 时同步累计「加深被轮数上限卡住次数」：v1.20.0 起加深把
+    stage_deepen_rounds 跑满、最后一轮仍在释放、加深级收尾时压力仍没按住，说明
+    温和阶梯被轮数卡住，作为抬高轮数上限的证据（口径同上）。
+    predictive_missed=True 时同步累计「预防式清理没防住次数」：v1.21.0 起预防式清理
+    后压力仍很快复发（距上次清理比当时预测的触阈时间还短，见 tray._note_relief），
+    作为放宽预测窗口的证据（口径同上）。
     """
     with _CONFIG_LOCK:
         cfg = load_config()
@@ -163,6 +198,10 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
             st["low_mem"] = int(st.get("low_mem", 0)) + 1
         if deepen_rounds:
             st["deepen"] = int(st.get("deepen", 0)) + int(deepen_rounds)
+        if deepen_capped:
+            st["deepen_capped"] = int(st.get("deepen_capped", 0)) + 1
+        if predictive_missed:
+            st["preventive_missed"] = int(st.get("preventive_missed", 0)) + 1
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
@@ -501,6 +540,48 @@ def leak_candidates(history) -> list:
     return out
 
 
+def _long_term_names(samples, top):
+    """从采样列表里统计「长期在榜」的名字与它占据的位次数（v1.19.0 抽出）。
+
+    samples 是 [(t, {pid: (name, rss_bytes)}), ...]，top 是单次大户数
+    （target_clean_top）。逐采样按 rss 降序取前 top 个名字并归一化
+    （_norm_proc_name），出现于过半可用采样的名字算「长期在榜」。返回
+    (name -> 在榜次数字典, 实际总位次数)：位次数按各份采样真实取到的名字数求和，
+    别拿 top*份数 凑数。采样不够干净 / 一个位次都没有时返回 ({}, 0)——调用方据此
+    判「证据不足」。纯函数，便于单测。
+    """
+    seen_times = {}
+    slots = 0
+    usable = 0
+    for sample in samples:
+        try:
+            _, snap = sample
+        except (TypeError, ValueError, IndexError):
+            continue
+        rows = []
+        for _, item in (snap or {}).items():
+            try:
+                name, rss = item
+                rows.append((_norm_proc_name(name), int(rss)))
+            except (TypeError, ValueError):
+                continue
+        if not rows:
+            continue
+        usable += 1
+        rows.sort(key=lambda r: r[1], reverse=True)
+        names = [n for n, _ in rows[:top]]
+        slots += len(names)
+        for name in set(names):
+            seen_times[name] = seen_times.get(name, 0) + 1
+    if slots <= 0 or usable <= 0:
+        return {}, 0
+    sticky = usable / 2.0
+    focus_times = {n: c for n, c in seen_times.items() if c >= sticky}
+    if not focus_times:
+        return {}, 0
+    return focus_times, slots
+
+
 def top_focus_ratio(history, top) -> float:
     """定向大户榜的集中度：长期在榜的名字占了多少个位次（v1.15.0）。
 
@@ -527,40 +608,64 @@ def top_focus_ratio(history, top) -> float:
             return 0.0
     except (TypeError, ValueError, IndexError):
         return 0.0
-    seen_times = {}
-    slots = 0
-    usable = 0
+    seen_times, slots = _long_term_names(samples, top)
+    if slots <= 0 or not seen_times:
+        return 0.0
+    return min(1.0, sum(seen_times.values()) / float(slots))
+
+
+def focused_top_rss(history, top):
+    """长期在榜名字的 rss 中位数(字节)，够不着大户下限时用来把下限降一档（v1.19.0）。
+
+    history 是 (t, {pid: (name, rss_bytes)}) 采样列表（即 Guard.proc_history），top 是
+    单次大户数（target_clean_top）。先按 top_focus_ratio 的同源门槛圈出「长期在榜」的
+    名字（采样不足、跨度过短、top<=0、没有长期在榜名字时一律 None：证据不够就不下
+    结论），再把这些名字在所有采样里出现过的 rss 收起来取中位数——中位数比均值抗
+    一次性的尖峰。None 表示证据不足或无值可看。纯函数，便于单测。
+    """
+    try:
+        top = int(top)
+    except (TypeError, ValueError):
+        return None
+    samples = list(history or [])
+    if top <= 0 or len(samples) < _FOCUS_MIN_SAMPLES:
+        return None
+    try:
+        if float(samples[-1][0]) - float(samples[0][0]) < _FOCUS_MIN_SPAN:
+            return None
+    except (TypeError, ValueError, IndexError):
+        return None
+    names, _slots = _long_term_names(samples, top)
+    if not names:
+        return None
+    values = []
     for sample in samples:
         try:
             _, snap = sample
         except (TypeError, ValueError, IndexError):
             continue
-        rows = []
         for _, item in (snap or {}).items():
             try:
                 name, rss = item
-                rows.append((_norm_proc_name(name), int(rss)))
+                if _norm_proc_name(name) not in names:
+                    continue
+                values.append(int(rss))
             except (TypeError, ValueError):
                 continue
-        if not rows:
-            continue
-        usable += 1
-        rows.sort(key=lambda r: r[1], reverse=True)
-        names = [n for n, _ in rows[:top]]
-        slots += len(names)
-        for name in set(names):
-            seen_times[name] = seen_times.get(name, 0) + 1
-    if slots <= 0 or usable <= 0:
-        return 0.0
-    sticky = usable / 2.0
-    focus = sum(c for c in seen_times.values() if c >= sticky)
-    return min(1.0, focus / float(slots))
+    if not values:
+        return None
+    values.sort()
+    mid = len(values) // 2
+    if len(values) % 2:
+        return float(values[mid])
+    return (values[mid - 1] + values[mid]) / 2.0
 
 
 def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=None,
                 preventive: bool = False, low_relief: bool = False,
                 low_mem: bool = False,
-                growth_rows=None, sticky: bool = False, skip=()) -> dict:
+                growth_rows=None, sticky: bool = False, skip=(),
+                predictive_missed: bool = False) -> dict:
     """执行一次清理，返回结果统计（特权在返回前恢复，用完即关）。
 
     level: "conservative"（默认，只清 standby/修改页/文件缓存）或
@@ -588,7 +693,12 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     加深可多轮（stage_deepen_rounds，默认 1 轮即 v1.13.0 行为），每轮只挑还没碰过
     的进程，没候选/没清动/已按住都会提前收尾。加深的释放量计入 targeted_freed，另
     以回传键 deepened（加深清掉的进程数）/ deepen_freed / deepen_rounds（实际跑了几
-    轮）报给通知与统计（stats.deepen 按轮累计）。
+    轮）报给通知与统计（stats.deepen 按轮累计）。v1.20.0 起另以回传键
+    deepen_capped 报「加深是否被轮数上限卡住」：轮数跑满、最后一轮仍在释放、
+    加深级收尾时压力仍没按住（stats.deepen_capped 按次累计）。
+    predictive_missed=True 表示「上次预防式清理没防住」（v1.21.0）：预防式清理后
+    压力仍很快复发（距上次清理比当时预测的触阈时间还短），只多累计一个
+    stats.preventive_missed 计数供统计行、通知与 advisor 放宽预测窗口使用。
     v1.15.0 起加深还会看「收益衰减」：单轮释放不足上轮的 stage_deepen_diminish_pct
     这么多（默认 50%，0=关）就收尾——网撒到收益衰减区就停，别为「再宽一点」多清
     一批无关紧要的中等进程（明细里点明「收益衰减」）。
@@ -629,6 +739,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     bg_freed = 0
     escalated_freed = 0
     deepen_rounds = 0            # v1.14.0：实际跑过的加深轮数（stats 按轮累计）
+    deepen_capped = False         # v1.20.0：加深是否被轮数上限卡住（stats.deepen_capped 累计）
 
     # 定向清理（v1.7.0 阶梯第一级）：保守清理后仍超阈值时，先只对工作集最大的几个
     # 进程精确清空——比直接全量升档的打扰小；仍不达标才轮到升档的「全清」
@@ -674,6 +785,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         # 收益基线取首次定向那轮的释放量：加深是「上一轮确实有效」的补刀，比较对象
         # 自然就是那个让它获准开工的数字
         prev_freed = targeted_freed
+        round_freed = 0
         for rnd in range(1, cap + 1):
             if not _still_pressured(after, cfg):
                 break               # 上一轮已经按住：加深到此为止，别再多撒网
@@ -715,6 +827,15 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
             names = "、".join(f"{name} {gb(rss)}" for name, rss, _ in extra)
             detail.append(f"定向加深({rnd_txt}{names}): {n} 个"
                           + (f"（跳过 {skipped}）" if skipped else ""))
+        else:
+            # v1.20.0 加深被轮数上限卡住：一次都没提前收尾（候选没枯竭、收益没衰减、
+            # 中途没被按住），且最后一轮仍在释放、加深级跑完后压力仍没按住——温和阶梯
+            # 是被轮数卡住的，多给一轮加深比升档全清打扰小。报回给自调优把上限 +1。
+            if round_freed > 0 and _still_pressured(after, cfg):
+                deepen_capped = True
+                detail.append(f"定向加深: 轮数跑满({cap} 轮)仍释放且压力未按住")
+                log(f"{reason}加深卡住 | 轮数上限 {cap} 跑满，末轮仍释放 "
+                    f"{gb(round_freed)}，收尾时压力仍未按住")
 
     # 后台进程工作集清理（v1.11.0 阶梯第二级）：定向大户仍不达标时，清空「没有可见
     # 顶层窗口」的后台进程工作集——比直接全量升档的打扰小（前台正在访问的页不动），
@@ -786,6 +907,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         "deepened": deepened,
         "deepen_freed": deepen_freed,
         "deepen_rounds": deepen_rounds,
+        "deepen_capped": deepen_capped,
         "sticky": sticky,
         "still": still,
         "detail": ", ".join(detail),
@@ -794,7 +916,8 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     try:
         result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive,
                                      low_relief, bool(bg_trimmed), sticky,
-                                     deepen_rounds, low_mem)
+                                     deepen_rounds, low_mem, deepen_capped,
+                                     predictive_missed)
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

@@ -686,3 +686,70 @@ def test_menu_toggle_min_avail_adapt_writes_current_config(monkeypatch):
     assert merged == [{"min_avail_adapt": False}], "只提交本次勾选，不带旧快照"
     assert guard.cfg["min_avail_adapt"] is False
 
+
+def test_menu_toggle_min_mb_adapt_writes_current_config(monkeypatch):
+    """「定向大户下限自适应」勾选只提交增量 min_mb_adapt，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"min_mb_adapt": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "定向大户下限自适应(榜上够不着下限时减半)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"min_mb_adapt": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["min_mb_adapt"] is False
+
+
+def test_menu_toggle_deepen_rounds_adapt_writes_current_config(monkeypatch):
+    """「加深轮数自适应」勾选只提交增量 deepen_rounds_adapt，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"deepen_rounds_adapt": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "加深轮数自适应(加深卡住时+1轮)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"deepen_rounds_adapt": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["deepen_rounds_adapt"] is False
+
+
+def test_menu_toggle_predict_window_adapt_writes_current_config(monkeypatch):
+    """「预防窗口自适应」勾选只提交增量 predict_window_adapt，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"predict_window_adapt": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "预防窗口自适应(没防住时加宽窗口)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"predict_window_adapt": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["predict_window_adapt"] is False
+
+
+def test_menu_toggle_threshold_adapt_writes_current_config(monkeypatch):
+    """「触发线自适应」勾选只提交增量 threshold_adapt，并即时回填。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                         lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"threshold_adapt": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "触发线自适应(短效反复且温和手段用尽时提前)")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"threshold_adapt": False}], "只提交本次勾选，不带旧快照"
+    assert guard.cfg["threshold_adapt"] is False

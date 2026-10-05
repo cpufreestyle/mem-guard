@@ -7,6 +7,7 @@ import pytest
 from memguard import config
 from memguard.config import (
     DEFAULT_CONFIG,
+    TARGET_CLEAN_TOP_MAX,
     _blacklist_stems,
     _clamp_int,
     _norm_proc_name,
@@ -431,14 +432,14 @@ def test_normalize_config_stats_sticky_roundtrip():
     assert plain["stats"] == {"count": 3, "freed": 100}
 
 def test_default_config_v15_keys_present():
-    """v1.15.0 三键（加深收益衰减 + 覆盖面自适应及其一次性闩）必须有默认值。"""
+    """v1.15.0 三键（加深收益衰减 + 覆盖面自适应开关）必须有默认值。"""
     assert "stage_deepen_diminish_pct" in DEFAULT_CONFIG
     assert "target_top_adapt" in DEFAULT_CONFIG
     assert "target_top_adapt_done" in DEFAULT_CONFIG
     d = normalize_config({})
     assert d["stage_deepen_diminish_pct"] == 50
     assert d["target_top_adapt"] is True
-    assert d["target_top_adapt_done"] is False
+    assert d["target_top_adapt_done"] == 0, "爬山计数：0=从未加宽"
 
 
 def test_normalize_config_stage_deepen_diminish_pct_clamped():
@@ -456,12 +457,50 @@ def test_normalize_config_stage_deepen_diminish_pct_clamped():
 
 
 def test_normalize_config_target_top_adapt_coercion():
-    """覆盖面自适应开关与其一次性闩 bool 强转，语义与其它开关一致。"""
+    """覆盖面自适应开关 bool 强转；done 是爬山计数 int，clamp 到 [0, TARGET_CLEAN_TOP_MAX]。"""
     assert normalize_config({"target_top_adapt": 0})["target_top_adapt"] is False
     assert normalize_config({"target_top_adapt": "off"})["target_top_adapt"] is True
-    assert normalize_config({"target_top_adapt_done": 1})["target_top_adapt_done"] is True
+    assert normalize_config({"target_top_adapt_done": 1})["target_top_adapt_done"] == 1
     assert normalize_config(
-        {"target_top_adapt_done": None})["target_top_adapt_done"] is False
+        {"target_top_adapt_done": None})["target_top_adapt_done"] == 0
+    assert normalize_config(
+        {"target_top_adapt_done": 999})["target_top_adapt_done"] == TARGET_CLEAN_TOP_MAX
+    assert normalize_config(
+        {"target_top_adapt_done": -3})["target_top_adapt_done"] == 0
+    assert normalize_config(
+        {"target_top_adapt_done": "x"})["target_top_adapt_done"] == 0
+    # 老配置里的 bool 闩天然兼容：真当过、假从没加过
+    assert normalize_config(
+        {"target_top_adapt_done": True})["target_top_adapt_done"] == 1
+    assert normalize_config(
+        {"target_top_adapt_done": False})["target_top_adapt_done"] == 0
+
+
+def test_default_config_v21_keys_present():
+    """v1.21.0 两键（预防窗口自适应开关与其爬山计数）必须有默认值。"""
+    assert "predict_window_adapt" in DEFAULT_CONFIG
+    assert "predict_window_adapt_done" in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["predict_window_adapt"] is True
+    assert d["predict_window_adapt_done"] == 0, "爬山计数：0=从未加宽"
+
+
+def test_normalize_config_predict_window_adapt_coercion():
+    """预防窗口自适应开关 bool 强转；done 是已爬到的窗口分钟数，clamp 到 [0, 30]。"""
+    assert normalize_config(
+        {"predict_window_adapt": 0})["predict_window_adapt"] is False
+    assert normalize_config(
+        {"predict_window_adapt": "off"})["predict_window_adapt"] is True
+    assert normalize_config(
+        {"predict_window_adapt_done": 10})["predict_window_adapt_done"] == 10
+    assert normalize_config(
+        {"predict_window_adapt_done": None})["predict_window_adapt_done"] == 0
+    assert normalize_config(
+        {"predict_window_adapt_done": 999})["predict_window_adapt_done"] == 30
+    assert normalize_config(
+        {"predict_window_adapt_done": -5})["predict_window_adapt_done"] == 0
+    assert normalize_config(
+        {"predict_window_adapt_done": "x"})["predict_window_adapt_done"] == 0
 
 
 def test_default_config_v16_keys_present():
@@ -510,3 +549,70 @@ def test_normalize_config_stats_low_mem_roundtrip():
     plain = normalize_config({"stats": {"count": 3, "freed": 100}})
     assert plain["stats"] == {"count": 3, "freed": 100}
 
+
+def test_default_config_v19_keys_present():
+    """v1.19.0 大户下限自调优键进默认配置：开关默认开、一次性闩默认未落。"""
+    assert "min_mb_adapt" in DEFAULT_CONFIG
+    assert "min_mb_adapt_done" in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["min_mb_adapt"] is True
+    assert d["min_mb_adapt_done"] is False
+
+
+def test_normalize_config_min_mb_adapt_coercion():
+    """大户下限自适应开关与其一次性闩 bool 强转，语义与其它开关一致。"""
+    assert normalize_config({"min_mb_adapt": 0})["min_mb_adapt"] is False
+    assert normalize_config({"min_mb_adapt": "off"})["min_mb_adapt"] is True
+    assert normalize_config(
+        {"min_mb_adapt_done": 1})["min_mb_adapt_done"] is True
+    assert normalize_config(
+        {"min_mb_adapt_done": None})["min_mb_adapt_done"] is False
+
+def test_default_config_v20_keys_present():
+    """v1.20.0 加深轮数自调优键进默认配置：开关默认开、已爬到轮数默认 0（从未）。"""
+    assert "deepen_rounds_adapt" in DEFAULT_CONFIG
+    assert "deepen_rounds_adapt_done" in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["deepen_rounds_adapt"] is True
+    assert d["deepen_rounds_adapt_done"] == 0
+
+
+def test_normalize_config_deepen_rounds_adapt_coercion():
+    """加深轮数自适应开关 bool 强转、已爬轮数钳 0..3，语义与其它自调优键一致。"""
+    assert normalize_config(
+        {"deepen_rounds_adapt": 0})["deepen_rounds_adapt"] is False
+    assert normalize_config(
+        {"deepen_rounds_adapt": "off"})["deepen_rounds_adapt"] is True
+    assert normalize_config(
+        {"deepen_rounds_adapt_done": 9})["deepen_rounds_adapt_done"] == 3
+    assert normalize_config(
+        {"deepen_rounds_adapt_done": -1})["deepen_rounds_adapt_done"] == 0
+    assert isinstance(normalize_config(
+        {"deepen_rounds_adapt_done": "2"})["deepen_rounds_adapt_done"], int)
+
+
+def test_default_config_v22_keys_present():
+    """v1.22.0 两键（触发阈值自适应开关与其下调计数）必须有默认值。"""
+    assert "threshold_adapt" in DEFAULT_CONFIG
+    assert "threshold_adapt_done" in DEFAULT_CONFIG
+    d = normalize_config({})
+    assert d["threshold_adapt"] is True
+    assert d["threshold_adapt_done"] == 0, "下调计数：0=从未降过"
+
+
+def test_normalize_config_threshold_adapt_coercion():
+    """触发阈值自适应开关 bool 强转；done 是已下调次数，clamp 到 [0, 2]。"""
+    assert normalize_config(
+        {"threshold_adapt": 0})["threshold_adapt"] is False
+    assert normalize_config(
+        {"threshold_adapt": "off"})["threshold_adapt"] is True
+    assert normalize_config(
+        {"threshold_adapt_done": 9})["threshold_adapt_done"] == 2
+    assert normalize_config(
+        {"threshold_adapt_done": -1})["threshold_adapt_done"] == 0
+    assert isinstance(normalize_config(
+        {"threshold_adapt_done": "2"})["threshold_adapt_done"], int)
+    assert normalize_config(
+        {"threshold_adapt_done": "x"})["threshold_adapt_done"] == 0
+    assert normalize_config(
+        {"threshold_adapt_done": None})["threshold_adapt_done"] == 0

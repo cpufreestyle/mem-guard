@@ -9,8 +9,12 @@
 """
 from __future__ import annotations
 
-from .clean import (_FOCUS_RATIO, _HEADROOM_MAX, _HEADROOM_STEP,
-                    _MINAVAIL_MAX, _MINAVAIL_STEP,
+from .clean import (_DEEPEN_MAX_ROUNDS, _FOCUS_RATIO, _HEADROOM_MAX,
+                    _HEADROOM_STEP, _MINAVAIL_MAX, _MINAVAIL_STEP,
+                    _MINMB_DIV, _MINMB_FLOOR_MB, _PREDICT_WINDOW_MAX,
+                    _PREDICT_WINDOW_STEP, _THRESHOLD_COMMIT_FLOOR,
+                    _THRESHOLD_MAX_DROPS, _THRESHOLD_PHYS_FLOOR,
+                    _THRESHOLD_STEP, focused_top_rss,
                     top_focus_ratio, top_processes_list)
 from .config import TARGET_CLEAN_TOP_MAX, _norm_proc_name, gb
 from .winapi import get_mem, is_admin
@@ -28,6 +32,17 @@ LEVEL_INFO = "info"
 _LEVEL_ORDER = {LEVEL_WARN: 0, LEVEL_TIP: 1, LEVEL_INFO: 2}
 # 激进档被判定为「杀鸡用牛刀」的余量：物理/提交占用距阈值都这么多个百分点以上才算宽裕
 _AGGRESSIVE_SLACK = 20
+# 定向大户下限自调优（v1.19.0）至少要见过的清理次数：一次都没定向清到东西，才谈得上「这条下限谁也够不着」
+_MINMB_MIN_CLEANS = 3
+# 定向加深轮数自调优（v1.20.0）至少要见过的「加深被轮数卡住」次数：偶尔一次可能只是
+# 当时偶发压力，反复卡住才说明 1 轮上限压不住这台机器的温和阶梯
+_ROUNDSAT_MIN_CAPPED = 3
+# 预防窗口自调优（v1.21.0）至少要见过的「预防式清理没防住」次数：偶尔一次可能只是
+# 当时曲线特殊，反复没防住才说明 predict_window_min 预判得偏窄
+_PREDICT_MISS_MIN = 3
+# 触发阈值自调优（v1.22.0）至少要见过的短效次数：一次偏短可能只是当时偶发压力，
+# 反复偏短才说明两条触发线本身画得偏高；配合 escalated+sticky 证据确认温和阶梯用尽
+_THRESHOLD_MIN_SHORT = 2
 
 
 def frequent_escalation(cfg: dict) -> bool:
@@ -201,7 +216,156 @@ def narrow_top_coverage(cfg: dict, history=None) -> bool:
     # 大户数已到上限（或脏值）：没得可加，再建议也是空转，与托盘同门的判断
     if not (0 < top < TARGET_CLEAN_TOP_MAX):
         return False
-    return top_focus_ratio(history, top) >= _FOCUS_RATIO
+    if top_focus_ratio(history, top) < _FOCUS_RATIO:
+        return False
+    # 榜上有人却够不着下限时先降下限：加大户数只会把网撒得更宽，更够不着（v1.19.0）
+    return not unreachable_top_threshold(cfg, history)
+
+
+def unreachable_top_threshold(cfg: dict, history=None) -> bool:
+    """大户榜上有人却够不着 target_clean_min_mb：把大户下限降一档（v1.19.0）。
+
+    target_clean_min_mb 定得偏高时，长期在榜进程的 rss 怎么也过不了这条线——每轮
+    定向清理都挑不中它们，只剩后台撒宽在兜底，短效与升档便接踵而至。判据与 tray 的
+    自动大户下限适配（_maybe_adapt_min_mb）同源：大户榜确实长期钉在同几个进程
+    （top_focus_ratio 达到 _FOCUS_RATIO），且这些名字的 rss 中位数仍低于现行大户
+    下限；同时累计清理已有 _MINMB_MIN_CLEANS 次却一次都没定向清到东西
+    （targeted == 0），后台撒宽或升档兜过底（bg_trimmed / escalated 有计数）——
+    门槛一直够不着，不是「没有大户可清」。关定向清理、已是激进档、min_mb_adapt
+    关闭或闩已落、大户数不在 1..上限之间、下限已在兜底值或为脏值、没有采样可看，
+    一律 False——没有证据就不下结论，让用户自己决定。
+    """
+    if not cfg.get("target_clean", True):
+        return False
+    if str(cfg.get("clean_level", "conservative")).strip().lower() == "aggressive":
+        return False
+    if not cfg.get("min_mb_adapt", True) or cfg.get("min_mb_adapt_done"):
+        return False
+    try:
+        top = int(cfg.get("target_clean_top") or 0)
+    except (TypeError, ValueError):
+        return False
+    # 大户数不在 1..上限之间（含脏值）：谈不上一轮能覆盖到谁
+    if not (0 < top <= TARGET_CLEAN_TOP_MAX):
+        return False
+    try:
+        min_mb = int(cfg.get("target_clean_min_mb") or 0)
+    except (TypeError, ValueError):
+        return False
+    if min_mb <= _MINMB_FLOOR_MB:
+        return False
+    if top_focus_ratio(history, top) < _FOCUS_RATIO:
+        return False
+    med = focused_top_rss(history, top)
+    if med is None or med >= min_mb * 1024 ** 2:
+        return False
+    st = cfg.get("stats") or {}
+    clean_cnt = int(st.get("count", 0) or 0)
+    targeted = int(st.get("targeted", 0) or 0)
+    bg_trimmed = int(st.get("bg_trimmed", 0) or 0)
+    escalated = int(st.get("escalated", 0) or 0)
+    if clean_cnt < _MINMB_MIN_CLEANS or targeted > 0:
+        return False
+    return bg_trimmed > 0 or escalated > 0
+
+
+def deepen_round_saturated(cfg: dict) -> bool:
+    """加深把轮数上限跑满仍在释放、压力仍没按住：把 stage_deepen_rounds +1（v1.20.0）。
+
+    stage_deepen_rounds 是加深轮数的天花板（默认 1，clamp 1.._DEEPEN_MAX_ROUNDS）。
+    加深反复把上限跑满、最后一轮仍清出了东西、加深级收尾时压力仍未按住
+    （stats.deepen_capped 累计）——温和阶梯是被轮数卡住的，不是候选枯竭或收益
+    衰减，多给一轮加深比升档全清打扰小。判据与 tray 的自动加深轮数适配
+    （_maybe_adapt_deepen_rounds）同源：关定向清理/加深、已是激进档、
+    deepen_rounds_adapt 关闭、轮数已到 _DEEPEN_MAX_ROUNDS（没有更高可爬）、
+    已自动爬到过 _DEEPEN_MAX_ROUNDS，或 stats 为脏值，一律 False——没有证据
+    就不下结论，让用户自己决定。
+    """
+    if not cfg.get("target_clean", True) or not cfg.get("stage_deepen", True):
+        return False
+    if str(cfg.get("clean_level", "conservative")).strip().lower() == "aggressive":
+        return False
+    if not cfg.get("deepen_rounds_adapt", True):
+        return False
+    try:
+        cur = int(cfg.get("stage_deepen_rounds") or 1)
+        done = int(cfg.get("deepen_rounds_adapt_done") or 0)
+        capped = int((cfg.get("stats") or {}).get("deepen_capped", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if not (1 <= cur < _DEEPEN_MAX_ROUNDS):
+        return False
+    if done >= _DEEPEN_MAX_ROUNDS:
+        return False
+    return capped >= _ROUNDSAT_MIN_CAPPED
+
+
+def predict_window_saturated(cfg: dict) -> bool:
+    """预防式清理没防住压力：把 predict_window_min 加宽一档（v1.21.0）。
+
+    predict_window_min 是趋势预防式清理的预判窗口：斜率预计这么久后触阈才
+    提前清理。预防式清理之后压力仍很快复发（距上次清理比当时预测的 eta 还短，
+    见 tray._note_relief 的 eta 判定，stats.preventive_missed 累计）——这条
+    上升曲线比窗口预判的更陡，提前得还不够早。判据与 tray 的自动预防窗口适配
+    （_maybe_adapt_predict_window）同源：关趋势预防式清理、predict_window_adapt
+    关闭、已是激进档、窗口已到 _PREDICT_WINDOW_MAX（没有更宽可加）、已自动加宽
+    到过 _PREDICT_WINDOW_MAX，或 stats 为脏值，一律 False——没有证据就不下
+    结论，让用户自己决定。
+    """
+    if not cfg.get("predict_clean", True):
+        return False
+    if not cfg.get("predict_window_adapt", True):
+        return False
+    if str(cfg.get("clean_level", "conservative")).strip().lower() == "aggressive":
+        return False
+    try:
+        cur = int(cfg.get("predict_window_min") or 0)
+        done = int(cfg.get("predict_window_adapt_done") or 0)
+        missed = int((cfg.get("stats") or {}).get("preventive_missed", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if not (0 < cur < _PREDICT_WINDOW_MAX):
+        return False
+    if done >= _PREDICT_WINDOW_MAX:
+        return False
+    return missed >= _PREDICT_MISS_MIN
+
+
+def threshold_too_late(cfg: dict) -> bool:
+    """两条触发线是否「画得偏高」：温和阶梯全部用尽，清理仍连续偏短（v1.22.0）。
+
+    phys/commit_threshold 是两条总触发线，线内已有一整套温和阶梯（提前量 / 加深 /
+    覆盖面 / 大户下限 / 低内存下限 / 预测窗口）。当短效 >= _THRESHOLD_MIN_SHORT
+    次、且累计统计里 escalated + sticky >= 1（温和阶梯确曾跑到底也没按住），该动
+    的不是清理力度——激进在这台机器上也被证明不够——而是触发线本身：每回都顶到线
+    才被叫起来，把两条线各降 _THRESHOLD_STEP 个百分点，清理发生在压力顶上来之前。
+    判据与 tray 的自动触发阈值适配（_maybe_adapt_threshold）同源，两处必须说一样
+    的话。同一份短效证据只出一条补偿：该改用激进（frequent_short_relief）、该提前
+    阈值（recurrent_short_relief）、该抬高绝对下限（recurrent_lowmem_shortfall）
+    任一条仍适用时这里让位。threshold_adapt 关闭、已下调次数到顶
+    （_THRESHOLD_MAX_DROPS）、任一条线降一步会跌破各自兜底下限，或统计为脏值一律
+    False——没有空间就不下结论，让用户自己决定。
+    """
+    st = cfg.get("stats") or {}
+    try:
+        srt_cnt = int(st.get("short_relief", 0) or 0)
+        used_cnt = int(st.get("escalated", 0) or 0) + int(st.get("sticky", 0) or 0)
+        done = int(cfg.get("threshold_adapt_done") or 0)
+        phys = int(cfg.get("phys_threshold", 85))
+        commit = int(cfg.get("commit_threshold", 90))
+    except (TypeError, ValueError):
+        return False
+    if srt_cnt < _THRESHOLD_MIN_SHORT or used_cnt < 1:
+        return False
+    if (frequent_short_relief(cfg) or recurrent_short_relief(cfg)
+            or recurrent_lowmem_shortfall(cfg)):
+        return False
+    if not cfg.get("threshold_adapt", True):
+        return False
+    if done >= _THRESHOLD_MAX_DROPS:
+        return False
+    return (phys - _THRESHOLD_STEP >= _THRESHOLD_PHYS_FLOOR
+            and commit - _THRESHOLD_STEP >= _THRESHOLD_COMMIT_FLOOR)
 
 
 def advice_actions(items: list) -> list:
@@ -440,6 +604,95 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
             "action": {"label": f"下限 {cur}→{new_mb}MB",
                        "changes": {"min_avail_mb": new_mb,
                                    "min_avail_adapt_done": True}},
+        })
+
+    # ---- 3g. 定向大户下限自调优（v1.19.0）：榜上有人却够不着下限，把下限降一档 ----
+    if unreachable_top_threshold(cfg, history):
+        top_now = int(cfg.get("target_clean_top") or 0)
+        cur = int(cfg.get("target_clean_min_mb") or 0)
+        new_mb = max(cur // _MINMB_DIV, _MINMB_FLOOR_MB)
+        med_mb = (focused_top_rss(history, top_now) or 0) / 1024 ** 2
+        st3g = cfg.get("stats") or {}
+        bg_cnt = int(st3g.get("bg_trimmed", 0) or 0)
+        esc_cnt = int(st3g.get("escalated", 0) or 0)
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "定向大户下限偏高，榜上进程够不着",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {bg_cnt} 次是后台进程撒宽兜的底、"
+                     f"{esc_cnt} 次清理后压力没按住又补了激进，却一次都没定向清到东西——"
+                     f"长期排在定向大户榜上的进程，工作集中位数只有 {med_mb:.0f} MB，"
+                     f"够不着现行大户下限 {cur} MB，每轮都从网里漏过去。把大户下限 "
+                     f"{cur} → {new_mb} MB，清理重新够得着榜上这些进程，不必为此把"
+                     f"清理力度改成激进（建议窗口可一键应用）。"),
+            "action": {"label": f"下限 {cur}→{new_mb}MB",
+                       "changes": {"target_clean_min_mb": new_mb,
+                                   "min_mb_adapt_done": True}},
+        })
+
+    # ---- 3h. 定向加深轮数自调优（v1.20.0）：加深被轮数上限卡住，轮数 +1 ----
+    if deepen_round_saturated(cfg):
+        cur = int(cfg.get("stage_deepen_rounds") or 1)
+        new = min(cur + 1, _DEEPEN_MAX_ROUNDS)
+        st3h = cfg.get("stats") or {}
+        cap_cnt = int(st3h.get("deepen_capped", 0) or 0)
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "定向加深被轮数上限卡住",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {cap_cnt} 次加深把轮数上限跑满、"
+                     f"最后一轮仍在释放、加深级收尾时压力仍没按住——温和阶梯是被轮数"
+                     f"卡住的，不是候选枯竭或收益衰减。把加深轮数上限 {cur} → {new}，"
+                     f"多给撒宽补刀一轮的机会，不必为此把清理力度改成激进"
+                     f"（建议窗口可一键应用）。"),
+            "action": {"label": f"加深轮数 {cur}→{new}",
+                       "changes": {"stage_deepen_rounds": new,
+                                   "deepen_rounds_adapt_done": new}},
+        })
+
+    # ---- 3i. 预防窗口自调优（v1.21.0）：预防式清理没防住，预测窗口加宽一档 ----
+    if predict_window_saturated(cfg):
+        cur = int(cfg.get("predict_window_min") or 0)
+        new = min(cur + _PREDICT_WINDOW_STEP, _PREDICT_WINDOW_MAX)
+        st3i = cfg.get("stats") or {}
+        miss_cnt = int(st3i.get("preventive_missed", 0) or 0)
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "预防式清理没防住，预测窗口偏窄",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {miss_cnt} 次预防式清理之后"
+                     f"压力仍很快复发（距上次清理比当时预测的触阈时间还短）——"
+                     f"这条上升曲线比 predict_window_min 预判的更陡，提前得还"
+                     f"不够早。把预测窗口 {cur} → {new} 分钟，预防式清理在更早的"
+                     f"斜率上就提前动手，不必为此把清理力度改成激进"
+                     f"（建议窗口可一键应用）。"),
+            "action": {"label": f"预测窗口 {cur}→{new}分钟",
+                       "changes": {"predict_window_min": new,
+                                   "predict_window_adapt_done": new}},
+        })
+
+    # ---- 3j. 触发阈值自适应（v1.22.0）：温和手段用尽仍偏短，把两条触发线各降一档 ----
+    if threshold_too_late(cfg):
+        phys = int(cfg.get("phys_threshold") or 0)
+        commit = int(cfg.get("commit_threshold") or 0)
+        new_phys = phys - _THRESHOLD_STEP
+        new_commit = commit - _THRESHOLD_STEP
+        st3j = cfg.get("stats") or {}
+        esc_cnt = int(st3j.get("escalated", 0) or 0)
+        stk_cnt = int(st3j.get("sticky", 0) or 0)
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "温和手段用尽仍效果偏短，触发线画得偏高",
+            "text": (f"已累计清理 {clean_cnt} 次，其中 {srt_cnt} 次距上次自动清理不足 "
+                     f"效果下限（效果偏短），且清理过程中 {esc_cnt} 次自动升过档、"
+                     f"{stk_cnt} 次按粘滞激进执行过——温和阶梯已经用尽，压力仍很快"
+                     f"复发。该动的不是清理力度，而是触发线本身：把物理/提交判定阈值 "
+                     f"{phys} → {new_phys}% / {commit} → {new_commit}%，清理发生在"
+                     f"压力顶上来之前，不必为此把清理力度改成激进"
+                     f"（建议窗口可一键应用）。"),
+            "action": {"label":
+                       f"触发线 {phys}→{new_phys}%/{commit}→{new_commit}%",
+                       "changes": {"phys_threshold": new_phys,
+                                   "commit_threshold": new_commit,
+                                   "threshold_adapt_done":
+                                   int(cfg.get("threshold_adapt_done") or 0) + 1}},
         })
 
     # ---- 4. 进程 / 白名单 ----
