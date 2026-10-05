@@ -10,7 +10,7 @@ import threading
 
 import pystray
 
-from memguard import config, menu
+from memguard import adapters, config, menu
 from memguard.config import normalize_config
 from memguard.menu import build_menu
 from memguard.tray import Guard
@@ -753,3 +753,109 @@ def test_menu_toggle_threshold_adapt_writes_current_config(monkeypatch):
 
     assert merged == [{"threshold_adapt": False}], "只提交本次勾选，不带旧快照"
     assert guard.cfg["threshold_adapt"] is False
+
+
+
+# ------------------------------------- 自适应注册表菜单项 + 复位闩（v1.23.0）
+
+def test_all_adapter_toggles_present_and_labelled_from_registry():
+    """8 条自适应开关必须都在菜单里，文案与注册表逐字一致。"""
+    labels = {i.text for i in build_menu(_FakeGuard()).items}
+    for a in adapters.ADAPTERS:
+        assert a.label in labels, a.label
+
+
+def test_reset_adapters_item_says_when_there_is_nothing_to_do():
+    item = _find_item_by_text(build_menu(_FakeGuard()), "复位自适应闩")
+    assert "全部复位" in item.text, "一条都没触发过时要让用户知道没事可做"
+
+
+def test_reset_adapters_submits_latch_patch_only(monkeypatch):
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+    guard = _FakeGuard({"level_adapt_done": True, "threshold_adapt_done": 2})
+    _find_item_by_text(build_menu(guard), "复位自适应闩")(guard.icon)
+    assert merged and set(merged[0]) == set(adapters.ADAPTER_LATCHES)
+    assert merged[0]["level_adapt_done"] is False
+    assert merged[0]["threshold_adapt_done"] == 0
+    assert guard.cfg["threshold_adapt_done"] == 0, "合并结果要立刻回填"
+
+
+def test_reset_adapters_keeps_user_tuned_values(monkeypatch, tmp_path):
+    """复位只抹闩：用户手改的阈值 / 大户数必须原样活着。"""
+    cfg_file = tmp_path / "mem_guard.json"
+    cfg_file.write_text(json.dumps({"phys_threshold": 92, "target_clean_top": 7,
+                                    "threshold_adapt_done": 2}), encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+    guard = _FakeGuard()
+    guard.cfg = config.load_config()
+    _find_item_by_text(build_menu(guard), "复位自适应闩")(guard.icon)
+    on_disk = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert on_disk["phys_threshold"] == 92
+    assert on_disk["target_clean_top"] == 7
+    assert on_disk["threshold_adapt_done"] == 0
+
+
+def test_reset_adapters_works_on_a_real_guard(monkeypatch, tmp_path):
+    """复位在真实 Guard 上也要成立，不能只在 _FakeGuard 上灵。
+
+    update_config 是以磁盘配置为基准合并的，所以这条必须真的写盘再载入；只改
+    内存字典的话，测到的就不是用户机器上会发生的事。前面几条用 _FakeGuard，
+    若两者行为分歧，以前没有任何测试会发现。
+    """
+    cfg_file = tmp_path / "mem_guard.json"
+    cfg_file.write_text(json.dumps({
+        "phys_threshold": 92, "cooldown": 900, "target_clean_top": 7,
+        "clean_level": "aggressive", "min_mb_adapt": False,
+        "level_adapt_done": True, "threshold_adapt_done": 2,
+    }), encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(cfg_file))
+
+    guard = Guard()
+    guard.cfg = config.load_config()
+    _find_item_by_text(build_menu(guard), "复位自适应闩")(guard.icon)
+
+    after = guard.cfg
+    assert after["level_adapt_done"] is False and after["threshold_adapt_done"] == 0
+    # 手改的值与开关一个都不许动
+    assert after["phys_threshold"] == 92 and after["cooldown"] == 900
+    assert after["target_clean_top"] == 7 and after["clean_level"] == "aggressive"
+    assert after["min_mb_adapt"] is False
+    on_disk = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert on_disk["level_adapt_done"] is False, "复位要落盘，不然重启后又触发"
+
+    # 连点两次必须幂等：第二次本来就是无事可做，不许再写一次盘
+    sentinel = cfg_file.read_bytes()
+    mtime_ns = cfg_file.stat().st_mtime_ns
+    _find_item_by_text(build_menu(guard), "复位自适应闩")(guard.icon)
+    assert cfg_file.read_bytes() == sentinel, "第二次复位不该再写盘"
+    assert cfg_file.stat().st_mtime_ns == mtime_ns, "连点也不该刷新 mtime"
+    assert "全部复位" in _find_item_by_text(
+        build_menu(guard), "复位自适应闩").text, "复位完菜单要显示无事可做"
+
+
+def test_reset_adapters_is_a_noop_when_nothing_fired(monkeypatch):
+    calls = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: calls.append(dict(changes)) or dict(changes))
+    _find_item_by_text(build_menu(_FakeGuard()), "复位自适应闩")(None)
+    assert calls == [], "什么都没触发过就不该写盘"
+
+
+def test_verify_sha256_toggle_writes_current_config(monkeypatch):
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+    guard = _FakeGuard({"verify_update_sha256": True})
+    item = _find_item(build_menu(guard), "更新包 sha256 校验")
+    assert item.checked is True
+    item(guard.icon)
+    assert merged == [{"verify_update_sha256": False}]
+    assert guard.cfg["verify_update_sha256"] is False
+
+    guard.cfg = normalize_config({"verify_update_sha256": False})
+    item = _find_item(build_menu(guard), "更新包 sha256 校验")
+    assert item.checked is False
+    item(guard.icon)
+    assert merged[-1] == {"verify_update_sha256": True}

@@ -2,7 +2,7 @@
 """
 配置与日志：版本、路径、默认配置、配置校验、落盘日志。
 
-只依赖标准库，被其它模块（winapi/clean/tray/cli）广泛引用，故保持零项目内依赖。
+只依赖标准库与 memguard.adapters（自适应适配器注册表），被其它模块广泛引用。
 """
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ import sys
 import threading
 from datetime import datetime
 
-__version__ = "1.22.0"
+from .adapters import ADAPTERS, COUNTER, clamp_bounds
+
+__version__ = "1.23.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -108,6 +110,7 @@ DEFAULT_CONFIG = {
     "auto_install": False,      # 发现新版自动下载并静默安装（完成后自动重启）
     "last_update_check": 0,     # 上次检查时间戳(epoch 秒)，程序维护
     "update_notified_tag": "",  # 已气泡提醒过的版本 tag，去重
+    "verify_update_sha256": True,  # 下载更新包后先比对 Release 的 sha256 清单；默认开，关掉就不再校验
     # ---- 累计统计（由 do_clean 维护并持久化）----
     "stats": {"count": 0, "freed": 0},
 }
@@ -161,99 +164,84 @@ def _clamp_int(value, low: int, high: int, default: int) -> int:
     return max(low, min(high, n))
 
 
+# ---- 声明式钳制表：normalize_config 只 iterate 这两张表和 adapters 注册表 ----
+# 新增一个「越界回落」的整数旋钮时只加一行，不用再在 normalize_config 里铺一段。
+_FIELD_SPECS = (
+    # (键, 下限, 上限)；默认值一律从 DEFAULT_CONFIG 取，写错区间也有默认值兜底
+    ("phys_threshold", 50, 99),
+    ("commit_threshold", 50, 99),
+    ("interval", 2, 3600),
+    ("cooldown", 0, 86400),
+    ("debounce_sec", 0, 3600),
+    ("warn_margin", 0, 50),
+    ("advice_refresh_sec", 15, 600),
+    ("target_clean_min_mb", 128, 32768),
+    ("target_clean_top", 1, TARGET_CLEAN_TOP_MAX),
+    ("predict_window_min", 1, 60),
+    ("effect_min_relief_sec", 60, 86400),
+    ("adaptive_cooldown_floor", 5, 3600),
+    ("stage_learn_strikes", 2, 10),
+    ("stage_deepen_rounds", 1, 3),
+    ("target_headroom_pct", 0, 20),
+    ("stage_deepen_diminish_pct", 0, 100),
+    ("min_avail_mb", 0, 10 ** 7),
+    ("scheduled_minutes", 0, 24 * 60),
+    ("update_check_hours", 1, 168),
+)
+
+
+# 纯布尔开关：没有区间可言，脏值（None / 字符串 / 1）一律按 bool 语义归一。
+# 自适应的开关键不在这里——它们跟着 ADAPTERS 一起走，见 normalize_config。
+_BOOL_KEYS = (
+    "auto_clean",
+    "escalate_clean",
+    "target_clean",
+    "bg_trim",
+    "predict_clean",
+    "effect_track",
+    "adaptive_cooldown",
+    "sticky_aggressive",
+    "stage_learn",
+    "stage_deepen",
+    "clean_on_start",
+    "auto_update",
+    "auto_install",
+    "verify_update_sha256",
+)
+
+
 def normalize_config(raw) -> dict:
     """校验并钳制配置：越界/脏值不会让程序跑飞，未知键原样保留。"""
     cfg = dict(DEFAULT_CONFIG)
     if isinstance(raw, dict):
         cfg.update(raw)
-    cfg["phys_threshold"] = _clamp_int(cfg.get("phys_threshold"), 50, 99, DEFAULT_CONFIG["phys_threshold"])
-    cfg["commit_threshold"] = _clamp_int(cfg.get("commit_threshold"), 50, 99, DEFAULT_CONFIG["commit_threshold"])
-    cfg["interval"] = _clamp_int(cfg.get("interval"), 2, 3600, DEFAULT_CONFIG["interval"])
-    cfg["cooldown"] = _clamp_int(cfg.get("cooldown"), 0, 86400, DEFAULT_CONFIG["cooldown"])
-    cfg["debounce_sec"] = _clamp_int(cfg.get("debounce_sec"), 0, 3600, DEFAULT_CONFIG["debounce_sec"])
-    cfg["warn_margin"] = _clamp_int(cfg.get("warn_margin"), 0, 50, DEFAULT_CONFIG["warn_margin"])
-    cfg["advice_refresh_sec"] = _clamp_int(
-        cfg.get("advice_refresh_sec"), 15, 600, DEFAULT_CONFIG["advice_refresh_sec"])
-    cfg["auto_clean"] = bool(cfg.get("auto_clean", True))
-    cfg["escalate_clean"] = bool(cfg.get("escalate_clean", True))
-    cfg["target_clean"] = bool(cfg.get("target_clean", True))
-    cfg["target_clean_min_mb"] = _clamp_int(
-        cfg.get("target_clean_min_mb"), 128, 32768, DEFAULT_CONFIG["target_clean_min_mb"])
-    cfg["target_clean_top"] = _clamp_int(
-        cfg.get("target_clean_top"), 1, TARGET_CLEAN_TOP_MAX, DEFAULT_CONFIG["target_clean_top"])
-    cfg["bg_trim"] = bool(cfg.get("bg_trim", True))
-    cfg["predict_clean"] = bool(cfg.get("predict_clean", True))
-    cfg["predict_window_min"] = _clamp_int(
-        cfg.get("predict_window_min"), 1, 60, DEFAULT_CONFIG["predict_window_min"])
-    cfg["auto_level_adapt"] = bool(cfg.get("auto_level_adapt", True))
-    cfg["level_adapt_done"] = bool(cfg.get("level_adapt_done", False))
-    cfg["effect_track"] = bool(cfg.get("effect_track", True))
-    cfg["effect_min_relief_sec"] = _clamp_int(
-        cfg.get("effect_min_relief_sec"), 60, 86400, DEFAULT_CONFIG["effect_min_relief_sec"])
-    cfg["adaptive_cooldown"] = bool(cfg.get("adaptive_cooldown", True))
-    cfg["adaptive_cooldown_floor"] = _clamp_int(
-        cfg.get("adaptive_cooldown_floor"), 5, 3600,
-        DEFAULT_CONFIG["adaptive_cooldown_floor"])
-    cfg["sticky_aggressive"] = bool(cfg.get("sticky_aggressive", True))
-    cfg["stage_learn"] = bool(cfg.get("stage_learn", True))
-    cfg["stage_learn_strikes"] = _clamp_int(
-        cfg.get("stage_learn_strikes"), 2, 10, DEFAULT_CONFIG["stage_learn_strikes"])
-    cfg["stage_deepen"] = bool(cfg.get("stage_deepen", True))
-    cfg["stage_deepen_rounds"] = _clamp_int(
-        cfg.get("stage_deepen_rounds"), 1, 3, DEFAULT_CONFIG["stage_deepen_rounds"])
-    cfg["target_headroom_pct"] = _clamp_int(
-        cfg.get("target_headroom_pct"), 0, 20, DEFAULT_CONFIG["target_headroom_pct"])
-    cfg["stage_deepen_diminish_pct"] = _clamp_int(
-        cfg.get("stage_deepen_diminish_pct"), 0, 100,
-        DEFAULT_CONFIG["stage_deepen_diminish_pct"])
-    cfg["target_top_adapt"] = bool(cfg.get("target_top_adapt", True))
-    # target_top_adapt_done 从 v1.21.0 起是「已加过的次数」（int，爬山计数）；老配置
-    # 里的 bool 经 _clamp_int 天然兼容（True→1、False→0），到 target_clean_top 上限即停
-    cfg["target_top_adapt_done"] = _clamp_int(
-        cfg.get("target_top_adapt_done"), 0, TARGET_CLEAN_TOP_MAX,
-        DEFAULT_CONFIG["target_top_adapt_done"])
-    cfg["headroom_adapt"] = bool(cfg.get("headroom_adapt", True))
-    cfg["headroom_adapt_done"] = bool(cfg.get("headroom_adapt_done", False))
-    cfg["min_avail_adapt"] = bool(cfg.get("min_avail_adapt", True))
-    cfg["min_avail_adapt_done"] = bool(cfg.get("min_avail_adapt_done", False))
-    cfg["min_mb_adapt"] = bool(cfg.get("min_mb_adapt", True))
-    cfg["min_mb_adapt_done"] = bool(cfg.get("min_mb_adapt_done", False))
-    # 加深轮数自调优开关口径同上；done 是 int（已爬到的轮数，0=从未），clamp 到
-    # 0..3（不许超过 clean._DEEPEN_MAX_ROUNDS），脏值归 0
-    cfg["deepen_rounds_adapt"] = bool(cfg.get("deepen_rounds_adapt", True))
-    cfg["deepen_rounds_adapt_done"] = _clamp_int(
-        cfg.get("deepen_rounds_adapt_done"), 0, 3,
-        DEFAULT_CONFIG["deepen_rounds_adapt_done"])
-    # 预防窗口自调优开关口径同上；done 是 int（已爬到的窗口分钟数，0=从未），clamp 到
-    # 0..30（不许超过 clean._PREDICT_WINDOW_MAX，config 不依赖 clean 故写死）
-    cfg["predict_window_adapt"] = bool(cfg.get("predict_window_adapt", True))
-    cfg["predict_window_adapt_done"] = _clamp_int(
-        cfg.get("predict_window_adapt_done"), 0, 30,
-        DEFAULT_CONFIG["predict_window_adapt_done"])
-    # 触发阈值自调优开关口径同上；done 是 int（已下调次数，0=从未），clamp 到
-    # 0..2（不许超过 clean._THRESHOLD_MAX_DROPS，config 不依赖 clean 故写死），脏值归 0
-    cfg["threshold_adapt"] = bool(cfg.get("threshold_adapt", True))
-    cfg["threshold_adapt_done"] = _clamp_int(
-        cfg.get("threshold_adapt_done"), 0, 2,
-        DEFAULT_CONFIG["threshold_adapt_done"])
-    cfg["clean_on_start"] = bool(cfg.get("clean_on_start", False))
+    # ---- 标量字段：钳制区间集中声明，越界 / 脏值一律回落默认值 ----
+    for key, low, high in _FIELD_SPECS:
+        cfg[key] = _clamp_int(cfg.get(key), low, high, DEFAULT_CONFIG[key])
+    # ---- 布尔开关：老配置没有这个键时按默认开算，脏值按 bool 语义归一 ----
+    for key in _BOOL_KEYS:
+        cfg[key] = bool(cfg.get(key, DEFAULT_CONFIG[key]))
+    # ---- 自适应闩：区间与复位口径全部由 adapters.ADAPTERS 推导 ----
+    # 计数型闩（爬山：0=从未，到 cap 即停）钳 0..cap；一次性闩只取布尔值。
+    # 老配置里 target_top_adapt_done 存的是 bool，_clamp_int 天然兼容
+    # （True→1、False→0），不需要额外的迁移代码。
+    for a in ADAPTERS:
+        cfg[a.key] = bool(cfg.get(a.key, True))
+        low, high, default = clamp_bounds(a)
+        if a.kind == COUNTER:
+            cfg[a.latch] = _clamp_int(cfg.get(a.latch), low, high, default)
+        else:
+            cfg[a.latch] = bool(cfg.get(a.latch, default))
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
     cfg["user_blacklist"] = sorted(_blacklist_stems(cfg.get("user_blacklist")))
-    # 清理触发方式
-    cfg["min_avail_mb"] = _clamp_int(cfg.get("min_avail_mb"), 0, 10 ** 7, 0)
-    cfg["scheduled_minutes"] = _clamp_int(cfg.get("scheduled_minutes"), 0, 24 * 60, 0)
     # 清理区域开关：只接受已知键的布尔值，缺失的沿用默认
     raw_areas = cfg.get("clean_areas")
     raw_areas = raw_areas if isinstance(raw_areas, dict) else {}
     cfg["clean_areas"] = {
         k: bool(raw_areas.get(k, DEFAULT_CONFIG["clean_areas"][k])) for k in CLEAN_AREA_KEYS
     }
-    # 自动更新：间隔钳制在 1 小时..1 周；两个开关容错为 bool；时间戳容忍脏值
-    cfg["update_check_hours"] = _clamp_int(
-        cfg.get("update_check_hours"), 1, 168, DEFAULT_CONFIG["update_check_hours"])
-    cfg["auto_update"] = bool(cfg.get("auto_update", True))
-    cfg["auto_install"] = bool(cfg.get("auto_install", False))
+    # 自动更新的时间戳与已提醒 tag：间隔和开关已在 _FIELD_SPECS / _BOOL_KEYS 里钳过
     try:
         cfg["last_update_check"] = max(0.0, float(cfg.get("last_update_check") or 0))
     except (TypeError, ValueError):

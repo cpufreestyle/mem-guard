@@ -11,6 +11,7 @@ import zipfile
 from datetime import datetime
 
 from .autostart import autostart_enabled
+from .adapters import summary_lines as adapter_summary
 from .clean import top_processes_list
 from .config import BASE_DIR, CONFIG_PATH, LOG_PATH, __version__, gb, load_config
 from .privileges import CLEAN_PRIVILEGES
@@ -37,6 +38,11 @@ def export_diagnostics() -> str:
         ]
         for p in CLEAN_PRIVILEGES:
             info.append(f"priv {p}={privilege_state(p)}")
+        # 自适应痕迹：自动调优到底动过哪几条、爬到第几级、开关是开是关。
+        # 少了这一段，现场报告只能看到 config 里的一把散键和日志里的零散行，
+        # 回答不了「这个阈值为什么被自动改了」。
+        info.append("--- 自适应决策痕迹 ---")
+        info.extend(adapter_summary(cfg))
         info.append("--- 物理占用 Top20 ---")
         for name, rss, pid in top_processes_list(20):
             info.append(f"{name}  {rss / 1024 ** 3:.2f} GB  PID {pid}")

@@ -10,6 +10,7 @@ import os
 import sys
 
 from .config import (
+    DEFAULT_CONFIG,
     CLEAN_BLACKLIST_STEMS,
     __version__,
     _norm_proc_name,
@@ -24,7 +25,10 @@ from .autostart import autostart_enabled
 from .menu import build_menu
 from .tray import Guard
 from .ui import make_icon, message_box
-from .update import _parse_version, check_and_notify, install_latest, pick_asset
+from .adapters import ADAPTERS, reset_patch
+from .update import (_parse_version, check_and_notify, find_checksums_asset,
+                    install_latest, parse_checksums, pick_asset,
+                    purge_stale_backup, sha256_of, verify_asset)
 from .winapi import (
     acquire_single_instance,
     get_mem,
@@ -110,6 +114,17 @@ def selftest() -> int:
         f"{len(format_advice(analyze(normalize_config({}))))} 字符"
     ))
     check("build_menu", lambda: f"菜单构建成功（{type(build_menu(Guard())).__name__}）")
+    check("sha256校验", lambda: (
+        f"清单解析->{parse_checksums('a' * 64 + '  mem_guard.exe', 'mem_guard.exe') == 'a' * 64}, "
+        f"挑清单->{find_checksums_asset([{'name': 'checksums.txt', 'browser_download_url': 'u'}])['name']}, "
+        f"自身哈希->{sha256_of(__file__)[:12]}…, "
+        f"缺摘要->{verify_asset(__file__, '')['skipped']}"
+    ))
+    check("adapters注册表", lambda: (
+        f"{len(ADAPTERS)} 条自适应 / 复位 {len(reset_patch())} 键 / "
+        f"默认配置键全登记->"
+        f"{all(k in DEFAULT_CONFIG for a in ADAPTERS for k in (a.key, a.latch))}"
+    ))
 
     ok_all = all(ok for _, ok, _ in results)
     for name, ok, val in results:
@@ -264,4 +279,7 @@ def main() -> None:
             # 用守护线程弹提示，主线程立即退出，避免互斥体句柄被卡死的进程长期持有
             message_box("MemGuard", "MemGuard 已在运行（请查看系统托盘），本次不再重复启动。")
             sys.exit(0)
+        # 上一版自替换成功后 .bak 已无用；引导批处理没跑完就被杀时也会留下残留。
+        # 在安装目录里放一个大型可执行文件只会让用户困惑、也容易被安全软件单独报毒。
+        purge_stale_backup()
         Guard().run(show_on_start=show_on_start)

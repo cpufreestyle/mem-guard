@@ -15,6 +15,7 @@ import time
 
 import pystray
 
+from . import adapters
 from . import update
 from .advisor import (advice_actions, analyze, deepen_round_saturated,
                       frequent_escalation, frequent_short_relief,
@@ -553,7 +554,8 @@ class Guard:
         """
         try:
             cfg = self.cfg
-            if not cfg.get("auto_level_adapt", True) or cfg.get("level_adapt_done"):
+            if (not adapters.require("auto_level_adapt").enabled(cfg)
+                    or adapters.require("auto_level_adapt").fired(cfg)):
                 return
             esc = frequent_escalation(cfg)
             srt = frequent_short_relief(cfg)
@@ -608,7 +610,7 @@ class Guard:
         """
         try:
             cfg = self.cfg
-            if not cfg.get("target_top_adapt", True):
+            if not adapters.require("target_top_adapt").enabled(cfg):
                 return
             if not narrow_top_coverage(cfg, self.proc_history):
                 return
@@ -616,7 +618,7 @@ class Guard:
             if not (0 < top < TARGET_CLEAN_TOP_MAX):
                 return
             new_top = top + 1
-            done = int(cfg.get("target_top_adapt_done") or 0) + 1
+            done = adapters.require("target_top_adapt").progress(cfg) + 1
             self.cfg = update_config({"target_clean_top": new_top,
                                       "target_top_adapt_done": done})
             log(f"自动优化 | 定向大户榜长期集中在同几个进程（第 {done} 次撒宽，"
@@ -649,7 +651,8 @@ class Guard:
 
         try:
             cfg = self.cfg
-            if not cfg.get("headroom_adapt", True) or cfg.get("headroom_adapt_done"):
+            if (not adapters.require("headroom_adapt").enabled(cfg)
+                    or adapters.require("headroom_adapt").fired(cfg)):
                 return
             try:
                 hr = int(cfg.get("target_headroom_pct") or 0)
@@ -691,7 +694,8 @@ class Guard:
 
         try:
             cfg = self.cfg
-            if not cfg.get("min_avail_adapt", True) or cfg.get("min_avail_adapt_done"):
+            if (not adapters.require("min_avail_adapt").enabled(cfg)
+                    or adapters.require("min_avail_adapt").fired(cfg)):
                 return
             try:
                 cur = int(cfg.get("min_avail_mb") or 0)
@@ -846,9 +850,9 @@ class Guard:
         了，才动 Phys/commit 两条总触发线。口径与 _maybe_adapt_headroom 的门一一
         对应：那里会直接 return 的情形，这里都算用尽。
         """
-        if not self.cfg.get("headroom_adapt", True):
+        if not adapters.require("headroom_adapt").enabled(self.cfg):
             return True
-        if self.cfg.get("headroom_adapt_done"):
+        if adapters.require("headroom_adapt").fired(self.cfg):
             return True
         try:
             hr = int(self.cfg.get("target_headroom_pct") or 0)
@@ -884,7 +888,7 @@ class Guard:
             try:
                 phys = int(cfg.get("phys_threshold") or 0)
                 commit = int(cfg.get("commit_threshold") or 0)
-                done = int(cfg.get("threshold_adapt_done") or 0)
+                done = adapters.require("threshold_adapt").progress(cfg)
             except (TypeError, ValueError):
                 return
             new_phys = phys - _THRESHOLD_STEP

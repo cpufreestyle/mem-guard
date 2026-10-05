@@ -2,16 +2,22 @@
 """
 自动更新：查询 GitHub 最新 Release、比较版本，并按需下载静默安装 / 自替换。
 
-只依赖标准库（urllib / subprocess / os / sys / re / tempfile）+ config，
+只依赖标准库（hashlib / urllib / subprocess / os / sys / re / tempfile）+ config，
 托盘后台静默检查、菜单「立即更新」、CLI（--check-update / --update）共用本模块。
 
 最小打扰原则：
 - 检查失败、已是最新版本：只写日志，不弹任何窗；
 - 发现新版本：每个版本只发一条托盘气泡（update_notified_tag 去重）；
 - 真正下载安装只发生在用户点「立即更新」，或配置开了「下载后自动安装」。
+
+完整性原则：
+- Release 随包发布 sha256 清单（checksums.txt，由 CI 生成后一起上传）；
+- 下载完先比对 sha256，不通过就删包中止——绝不让未校验的二进制进引导批处理；
+- 便携自替换前留一份旧 exe 备份，新版本起不来就自动还原旧版本。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -28,6 +34,10 @@ from .config import REPO_SLUG, __version__, log, update_config
 # mem_guard.exe（便携单文件）与 MemGuard-Setup-x.y.z.exe（Inno 安装器）
 SETUP_ASSET_RE = re.compile(r"^MemGuard-Setup-.*\.exe$", re.IGNORECASE)
 PORTABLE_ASSET_RE = re.compile(r"^mem_guard\.exe$", re.IGNORECASE)
+
+# Release 资产里的 sha256 清单：checksums.txt / sha256sums.txt / checksums.sha256 都认
+CHECKSUMS_ASSET_RE = re.compile(
+    r"^(checksums?|sha256sums?|sha256)\.(txt|sha256|sums?)$", re.IGNORECASE)
 
 # 后台静默检查间隔的兜底值（小时）；实际以配置 update_check_hours 为准
 DEFAULT_CHECK_HOURS = 12
@@ -82,20 +92,35 @@ def portable_boot_cmd(pid: int, new_path: str, target_path: str) -> str:
     做成纯函数是因为命令串里嵌着 PID 与路径，拼错就是「更新完程序消失」，
     这种错误必须在测试里直接断言，不能等用户反馈。窗口以 CREATE_NO_WINDOW
     启动，全程无黑窗。
+
+    覆盖前先把当前 exe 留一份 .bak，新版本 6 秒内没起来就把旧版本还原回去：
+    宁可退回老代码，也不让用户面对一个双击打不开的程序。
     """
     image = os.path.basename(target_path)
+    bak = target_path + ".bak"
     return (
         "@echo off\r\n"
         "setlocal\r\n"
         'set "new={0}"\r\n'
         'set "target={1}"\r\n'
+        'set "bak={2}"\r\n'
+        'set "image={3}"\r\n'
         ":wait\r\n"
-        'tasklist /fi "PID eq {2}" 2>nul | find /i "{3}" >nul\r\n'
+        'tasklist /fi "PID eq {4}" 2>nul | find /i "%image%" >nul\r\n'
         "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)\r\n"
+        'if exist "%target%" copy /y "%target%" "%bak%" >nul\r\n'
         'move /y "%new%" "%target%" >nul\r\n'
         'start "" "%target%"\r\n'
+        ":: 等新版本起来；起不来就把旧版本还原回去\r\n"
+        "timeout /t 6 /nobreak >nul\r\n"
+        'tasklist /fi "IMAGENAME eq %image%" 2>nul | find /i "%image%" >nul\r\n'
+        "if errorlevel 1 (\r\n"
+        '  if exist "%bak%" (move /y "%bak%" "%target%" >nul & start "" "%target%")\r\n'
+        ") else (\r\n"
+        '  if exist "%bak%" del "%bak%"\r\n'
+        ")\r\n"
         'del "%~f0"\r\n'
-    ).format(new_path, target_path, pid, image)
+    ).format(new_path, target_path, bak, image, pid)
 
 
 def setup_boot_cmd(pid: int, setup_path: str, app_dir: str) -> str:
@@ -139,6 +164,127 @@ def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> dict
     if not os.path.exists(dest) or os.path.getsize(dest) == 0:
         return {"ok": False, "msg": "下载结果为空"}
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- sha256 校验
+
+_HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+# 「sha256:<hex>」这种带算法前缀的写法，OCI 镜像清单和一部分打包工具用它
+_SHA256_TAG_RE = re.compile(r"^sha256[:=]([0-9a-fA-F]{64})$")
+_CERTUTIL_RE = re.compile(
+    r"^\s*sha256\s*\((.+?)\)\s*=\s*([0-9a-fA-F]{64})\s*$", re.IGNORECASE)
+
+
+def _clean_token(tok: str) -> str:
+    """清单里的文件名 token：去掉引号、二进制模式前缀 * 与前后空白。"""
+    return str(tok or "").strip().strip('"').strip("'").lstrip("*")
+
+
+def sha256_of(path: str, chunk: int = 1 << 20) -> str:
+    """流式计算文件 sha256（小写十六进制）；读不到文件返回 ''。
+
+    流式是为了不把几十 MB 的安装包一次性读进内存——更新链路跑在托盘后台
+    线程里，一次大块分配会让它自己成为被清理的对象。
+    """
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                buf = f.read(chunk)
+                if not buf:
+                    break
+                h.update(buf)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def find_checksums_asset(assets):
+    """从 Release 资产里挑 sha256 清单；没有则返回 None。"""
+    for a in assets or ():
+        name = str(a.get("name") or "")
+        url = str(a.get("browser_download_url") or "")
+        if CHECKSUMS_ASSET_RE.match(name) and url:
+            return {"name": name, "url": url}
+    return None
+
+
+def parse_checksums(text: str, name: str):
+    """从 sha256 清单文本里取出指定资产的期望摘要；取不到返回 None。
+
+    兼容三种常见写法，都是 CI 或用户手工核对时会遇到的：
+      "<hex>  <name>"        coreutils sha256sum（CI 用这种）
+      "<hex> *<name>"        二进制模式，PowerShell 的 Get-FileHash 常配这种
+      "SHA256(<name>)= <hex>" Windows certutil -hashfile
+    """
+    want = _clean_token(name).lower()
+    if not want:
+        return None
+    for raw in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _CERTUTIL_RE.match(line)
+        if m and _clean_token(m.group(1)).lower() == want:
+            return m.group(2).lower()
+        hexes, names = [], []
+        for tok in line.split():
+            t = _clean_token(tok).lower()
+            if _HEX64_RE.match(t):
+                hexes.append(t)
+            elif _SHA256_TAG_RE.match(t):
+                hexes.append(_SHA256_TAG_RE.match(t).group(1).lower())
+            else:
+                names.append(t)
+        if hexes and want in names:
+            return hexes[0]
+    return None
+
+
+def fetch_checksums(url: str, timeout: int = 30) -> dict:
+    """下载 Release 上的 sha256 清单（几 KB 文本）。"""
+    req = urllib.request.Request(url, headers={"User-Agent": f"MemGuard/{__version__}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return {"ok": True, "text": resp.read().decode("utf-8", "replace")}
+    except Exception as e:
+        return {"ok": False, "msg": f"下载 sha256 清单失败：{e}"}
+
+
+def verify_asset(path: str, expected: str) -> dict:
+    """比对下载文件的 sha256。
+
+    expected 为空表示无从校验（Release 没给摘要）：这时返回 skipped=True，
+    由调用方决定是硬失败还是放行——自动更新默认硬失败。
+    """
+    want = str(expected or "").strip().lower()
+    if not want:
+        return {"ok": False, "skipped": True, "msg": "Release 未提供 sha256 摘要"}
+    got = sha256_of(path)
+    if not got:
+        return {"ok": False, "msg": "已下载的文件读取不到，无法校验"}
+    if got != want:
+        return {"ok": False, "msg": "sha256 校验不通过（文件与 Release 清单不一致）"}
+    return {"ok": True, "sha256": got}
+
+
+def purge_stale_backup() -> None:
+    """删掉上次更新遗留的旧版备份。
+
+    便携自替换成功后 .bak 已无用，留着只会在安装目录里多一个大型可执行文件，
+    既让用户困惑也容易被安全软件单独报毒。脏启动路径（批处理没跑完就被杀）
+    留下的残留同样在这里清掉。
+    """
+    exe = _frozen_exe()
+    if not exe:
+        return
+    try:
+        bak = exe + ".bak"
+        if os.path.exists(bak):
+            os.remove(bak)
+    except OSError:
+        pass
 
 
 def due_for_check(cfg: dict, now=None) -> bool:
@@ -265,6 +411,26 @@ def check_and_notify(cfg: dict, notify=None, open_page: bool = False,
             "msg": f"发现新版本 {tag}"}
 
 
+
+def _verify_download(asset: dict, assets, path: str) -> dict:
+    """下载后的完整性校验：取清单 → 找摘要 → 比对，任何一步不通都算失败。
+    """
+    cks = find_checksums_asset(assets)
+    if not cks:
+        return {"ok": False,
+                "msg": "Release 缺少 sha256 清单，已取消安装（可在配置里关掉 sha256 校验）"}
+    fetched = fetch_checksums(cks["url"])
+    if not fetched.get("ok"):
+        return {"ok": False, "msg": fetched.get("msg", "下载 sha256 清单失败")}
+    expected = parse_checksums(fetched.get("text"), asset.get("name"))
+    if not expected:
+        return {"ok": False,
+                "msg": f"sha256 清单里没有 {asset.get('name')} 的摘要，已取消安装"}
+    v = verify_asset(path, expected)
+    if not v.get("ok"):
+        return {"ok": False, "msg": v.get("msg", "sha256 校验不通过")}
+    return v
+
 def install_latest(cfg: dict, on_ready=None, release: dict = None) -> dict:
     """下载最新版并静默安装 / 自替换。成功时进程被引导批处理重启，不再返回。
 
@@ -295,6 +461,22 @@ def install_latest(cfg: dict, on_ready=None, release: dict = None) -> dict:
     d = download_asset(asset["url"], new_path)
     if not d.get("ok"):
         return {"ok": False, "action": "none", "msg": d.get("msg", "下载失败")}
+    # 完整性校验：自动更新链路上唯一一道「装进机器的确实是作者发的那个包」的
+    # 关卡。默认硬失败——Release 一定带 sha256 清单（CI 生成并一起上传），
+    # 缺清单 / 摘要对不上 / 清单里没这个文件，一律在动手安装前中止。
+    if bool((cfg or {}).get("verify_update_sha256", True)):
+        v = _verify_download(asset, r.get("assets"), new_path)
+        if not v.get("ok"):
+            # 校验不过的包当场删掉：引导批处理下一步就要 move 它，留着就是个
+            # 未校验的可执行文件躺在临时目录里。
+            try:
+                if os.path.exists(new_path):
+                    os.remove(new_path)
+            except OSError:
+                pass
+            log(f"更新包 sha256 校验失败：{v.get('msg', '')}")
+            return {"ok": False, "action": "none", "msg": v.get("msg", "sha256 校验不通过")}
+        log(f"更新包 sha256 校验通过（{str(v.get('sha256', ''))[:12]}…）")
     log(f"更新包下载完成（{asset['name']}），准备切换到 {tag}")
 
     pid = os.getpid()

@@ -111,14 +111,22 @@ def test_unknown_flag_rejected_instead_of_hidden_gui(monkeypatch, capsys, argv):
     (["mem_guard.py"], False),
 ])
 def test_guard_receives_show_flag(monkeypatch, argv, expected):
-    """--show 才把概览窗带出来；开机自启是无参启动，登录时不该弹窗。"""
+    """--show 才把概览窗带出来；开机自启是无参启动，登录时不该弹窗。
+
+    顺带锁住 GUI 分支里的 purge_stale_backup()：上一版自替换留下的 .bak 要在启动时
+    清掉，而删掉那一行原本不会有任何测试变红。
+    """
     _quiet(monkeypatch, argv)
     guard = _RecordingGuard()
     monkeypatch.setattr(cli, "Guard", lambda: guard)
+    purged = []
+    monkeypatch.setattr(cli, "purge_stale_backup", lambda: purged.append(1))
 
     cli.main()
 
     assert guard.kwargs is expected
+    assert purged == [1], "GUI 分支必须清理上次更新残留的 .bak"
+    assert purged == [1], "GUI 分支必须清理上次更新残留的 .bak（删掉那行不会有别的测试红）"
 
 
 
@@ -276,3 +284,21 @@ def test_once_without_escalation_prints_plain_level(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "自动升档" not in out
     assert "清理档位: 保守" in out
+
+
+
+# ------------------------------------------------ selftest 全链表（v1.23.0）
+
+def test_selftest_reports_all_pass(monkeypatch, capsys):
+    """selftest() 必须返回 0：它同时锁住导入链、以及 sha256 校验四件套与
+    adapters 注册表这两项 v1.23.0 新检查。CI 拿冻结版 exe 跑同一支自检当冒烟，
+    这里在源码态先把同一套断言跑一遍——冻结版多出来的唯一变量是 __file__ 指向
+    临时解压目录，而 sha256_of 读不到文件时返回空串、检查本身不抛。
+    """
+    monkeypatch.setattr(cli.sys, "argv", ["mem_guard.py", "--selftest"])
+    monkeypatch.setattr(cli, "acquire_single_instance", lambda: True)
+    code = cli.selftest()
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "sha256校验" in out and "adapters注册表" in out
+    assert "[FAIL]" not in out

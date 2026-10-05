@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+from . import adapters
 from .clean import (_DEEPEN_MAX_ROUNDS, _FOCUS_RATIO, _HEADROOM_MAX,
                     _HEADROOM_STEP, _MINAVAIL_MAX, _MINAVAIL_STEP,
                     _MINMB_DIV, _MINMB_FLOOR_MB, _PREDICT_WINDOW_MAX,
@@ -114,7 +115,8 @@ def recurrent_short_relief(cfg: dict) -> bool:
         return False
     if frequent_short_relief(cfg):
         return False
-    if not cfg.get("headroom_adapt", True) or cfg.get("headroom_adapt_done"):
+    if (not adapters.require("headroom_adapt").enabled(cfg)
+            or adapters.require("headroom_adapt").fired(cfg)):
         return False
     try:
         hr = int(cfg.get("target_headroom_pct", 0) or 0)
@@ -142,7 +144,8 @@ def recurrent_lowmem_shortfall(cfg: dict) -> bool:
         return False
     if frequent_short_relief(cfg) or recurrent_short_relief(cfg):
         return False
-    if not cfg.get("min_avail_adapt", True) or cfg.get("min_avail_adapt_done"):
+    if (not adapters.require("min_avail_adapt").enabled(cfg)
+            or adapters.require("min_avail_adapt").fired(cfg)):
         return False
     try:
         cur = int(cfg.get("min_avail_mb") or 0)
@@ -239,7 +242,8 @@ def unreachable_top_threshold(cfg: dict, history=None) -> bool:
         return False
     if str(cfg.get("clean_level", "conservative")).strip().lower() == "aggressive":
         return False
-    if not cfg.get("min_mb_adapt", True) or cfg.get("min_mb_adapt_done"):
+    if (not adapters.require("min_mb_adapt").enabled(cfg)
+            or adapters.require("min_mb_adapt").fired(cfg)):
         return False
     try:
         top = int(cfg.get("target_clean_top") or 0)
@@ -285,11 +289,11 @@ def deepen_round_saturated(cfg: dict) -> bool:
         return False
     if str(cfg.get("clean_level", "conservative")).strip().lower() == "aggressive":
         return False
-    if not cfg.get("deepen_rounds_adapt", True):
+    if not adapters.require("deepen_rounds_adapt").enabled(cfg):
         return False
     try:
         cur = int(cfg.get("stage_deepen_rounds") or 1)
-        done = int(cfg.get("deepen_rounds_adapt_done") or 0)
+        done = adapters.require("deepen_rounds_adapt").progress(cfg)
         capped = int((cfg.get("stats") or {}).get("deepen_capped", 0) or 0)
     except (TypeError, ValueError, AttributeError):
         return False
@@ -314,13 +318,13 @@ def predict_window_saturated(cfg: dict) -> bool:
     """
     if not cfg.get("predict_clean", True):
         return False
-    if not cfg.get("predict_window_adapt", True):
+    if not adapters.require("predict_window_adapt").enabled(cfg):
         return False
     if str(cfg.get("clean_level", "conservative")).strip().lower() == "aggressive":
         return False
     try:
         cur = int(cfg.get("predict_window_min") or 0)
-        done = int(cfg.get("predict_window_adapt_done") or 0)
+        done = adapters.require("predict_window_adapt").progress(cfg)
         missed = int((cfg.get("stats") or {}).get("preventive_missed", 0) or 0)
     except (TypeError, ValueError, AttributeError):
         return False
@@ -350,7 +354,7 @@ def threshold_too_late(cfg: dict) -> bool:
     try:
         srt_cnt = int(st.get("short_relief", 0) or 0)
         used_cnt = int(st.get("escalated", 0) or 0) + int(st.get("sticky", 0) or 0)
-        done = int(cfg.get("threshold_adapt_done") or 0)
+        done = adapters.require("threshold_adapt").progress(cfg)
         phys = int(cfg.get("phys_threshold", 85))
         commit = int(cfg.get("commit_threshold", 90))
     except (TypeError, ValueError):
@@ -360,7 +364,7 @@ def threshold_too_late(cfg: dict) -> bool:
     if (frequent_short_relief(cfg) or recurrent_short_relief(cfg)
             or recurrent_lowmem_shortfall(cfg)):
         return False
-    if not cfg.get("threshold_adapt", True):
+    if not adapters.require("threshold_adapt").enabled(cfg):
         return False
     if done >= _THRESHOLD_MAX_DROPS:
         return False

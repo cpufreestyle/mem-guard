@@ -13,6 +13,7 @@ import threading
 import pystray
 
 from .advisor import analyze
+from . import adapters
 from .autostart import autostart_enabled, install_autostart, remove_autostart
 from .clean import do_clean, top_processes_list
 from .config import LOG_PATH, __version__, gb, log, update_config
@@ -175,10 +176,36 @@ def build_menu(guard) -> pystray.Menu:
             {"target_clean": not bool(guard.cfg.get("target_clean", True))})
         log(f"定向清理内存大户 -> {'开' if guard.cfg['target_clean'] else '关'}")
 
-    def on_toggle_level_adapt(icon, item) -> None:
-        guard.cfg = update_config(
-            {"auto_level_adapt": not bool(guard.cfg.get("auto_level_adapt", True))})
-        log(f"保守档不给力自动改激进 -> {'开' if guard.cfg['auto_level_adapt'] else '关'}")
+    # -- 自适应开关：文案 / 键名 / 勾选态全部来自 adapters.ADAPTERS --
+    # 新增一条自适应只在注册表加一行，菜单不用再补回调、文案、checked lambda
+    # 这三处——以前它们是最容易漏同步的。
+    def _toggle_adapter(key):
+        def setter(icon, item) -> None:
+            guard.cfg = update_config({key: not bool(guard.cfg.get(key, True))})
+            log(f"{adapters.require(key).label} -> "
+                f"{'开' if guard.cfg.get(key, True) else '关'}")
+        return setter
+
+    def adapter_menu_items():
+        return [
+            pystray.MenuItem(a.label, _toggle_adapter(a.key),
+                             checked=(lambda i, k=a.key: bool(guard.cfg.get(k, True))))
+            for a in adapters.ADAPTERS
+        ]
+
+    def on_reset_adapters(icon=None, item=None) -> None:
+        """一键复位所有自适应闩：抹掉「已经自动调优过一次」这段记忆。
+
+        只清闩、不动别的配置——用户手动调过的档位 / 阈值 / 大户数全部保住。
+        一条都没触发过时这件事没有意义，只写日志、不弹气泡，与程序其它地方
+        「无事不打扰」的口径一致。
+        """
+        status = adapters.reset_status(guard.cfg)
+        if status == "自适应闩已全部复位":
+            log("复位自适应闩 | " + status + "，无需处理")
+            return
+        guard.cfg = update_config(adapters.reset_patch())
+        log("复位自适应闩 | " + status + " → 已全部复位")
 
     def on_toggle_sticky(icon, item) -> None:
         guard.cfg = update_config(
@@ -200,51 +227,6 @@ def build_menu(guard) -> pystray.Menu:
         guard.cfg = update_config(
             {"bg_trim": not bool(guard.cfg.get("bg_trim", True))})
         log(f"后台进程工作集清理 -> {'开' if guard.cfg['bg_trim'] else '关'}")
-
-    def on_toggle_target_top_adapt(icon, item) -> None:
-        guard.cfg = update_config(
-            {"target_top_adapt": not bool(guard.cfg.get("target_top_adapt", True))})
-        log(f"定向覆盖面自适应(大户数不足时+1) -> "
-            f"{'开' if guard.cfg['target_top_adapt'] else '关'}")
-
-    def on_toggle_headroom_adapt(icon, item) -> None:
-        guard.cfg = update_config(
-            {"headroom_adapt": not bool(guard.cfg.get("headroom_adapt", True))})
-        log(f"清理提前量自适应(效果偏短时阈值提前) -> "
-            f"{'开' if guard.cfg['headroom_adapt'] else '关'}")
-
-    def on_toggle_min_avail_adapt(icon, item) -> None:
-        guard.cfg = update_config(
-            {"min_avail_adapt": not bool(guard.cfg.get("min_avail_adapt", True))})
-        log(f"低内存下限自适应(可用内存偏低时抬高) -> "
-            f"{'开' if guard.cfg['min_avail_adapt'] else '关'}")
-
-    def on_toggle_min_mb_adapt(icon, item) -> None:
-        guard.cfg = update_config(
-            {"min_mb_adapt": not bool(guard.cfg.get("min_mb_adapt", True))})
-        log(f"定向大户下限自适应(榜上够不着下限时减半) -> "
-            f"{'开' if guard.cfg['min_mb_adapt'] else '关'}")
-
-    def on_toggle_deepen_rounds_adapt(icon, item) -> None:
-        guard.cfg = update_config(
-            {"deepen_rounds_adapt":
-             not bool(guard.cfg.get("deepen_rounds_adapt", True))})
-        log(f"加深轮数自适应(加深卡住时+1轮) -> "
-            f"{'开' if guard.cfg['deepen_rounds_adapt'] else '关'}")
-
-    def on_toggle_predict_window_adapt(icon, item) -> None:
-        guard.cfg = update_config(
-            {"predict_window_adapt":
-             not bool(guard.cfg.get("predict_window_adapt", True))})
-        log(f"预防窗口自适应(没防住时加宽窗口) -> "
-            f"{'开' if guard.cfg['predict_window_adapt'] else '关'}")
-
-    def on_toggle_threshold_adapt(icon, item) -> None:
-        guard.cfg = update_config(
-            {"threshold_adapt":
-             not bool(guard.cfg.get("threshold_adapt", True))})
-        log(f"触发线自适应(短效反复且温和手段用尽时提前) -> "
-            f"{'开' if guard.cfg['threshold_adapt'] else '关'}")
 
     def on_toggle_predict_clean(icon, item) -> None:
         guard.cfg = update_config(
@@ -385,6 +367,13 @@ def build_menu(guard) -> pystray.Menu:
             {"auto_install": not bool(guard.cfg.get("auto_install", False))})
         log(f"下载后自动安装 -> {'开' if guard.cfg['auto_install'] else '关'}")
 
+    def on_toggle_verify_sha256(icon, item) -> None:
+        guard.cfg = update_config(
+            {"verify_update_sha256":
+             not bool(guard.cfg.get("verify_update_sha256", True))})
+        log(f"更新包 sha256 校验 -> "
+            f"{'开' if guard.cfg['verify_update_sha256'] else '关'}")
+
     # -- 菜单结构 ------------------------------------------------
 
     def line_phys(_):
@@ -455,42 +444,16 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("target_clean", True))),
         pystray.MenuItem("后台进程工作集清理", on_toggle_bg_trim,
                          checked=lambda i: bool(guard.cfg.get("bg_trim", True))),
-        pystray.MenuItem("保守档不给力自动改激进", on_toggle_level_adapt,
-                         checked=lambda i: bool(guard.cfg.get("auto_level_adapt", True))),
+        *adapter_menu_items(),
+        pystray.MenuItem(
+            lambda i: "复位自适应闩（" + adapters.reset_status(guard.cfg) + "）",
+            on_reset_adapters),
         pystray.MenuItem("持续高压粘滞激进", on_toggle_sticky,
                          checked=lambda i: bool(guard.cfg.get("sticky_aggressive", True))),
         pystray.MenuItem("阶段自学习(跳过无效阶段)", on_toggle_stage_learn,
                          checked=lambda i: bool(guard.cfg.get("stage_learn", True))),
         pystray.MenuItem("定向清理加深(不达标前再撒宽一轮)", on_toggle_stage_deepen,
                          checked=lambda i: bool(guard.cfg.get("stage_deepen", True))),
-        pystray.MenuItem("定向覆盖面自适应(大户数不足时+1)",
-                         on_toggle_target_top_adapt,
-                         checked=lambda i: bool(
-                             guard.cfg.get("target_top_adapt", True))),
-        pystray.MenuItem("清理提前量自适应(效果偏短时阈值提前)",
-                         on_toggle_headroom_adapt,
-                         checked=lambda i: bool(
-                             guard.cfg.get("headroom_adapt", True))),
-        pystray.MenuItem("低内存下限自适应(可用内存偏低时抬高)",
-                         on_toggle_min_avail_adapt,
-                         checked=lambda i: bool(
-                             guard.cfg.get("min_avail_adapt", True))),
-        pystray.MenuItem("定向大户下限自适应(榜上够不着下限时减半)",
-                         on_toggle_min_mb_adapt,
-                         checked=lambda i: bool(
-                             guard.cfg.get("min_mb_adapt", True))),
-        pystray.MenuItem("加深轮数自适应(加深卡住时+1轮)",
-                         on_toggle_deepen_rounds_adapt,
-                         checked=lambda i: bool(
-                             guard.cfg.get("deepen_rounds_adapt", True))),
-        pystray.MenuItem("预防窗口自适应(没防住时加宽窗口)",
-                         on_toggle_predict_window_adapt,
-                         checked=lambda i: bool(
-                             guard.cfg.get("predict_window_adapt", True))),
-        pystray.MenuItem("触发线自适应(短效反复且温和手段用尽时提前)",
-                         on_toggle_threshold_adapt,
-                         checked=lambda i: bool(
-                             guard.cfg.get("threshold_adapt", True))),
         pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
                          checked=lambda i: bool(guard.cfg.get("predict_clean", True))),
         pystray.MenuItem("开机自启", on_toggle_autostart,
@@ -508,5 +471,7 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("auto_update", True))),
         pystray.MenuItem("下载后自动安装", on_toggle_auto_install,
                          checked=lambda i: bool(guard.cfg.get("auto_install", False))),
+        pystray.MenuItem("更新包 sha256 校验", on_toggle_verify_sha256,
+                         checked=lambda i: bool(guard.cfg.get("verify_update_sha256", True))),
         pystray.MenuItem("退出", on_quit),
     )

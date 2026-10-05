@@ -108,11 +108,21 @@ if ($smoke -ne 0) {
     throw ('冒烟测试失败：产物自检退出码 ' + $smoke)
 }
 
+# 生成 sha256 清单：自动更新在跑引导批处理之前会拿它比对下载文件的哈希
+# （见 memguard\update.py 的 _verify_download）。与 CI 的 release.yml 共用同一个
+# make_checksums.py——原先两边各写一遍 PowerShell，格式漂移时只有一边能装；
+# tests/test_make_checksums.py 会把生成结果直接喂给客户端的 parse_checksums /
+# verify_asset 做往返验证。这里不加 --strict：本地可能只出便携、没编译安装器。
+$ckRel = if ($OneDir) { 'dist\mem_guard\checksums.txt' } else { 'dist\checksums.txt' }
+python make_checksums.py --dir (Split-Path -Parent $exePath) --patterns "mem_guard.exe" "MemGuard-Setup-*.exe" --out $ckRel
+Get-Content $ckRel | ForEach-Object { Write-Host ('[i] sha256 ' + $_) }
+
 Write-Host ''
 if ($OneDir) {
     Write-Host ('构建完成（目录版，单进程 / 启动快；冒烟自检通过）：dist\mem_guard\mem_guard.exe')
     Write-Host '分发请整目录拷贝（压缩后解压即可用）。'
 } else {
     Write-Host ('构建完成（单文件 {0:N1} MB；冒烟自检通过）：dist\mem_guard.exe' -f ((Get-Item $exePath).Length / 1MB))
+    Write-Host ('sha256 清单：' + $ckRel)
     Write-Host '注：单文件版运行时会解压到临时目录，进程列表里会看到"引导器 + 程序"两个进程，属正常现象。'
 }

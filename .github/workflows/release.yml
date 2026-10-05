@@ -31,6 +31,12 @@ jobs:
           pip install -r requirements-dev.txt
           pip install pyinstaller
 
+      - name: 版本与交接文档一致性
+        run: python check_version_sync.py
+
+      - name: 提交内容行尾 / BOM / 编码
+        run: python check_line_endings.py
+
       - name: 生成程序图标
         run: python make_icon.py
 
@@ -79,7 +85,13 @@ jobs:
             Write-Host "::warning title=跳过安装器::未找到 ISCC.exe（Inno Setup 未安装成功）"
             exit 0
           }
-          $ver = (Select-String -Path memguard\config.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          # 版本号从 check_version_sync.py 读：它上面刚跑完版本一致性闸门，解析口径与
+          # 闸门同一份；这里再写一条 PowerShell 正则，就会和闸门各说各话。
+          $ver = (python check_version_sync.py --print-version).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $ver) {
+            Write-Host "::error title=读不到版本号::check_version_sync.py --print-version 失败"
+            exit 1
+          }
           Write-Host "编译安装器，版本 $ver"
           & $iscc "/DAppVersion=$ver" "installer\mem_guard.iss"
           if ($LASTEXITCODE -ne 0) {
@@ -88,6 +100,12 @@ jobs:
           }
           Get-ChildItem dist\MemGuard-Setup-*.exe | ForEach-Object { Write-Host ("产物: " + $_.Name) }
 
+      - name: 生成 sha256 清单
+        # 自动更新在跑引导批处理之前会拿这份清单比对下载文件的 sha256（见 memguard/update.py）。
+        # 生成逻辑抽到 make_checksums.py，本地 build.ps1 调同一个脚本，两边格式不会对不上。
+        # --strict 要求两类制品都必须产出：缺一个就让构建红，不发缺条目的清单出去。
+        run: python make_checksums.py --dir dist --strict --patterns "mem_guard.exe" "MemGuard-Setup-*.exe" --out dist\checksums.txt
+
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -95,6 +113,7 @@ jobs:
           path: |
             dist/mem_guard.exe
             dist/MemGuard-Setup-*.exe
+            dist/checksums.txt
           if-no-files-found: warn
 
       - name: 发布 Release
@@ -104,4 +123,5 @@ jobs:
           files: |
             dist/mem_guard.exe
             dist/MemGuard-Setup-*.exe
+            dist/checksums.txt
           generate_release_notes: true

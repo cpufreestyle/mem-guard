@@ -4,9 +4,13 @@
 后台静默检查的「不打扰」是硬契约：检查失败 / 已最新都不该有气泡，有新版每个
 tag 只提醒一次，打开发布页只在用户显式点了「检查更新」时才发生。
 """
+import hashlib
+
 from memguard import update as update_mod
 from memguard.update import (_parse_version, check_and_notify, due_for_check,
-                             pick_asset, portable_boot_cmd, setup_boot_cmd)
+                             find_checksums_asset, parse_checksums, pick_asset,
+                             portable_boot_cmd, setup_boot_cmd, sha256_of,
+                             verify_asset)
 
 
 def test_parse_version_basic():
@@ -95,6 +99,175 @@ def test_setup_boot_cmd_silent_install_and_restart():
     assert "start \"\" \"C:\\App\\mem_guard.exe\"" in cmd
     assert "del \"%~f0\"" in cmd
 
+
+def test_find_checksums_asset_picks_manifest_only():
+    with_ck = _ASSETS + [{"name": "checksums.txt",
+                          "browser_download_url": "https://x/checksums"}]
+    assert find_checksums_asset(with_ck) == {"name": "checksums.txt",
+                                             "url": "https://x/checksums"}
+    assert find_checksums_asset(_ASSETS) is None, "Release 没给清单时要能被发现"
+    assert find_checksums_asset(None) is None
+
+
+# ---------------------------------------------------------------- sha256 校验
+
+_PAYLOAD = b"MemGuard installer payload"
+_CK_URL = "https://x/checksums"
+
+
+def test_sha256_of_streams_and_tolerates_missing_file(tmp_path):
+    p = tmp_path / "mem_guard.exe"
+    p.write_bytes(_PAYLOAD)
+    assert sha256_of(str(p)) == hashlib.sha256(_PAYLOAD).hexdigest()
+    assert sha256_of(str(tmp_path / "nope.exe")) == "", "读不到文件返回空串"
+
+
+def test_verify_asset_reports_mismatch_and_missing_manifest(tmp_path):
+    p = tmp_path / "mem_guard.exe"
+    p.write_bytes(_PAYLOAD)
+    good = hashlib.sha256(_PAYLOAD).hexdigest()
+    assert verify_asset(str(p), good)["ok"] is True
+    assert verify_asset(str(p), good.upper())["ok"] is True, "大小写不该影响比对"
+    bad = verify_asset(str(p), "0" * 64)
+    assert bad["ok"] is False and "sha256" in bad["msg"]
+    skip = verify_asset(str(p), "")
+    assert skip["ok"] is False and skip["skipped"] is True, "没有摘要 = 无从校验"
+
+
+def test_verify_asset_reports_unreadable_file(tmp_path):
+    r = verify_asset(str(tmp_path / "missing.exe"), "a" * 64)
+    assert r["ok"] is False and "读取不到" in r["msg"]
+
+
+def test_parse_checksums_accepts_common_formats():
+    good = "a" * 64
+    assert parse_checksums(good + "  mem_guard.exe", "mem_guard.exe") == good
+    assert parse_checksums(good + " *mem_guard.exe", "mem_guard.exe") == good
+    assert parse_checksums("SHA256(mem_guard.exe)= " + good, "mem_guard.exe") == good
+    assert parse_checksums("sha256:" + good + "  mem_guard.exe", "mem_guard.exe") == good
+    # 多行清单里按文件名对号入座，别拿到别人的摘要
+    text = "b" * 64 + "  other.exe" + chr(13) + chr(10) + good + "  mem_guard.exe" + chr(13) + chr(10)
+    assert parse_checksums(text, "mem_guard.exe") == good
+    assert parse_checksums(text, "other.exe") == "b" * 64
+
+
+def test_parse_checksums_rejects_missing_and_malformed():
+    good = "c" * 64
+    assert parse_checksums(good + "  other.exe", "mem_guard.exe") is None
+    assert parse_checksums("", "mem_guard.exe") is None
+    assert parse_checksums(good + "  mem_guard.exe", "") is None
+    assert parse_checksums("# " + good + "  mem_guard.exe", "mem_guard.exe") is None, \
+        "注释行不算数"
+    assert parse_checksums("deadbeef  mem_guard.exe", "mem_guard.exe") is None, \
+        "长度不够的摘要一律不认"
+
+
+# ------------------------------------------------- 安装前的完整性闸门
+
+class _Installer:
+    """把 install_latest 的网络与子进程边界换成假的，只留 sha256 校验是真的。"""
+
+    def __init__(self, monkeypatch, tmp_path, digest=None, no_checksums=False):
+        self.state = {"popen": 0, "exit": None}
+        monkeypatch.setattr(update_mod, "_frozen_exe", lambda: str(tmp_path))
+        monkeypatch.setattr(update_mod, "is_installed_layout", lambda: False)
+        monkeypatch.setattr(update_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+        monkeypatch.setattr(update_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(update_mod.os, "_exit",
+                            lambda code: self.state.__setitem__("exit", code))
+        monkeypatch.setattr(
+            update_mod.subprocess, "Popen",
+            lambda *a, **k: self.state.__setitem__("popen", self.state["popen"] + 1))
+        assets = [dict(x) for x in _ASSETS]
+        text = ""
+        if not no_checksums:
+            assets.append({"name": "checksums.txt", "browser_download_url": _CK_URL})
+            # 清单里的文件名必须与 pick_asset 真正挑中的那个一致，否则校验的是别的包
+            picked = pick_asset(assets)["name"]
+            text = (digest or hashlib.sha256(_PAYLOAD).hexdigest()) + "  " + picked + chr(13) + chr(10)
+        monkeypatch.setattr(
+            update_mod, "fetch_latest_release", lambda timeout=8: {
+                "ok": True, "tag": "v9.9.9", "url": "https://example/release",
+                "newer": True, "assets": assets})
+        monkeypatch.setattr(
+            update_mod, "fetch_checksums", lambda url, timeout=30: {
+                "ok": True, "text": text})
+
+        def fake_download(url, dest, timeout=300):
+            with open(dest, "wb") as f:
+                f.write(_PAYLOAD)
+            return {"ok": True}
+
+        monkeypatch.setattr(update_mod, "download_asset", fake_download)
+
+    def cfg(self, verify=True):
+        return {"verify_update_sha256": verify}
+
+
+def test_install_latest_refuses_without_manifest(monkeypatch, tmp_path):
+    """Release 没给 sha256 清单：宁可不动手，也不装一个无从校验的包。"""
+    it = _Installer(monkeypatch, tmp_path, no_checksums=True)
+    r = update_mod.install_latest(it.cfg())
+    assert r["ok"] is False and "sha256 清单" in r["msg"]
+    assert it.state["popen"] == 0, "一条引导批处理都不该启动"
+    assert it.state["exit"] is None
+    assert not list(tmp_path.glob("mem_guard_update_*.exe")), \
+        "校验不过的包必须当场删掉，不能留在临时目录"
+
+
+def test_install_latest_refuses_on_digest_mismatch(monkeypatch, tmp_path):
+    it = _Installer(monkeypatch, tmp_path, digest="0" * 64)
+    r = update_mod.install_latest(it.cfg())
+    assert r["ok"] is False and "sha256 校验不通过" in r["msg"]
+    assert it.state["popen"] == 0 and it.state["exit"] is None
+    assert not list(tmp_path.glob("mem_guard_update_*.exe"))
+
+
+def test_install_latest_refuses_when_manifest_lacks_the_asset(monkeypatch, tmp_path):
+    """清单在、但没有这个文件的摘要：同样装不了。"""
+    it = _Installer(monkeypatch, tmp_path, digest="a" * 64)
+    monkeypatch.setattr(
+        update_mod, "fetch_checksums",
+        lambda url, timeout=30: {"ok": True, "text": "b" * 64 + "  other.exe" + chr(13) + chr(10)})
+    r = update_mod.install_latest(it.cfg())
+    assert r["ok"] is False and "摘要" in r["msg"]
+    assert it.state["popen"] == 0
+
+
+def test_install_latest_refuses_when_manifest_unreachable(monkeypatch, tmp_path):
+    it = _Installer(monkeypatch, tmp_path, digest="a" * 64)
+    monkeypatch.setattr(update_mod, "fetch_checksums",
+                        lambda url, timeout=30: {"ok": False, "msg": "网络不通"})
+    r = update_mod.install_latest(it.cfg())
+    assert r["ok"] is False and "网络不通" in r["msg"]
+    assert it.state["popen"] == 0
+
+
+def test_install_latest_proceeds_after_digest_matches(monkeypatch, tmp_path):
+    it = _Installer(monkeypatch, tmp_path)
+    ready = []
+    update_mod.install_latest(it.cfg(), on_ready=lambda: ready.append(1))
+    assert it.state["popen"] == 1, "校验通过才启动引导批处理"
+    assert it.state["exit"] == 0, "引导批处理已接管，进程以 0 退出"
+    assert ready == [1], "on_ready 要在启动批处理之后、退出之前回调"
+
+
+def test_install_latest_can_skip_verification_when_configured(monkeypatch, tmp_path):
+    """关掉校验是显式逃生门：老 Release 没清单时用户仍要能升级。"""
+    it = _Installer(monkeypatch, tmp_path, no_checksums=True)
+    update_mod.install_latest(it.cfg(verify=False))
+    assert it.state["popen"] == 1 and it.state["exit"] == 0
+
+
+def test_purge_stale_backup_removes_only_the_bak(monkeypatch, tmp_path):
+    exe = tmp_path / "mem_guard.exe"
+    exe.write_bytes(b"me")
+    bak = tmp_path / "mem_guard.exe.bak"
+    bak.write_bytes(b"old")
+    monkeypatch.setattr(update_mod, "_frozen_exe", lambda: str(exe))
+    update_mod.purge_stale_backup()
+    assert not bak.exists() and exe.exists(), "只删备份，不能碰正在跑的 exe"
+    update_mod.purge_stale_backup(), "没有备份时静默返回"
 
 # ---------------------------------------------------------------- 通知契约
 

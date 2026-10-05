@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """advisor：建议生成与渲染（注入内存状态，避免依赖真实机器与真实进程扫描）。"""
+import io
+import os
+import re
+
 import pytest
 
 from memguard import advisor
-from memguard.config import normalize_config
+from memguard.config import DEFAULT_CONFIG, normalize_config
 
 GB = 1024 ** 3
 
@@ -740,3 +744,60 @@ def test_analyze_silent_on_thresholds_when_other_advice_applies():
                           "low_mem": 2}}):
         items = advisor.analyze(_thrsh_cfg(**kw), _mem(), [])
         assert not any("温和手段用尽" in i["title"] for i in items), kw
+
+
+
+
+
+# ------------------------------------- 建议写出的键必须是真实配置键
+
+_ADVICE_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "memguard", "advisor.py")
+_CHANGES_RE = re.compile(r'"changes"\s*:\s*\{([^{}]*)\}')
+_KEY_RE = re.compile(r'"([a-z0-9_]+)"\s*:')
+
+
+def _advice_change_keys():
+    with io.open(_ADVICE_SRC, encoding="utf-8") as f:
+        src = f.read()
+    keys = set()
+    for body in _CHANGES_RE.findall(src):
+        keys |= set(_KEY_RE.findall(body))
+    return keys
+
+
+def test_every_advice_action_writes_a_known_config_key():
+    """advisor 里每条建议的 changes 键，都必须是 DEFAULT_CONFIG 里存在的键。
+
+    normalize_config 对未知键是「原样保留」，所以键名打错的后果不是抛异常，而是：
+    用户点了「一键应用」、界面显示改好了、内存里多一个没人读的键、实际什么也没变。
+    要构造 17 条建议各自的触发条件去覆盖不现实，所以沿用自适应注册表那条的做法——
+    直接把源码里所有 "changes": {...} 的键抓出来逐一校验。
+    """
+    keys = _advice_change_keys()
+    assert keys, "一条 changes 都没抓到——该修的是这个正则，不是测试"
+    unknown = sorted(k for k in keys if k not in DEFAULT_CONFIG)
+    assert not unknown, "建议写了配置里不存在的键（点了会静默无效）: %s" % unknown
+
+
+def test_advice_change_keys_cover_the_expected_knobs():
+    """反向确认抓到的键够多、且代表键都在，防止正则悄悄漏抓后半段。
+
+    不断言精确集合：新增一条建议就会改集合，那是维护负担；这里只保证「没漏到
+    只剩一两个」，以及每条自适应闩键和主要旋钮都真的被抓到。
+    """
+    keys = _advice_change_keys()
+    assert len(keys) >= 18, sorted(keys)
+    must = {
+        # 自适应闩键：建议一键应用时要和 tray 自动调优落同一个闩
+        "headroom_adapt_done", "min_avail_adapt_done", "min_mb_adapt_done",
+        "deepen_rounds_adapt_done", "predict_window_adapt_done",
+        "threshold_adapt_done",
+        # 主要旋钮
+        "auto_clean", "warn_margin", "cooldown", "clean_level",
+        "escalate_clean", "target_clean_top", "target_headroom_pct",
+        "min_avail_mb", "target_clean_min_mb", "stage_deepen_rounds",
+        "predict_window_min", "phys_threshold", "commit_threshold",
+    }
+    missing = sorted(must - keys)
+    assert not missing, "正则漏抓了这些键: %s" % missing
