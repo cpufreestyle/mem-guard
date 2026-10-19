@@ -25,7 +25,8 @@ from . import foreground
 from .hotkeys import (action_specs, choice_clashes, choice_specs,
                      choices_are_usable, parse_hotkey)
 from . import idle
-from .clean import do_clean, top_processes
+import psutil
+from .clean import do_clean, kill_process, top_processes
 from .advisor import analyze, format_advice
 from .autostart import autostart_enabled
 from .menu import build_menu
@@ -179,6 +180,26 @@ def selftest() -> int:
         f"默认配置键全登记->"
         f"{all(k in DEFAULT_CONFIG for a in ADAPTERS for k in (a.key, a.latch))}"
     ))
+
+    def _kill_probe() -> str:
+        """只验证 kill_process 的保护判定，绝不真的结束任何进程。
+
+        三条都是必然被拒绝的输入：PID 0 是系统保留、本进程 PID 触发自杀保护、
+        不存在的 PID 取不到进程信息（RSS=0）走到 terminate_process 仍失败。
+        任何一条返回 ok=True 就说明保护形同虚设。
+        """
+        cfg = normalize_config({})
+        dead = 2 ** 22
+        while psutil.pid_exists(dead):
+            dead += 1
+        rows = [(0, "PID 0"), (os.getpid(), "本进程"), (dead, "不存在 PID")]
+        rejected = []
+        for pid, label in rows:
+            r = kill_process(pid, "probe.exe", cfg)
+            rejected.append(not r["ok"])
+        return "全部拒绝->%s" % all(rejected)
+
+    check("结束进程保护判定", _kill_probe)
 
     ok_all = all(ok for _, ok, _ in results)
     for name, ok, val in results:

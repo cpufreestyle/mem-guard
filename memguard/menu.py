@@ -16,14 +16,28 @@ from .advisor import analyze
 from . import adapters
 from . import hotkeys
 from .autostart import autostart_enabled, install_autostart, remove_autostart
-from .clean import do_clean, top_processes_list
+from .clean import do_clean, kill_process, top_processes_list
 from .config import LOG_PATH, __version__, gb, log, update_config
 from .diag import export_diagnostics
-from .ui import (apply_advice_actions,
+from .ui import (apply_advice_actions, confirm_box, message_box,
                 show_advice_window, show_top_window, show_trend_window)
 from .update import fetch_latest_release, install_latest
 from .winapi import is_admin
 
+
+def _kill_one(guard, pid: int, name: str) -> None:
+    """托盘子菜单点选后的单进程结束流程：确认框 -> kill_process -> 汇报 -> 刷新。
+
+    提升到模块级与 ui.run_kill 同一个理由：闭包在 build_menu 里，测试碰不到，
+    而这条路径直接决定用户机器上少不少一个进程。
+    """
+    cfg = guard.cfg
+    if cfg.get("process_kill_confirm", True) and not confirm_box(
+            "MemGuard - 结束进程", f"确定要结束进程 {name} (PID {pid}) 吗？"):
+        return
+    r = kill_process(pid, name, cfg)
+    message_box("MemGuard - 结束结果", r.get("msg", "已完成"))
+    guard.refresh()
 
 def build_menu(guard) -> pystray.Menu:
     """构建托盘右键菜单。
@@ -244,6 +258,7 @@ def build_menu(guard) -> pystray.Menu:
         stk = int(st.get('sticky', 0))
         dpn = int(st.get('deepen', 0))
         lm = int(st.get('low_mem', 0))
+        pk = int(st.get('process_killed', 0))
         base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
         return (base + (f"（升档 {esc} 次）" if esc else "")
                 + (f"（定向 {tgt} 次）" if tgt else "")
@@ -252,7 +267,8 @@ def build_menu(guard) -> pystray.Menu:
                 + (f"（短效 {srt} 次）" if srt else "")
                 + (f"（后台 {bgt} 次）" if bgt else "")
                 + (f"（粘滞 {stk} 次）" if stk else "")
-                + (f"（低内存 {lm} 次）" if lm else ""))
+                + (f"（低内存 {lm} 次）" if lm else "")
+                + (f"（结束进程 {pk} 次）" if pk else ""))
 
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
@@ -401,6 +417,37 @@ def build_menu(guard) -> pystray.Menu:
             {"fs_protect": not bool(guard.cfg.get("fs_protect", True))})
         log(f"保护前台进程（不清空工作集） -> {'开' if guard.cfg['fs_protect'] else '关'}")
 
+    def on_toggle_process_kill(icon, item) -> None:
+        """v1.25.0 关闭进程总开关：关闭后托盘子菜单与 Top10 右键全部不可用。"""
+        guard.cfg = update_config(
+            {"process_kill_enabled": not bool(guard.cfg.get("process_kill_enabled", True))})
+        log(f"关闭进程功能 -> {'开' if guard.cfg['process_kill_enabled'] else '关'}")
+
+    def on_toggle_process_kill_confirm(icon, item) -> None:
+        """v1.25.0 结束前确认：开启后弹 Yes/On 确认框再执行 TerminateProcess。"""
+        guard.cfg = update_config(
+            {"process_kill_confirm": not bool(guard.cfg.get("process_kill_confirm", True))})
+        log(f"结束进程前确认 -> {'开' if guard.cfg['process_kill_confirm'] else '关'}")
+
+    def _kill_submenu(guard):
+        """托盘子菜单：列出内存占用 Top8，点一项即结束该进程。"""
+        items = []
+        try:
+            rows = top_processes_list(8)
+            for nm, rss, pid in rows:
+                items.append(pystray.MenuItem(
+                    f"{nm} ({rss / 1024 / 1024:.0f}MB, PID {pid})",
+                    (lambda p=pid, n=nm:
+                     lambda icon, item: _on_kill_one(guard, p, n))(),
+                    enabled=lambda i: bool(guard.cfg.get("process_kill_enabled", True))))
+        except Exception:
+            items.append(pystray.MenuItem("无法读取进程列表", None, enabled=False))
+        return pystray.Menu(*items) if items else pystray.Menu(
+            pystray.MenuItem("(无)", None, enabled=False))
+
+    def _on_kill_one(guard, pid: int, name: str) -> None:
+        _kill_one(guard, pid, name)
+
     def _set_hotkey(action, spec):
         def setter(icon, item):
             changes = {"hotkey_" + action: spec}
@@ -518,6 +565,11 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("fs_pause", True))),
         pystray.MenuItem("保护前台进程（不清空工作集）", on_toggle_fs_protect,
                          checked=lambda i: bool(guard.cfg.get("fs_protect", True))),
+        pystray.MenuItem("关闭进程功能", on_toggle_process_kill,
+                         checked=lambda i: bool(guard.cfg.get("process_kill_enabled", True))),
+        pystray.MenuItem("结束进程前弹确认框", on_toggle_process_kill_confirm,
+                         checked=lambda i: bool(guard.cfg.get("process_kill_confirm", True))),
+        pystray.MenuItem("结束进程（内存占用 Top8）", _kill_submenu(guard)),
         *adapter_menu_items(),
         pystray.MenuItem(
             lambda i: "复位自适应闩（" + adapters.reset_status(guard.cfg) + "）",

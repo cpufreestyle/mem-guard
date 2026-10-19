@@ -14,7 +14,7 @@ import os
 
 import psutil
 
-from .config import CLEAN_BLACKLIST_STEMS, _blacklist_stems, name_in_blacklist
+from .config import CLEAN_BLACKLIST_STEMS, _blacklist_stems, _norm_proc_name, log, name_in_blacklist
 from .winapi import (
     MemoryEmptyWorkingSets,
     MemoryFlushModifiedList,
@@ -23,6 +23,7 @@ from .winapi import (
     clear_file_cache,
     kernel32,
     psapi,
+    _PROCESS_TERMINATE,
     _purge_list,
 )
 
@@ -91,13 +92,64 @@ def empty_selected_working_sets(pids, extra_blacklist=()) -> tuple:
                                (), skip_self=False)
 
 
+# OpenProcess 所需的最小权限；EmptyWorkingSet / OpenProcess 的类型声明见 winapi.py
+_PROCESS_ACCESS = 0x0400 | 0x0100      # PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA
+
+def terminate_process(pid: int, expected_name: str | None = None) -> bool:
+    """强制结束指定 PID 的进程（TerminateProcess），失败-软，绝不抛出。
+
+    保护规则（与清理编排同源，不要另起一套）：
+      - PID 0 (系统空闲) 与 PID 4 (系统) 跳过，结束它们会蓝屏/挂机；
+      - 跳过本进程（os.getpid()），避免自杀；
+      - expected_name 提供时，先用 psutil.Process(pid).name() 现场核对进程名，
+        用 _norm_proc_name 比对，不符直接返回 False（防 PID 复用：刚采样到的
+        PID 可能已被另一个进程复用，直接 TerminateProcess 会杀错目标）；
+      - 任何异常只记日志、返回 False，不影响主流程。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        log(f"terminate_process: 非法 PID {pid!r}，已跳过")
+        return False
+    if pid in (0, 4):
+        log(f"terminate_process: PID {pid} 是系统保留进程，已跳过")
+        return False
+    if pid == os.getpid():
+        log(f"terminate_process: PID {pid} 是本进程，已跳过（自杀保护）")
+        return False
+    if expected_name is not None:
+        try:
+            actual = psutil.Process(pid).name()
+        except Exception:
+            log(f"terminate_process: 无法读取 PID {pid} 进程名（可能已退出），已跳过")
+            return False
+        if _norm_proc_name(actual) != _norm_proc_name(expected_name):
+            log(f"terminate_process: PID {pid} 名 {actual!r} 与期望 {expected_name!r} 不符（PID 可能已复用），已跳过")
+            return False
+    handle = None
+    try:
+        handle = kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
+        if not handle:
+            log(f"terminate_process: OpenProcess(PID={pid}) 失败，已跳过")
+            return False
+        ok = bool(kernel32.TerminateProcess(handle, 0))
+        if not ok:
+            log(f"terminate_process: TerminateProcess(PID={pid}) 返回 False")
+        return ok
+    except Exception as e:
+        log(f"terminate_process: PID {pid} 异常 {e!r}，已跳过")
+        return False
+    finally:
+        if handle:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+
 def _pid_set(pids) -> set:
     """把 PID 序列归一成 int 集合（None / 空序列 → 空集）。"""
     return {int(pid) for pid in pids or ()}
-
-
-# OpenProcess needs minimal access for EmptyWorkingSet; type decls live in winapi.py
-_PROCESS_ACCESS = 0x0400 | 0x0100      # PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA
 
 
 def _empty_working_sets(pairs, extra_blacklist, exclude_pids, skip_self) -> tuple:

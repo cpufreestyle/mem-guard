@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 
 import psutil
@@ -24,8 +25,10 @@ from .actions import (
     purge_low_priority_standby,
     purge_standby_list,
     purge_working_sets,
+    terminate_process,
 )
-from .config import (CLEAN_LEVELS, _CONFIG_LOCK, _norm_proc_name, gb, load_config, log,
+from .config import (CLEAN_BLACKLIST_STEMS, CLEAN_LEVELS, _CONFIG_LOCK, _norm_proc_name, gb,
+                     load_config, log, name_in_blacklist, PROCESS_KILL_PROTECT_STEMS,
                      save_config)
 from .privileges import clean_privileges
 from .winapi import get_mem, is_admin, process_working_sets, visible_window_pids
@@ -160,7 +163,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
                 deepen_rounds: int = 0, low_mem: bool = False,
                 deepen_capped: bool = False,
                 predictive_missed: bool = False,
-                fg_protected: bool = False) -> dict:
+                fg_protected: bool = False,
+                process_killed: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -191,6 +195,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
     作为放宽预测窗口的证据（口径同上）。
     fg_protected=True 时同步累计「前台进程被保护次数」：v1.24.0 起激进档（含升档 /
     粘滞）按 fs_protect 跳过前台进程工作集的清理频次（口径同上）。
+    process_killed=True 时同步累计「结束进程次数」：v1.25.0 起手动结束进程的
+    触发频次，独立于 count/freed（杀进程不写内存清理账本），口径同上（非 0 才落键）。
     """
 
     with _CONFIG_LOCK:
@@ -220,6 +226,8 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
             st["preventive_missed"] = int(st.get("preventive_missed", 0)) + 1
         if fg_protected:
             st[fg.FG_STAT_KEY] = int(st.get(fg.FG_STAT_KEY, 0)) + 1
+        if process_killed:
+            st["process_killed"] = int(st.get("process_killed", 0)) + 1
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
@@ -938,13 +946,93 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive,
                                      low_relief, bool(bg_trimmed), sticky,
                                      deepen_rounds, low_mem, deepen_capped,
-                                     predictive_missed, bool(protect))
+                                     predictive_missed, bool(protect),
+                                     process_killed=False)
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "
         f"(释放 {gb(max(freed, 0))}) | 提交 {before['commit_pct']:.0f}% -> {after['commit_pct']:.0f}% | {result['detail']}")
     return result
 
+
+
+def kill_process(pid: int, name: str | None = None, cfg: dict | None = None) -> dict:
+    """编排式结束单个进程：保护判定 -> TerminateProcess -> 返回结构化结果。
+
+    保护判定顺序（不可跳）：
+      1. PID 0/4：系统保留，拒绝；
+      2. 本进程 os.getpid()：自杀保护，拒绝；
+      3. 前台进程 fg.protected_pid(cfg)：fs_protect 下用户正在用的进程，拒绝；
+      4. 黑名单 name_in_blacklist（含通配符）：系统/关键进程，拒绝；
+      5. process_kill_min_mb 门槛：RSS 低于阈值拒绝，拒杀轻量进程；
+      6. actions.terminate_process 真正下手（内部再核对名防 PID 复用）。
+
+    返回 {"ok": bool, "msg": str, "pid": int, "name": str, "rss": int}。
+    任何异常只记日志、返回 ok=False，绝不抛出、不影响主流程。
+    """
+    result = {"ok": False, "msg": "", "pid": pid, "name": name or "", "rss": 0}
+    cfg = cfg or load_config()
+    try:
+        pid = int(pid)
+        result["pid"] = pid
+    except (TypeError, ValueError):
+        result["msg"] = f"非法 PID {pid!r}"
+        log(f"kill_process: {result['msg']}")
+        return result
+    if pid in (0, 4):
+        result["msg"] = "PID 0/4 是系统保留进程，禁止结束"
+        log(f"kill_process: {result['msg']} (pid={pid})")
+        return result
+    if pid == os.getpid():
+        result["msg"] = "禁止结束本进程（自杀保护）"
+        log(f"kill_process: {result['msg']} (pid={pid})")
+        return result
+    # 前台保护
+    try:
+        prot = fg.protected_pid(cfg)
+    except Exception:
+        prot = None
+    if prot is not None and pid == prot:
+        result["msg"] = "前台进程受保护，禁止结束"
+        log(f"kill_process: {result['msg']} (pid={pid})")
+        return result
+    # 取名 + RSS
+    try:
+        proc = psutil.Process(pid)
+        pname = proc.name() or ""
+        prss = int(proc.memory_info().rss)
+    except Exception:
+        pname = name or ""
+        prss = 0
+    result["name"] = pname
+    result["rss"] = prss
+    # 黑名单（含通配符）
+    if name_in_blacklist(pname, CLEAN_BLACKLIST_STEMS) or name_in_blacklist(
+            pname, PROCESS_KILL_PROTECT_STEMS):
+        result["msg"] = f"进程 {pname} 在保护黑名单内，已跳过"
+        log(f"kill_process: {result['msg']} (pid={pid})")
+        return result
+    # min_mb 门槛（MB 字节比较）
+    min_mb = int(cfg.get("process_kill_min_mb", 64))
+    if prss and prss < min_mb * 1024 * 1024:
+        result["msg"] = f"工作集 {prss / 1024 / 1024:.0f}MB < 下限 {min_mb}MB，已拒绝"
+        log(f"kill_process: {result['msg']} (pid={pid}, name={pname})")
+        return result
+    # 真正结束（terminate_process 内部再核对名防 PID 复用）
+    ok = terminate_process(pid, expected_name=pname)
+    result["ok"] = bool(ok)
+    if ok:
+        result["msg"] = f"已结束进程 {pname} (PID {pid})"
+        log(f"kill_process: {result['msg']}")
+        # 结束进程不计入 count/freed；只累计 process_killed 统计
+        try:
+            _bump_stats(0, process_killed=True)
+        except Exception:
+            pass
+    else:
+        result["msg"] = f"结束进程 {pname} (PID {pid}) 失败"
+        log(f"kill_process: {result['msg']}")
+    return result
 
 def top_processes_list(n: int = 10) -> list:
     """返回物理内存占用最高的 n 个进程 [(name, rss_bytes, pid), ...]。

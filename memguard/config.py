@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import fnmatch
-
 import json
 import os
 import sys
@@ -16,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.24.0"
+__version__ = "1.25.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -123,6 +122,11 @@ DEFAULT_CONFIG = {
     # ---- 前台 / 全屏让路（v1.24.0，对标 ISLC 用户的「游戏不卡」诉求）----
     "fs_pause": True,    # 检测到全屏应用时暂停自动清理（手动清理不受限）
     "fs_protect": True,  # 前台进程不被清空工作集（激进档也跳过它）
+    # ---- 关闭进程（v1.25.0，对标 Mem Reduct 的「结束进程」）：仅用户手动触发，绝不自动杀 ---- 
+    "process_kill_enabled": True,   # 总开关：关闭后托盘/Top10 的「结束进程」全部不可点
+    "process_kill_confirm": True,   # 执行前弹确认对话框，防误杀
+    "process_kill_min_mb": 64,      # 只有工作集 ≥ 该值(MB) 的进程才允许结束，拒杀轻量进程
+
     # ---- 累计统计（由 do_clean 维护并持久化）----
     "stats": {"count": 0, "freed": 0},
 }
@@ -173,6 +177,9 @@ def _blacklist_stems(items) -> set:
 
 CLEAN_BLACKLIST_STEMS = _blacklist_stems(CLEAN_BLACKLIST)
 
+# 关闭进程保护名单：与清理黑名单共用，不要另起一套匹配逻辑（见 §5 依赖方向）。
+PROCESS_KILL_PROTECT_STEMS = CLEAN_BLACKLIST_STEMS
+
 
 def name_in_blacklist(name, stems) -> bool:
     """进程名是否命中黑名单；命中支持 * / ? 通配符（对标 Mem Reduct 的排除列表）。
@@ -185,6 +192,7 @@ def name_in_blacklist(name, stems) -> bool:
     if n in stems:
         return True
     return any(("*" in s or "?" in s) and fnmatch.fnmatchcase(n, s) for s in stems)
+
 
 def _clamp_int(value, low: int, high: int, default: int) -> int:
     """把配置值钳制到 [low, high]；非法值回落到默认值。"""
@@ -219,6 +227,7 @@ _FIELD_SPECS = (
     ("min_avail_mb", 0, 10 ** 7),
     ("scheduled_minutes", 0, 24 * 60),
     ("update_check_hours", 1, 168),
+    ("process_kill_min_mb", 1, 32768),
 )
 
 
@@ -242,6 +251,8 @@ _BOOL_KEYS = (
     "hotkey_enabled",
     "fs_pause",
     "fs_protect",
+    "process_kill_enabled",
+    "process_kill_confirm",
 )
 
 
@@ -335,6 +346,11 @@ def normalize_config(raw) -> dict:
     if raw_stats.get("fg_protected"):
         cfg["stats"]["fg_protected"] = _clamp_int(
             raw_stats.get("fg_protected"), 0, 10 ** 9, 0)
+    # process_killed（v1.25.0 结束进程次数）口径同上：非 0 才落键，没结束过的配置保持原形状
+    # 结束进程不计入 count/freed（那是内存清理账本），只独立累计过程 killed 计数
+    if raw_stats.get("process_killed"):
+        cfg["stats"]["process_killed"] = _clamp_int(
+            raw_stats.get("process_killed"), 0, 10 ** 9, 0)
     return cfg
 
 
@@ -419,3 +435,4 @@ def log(msg: str) -> None:
 
 def gb(n: float) -> str:
     return f"{n / 1024 ** 3:.1f}GB"
+

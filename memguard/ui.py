@@ -16,8 +16,8 @@ import threading
 from PIL import Image, ImageDraw, ImageFont
 
 from .advisor import advice_actions, analyze, format_advice
-from .clean import top_processes, top_processes_list
-from .config import gb, log, update_config
+from .clean import kill_process, top_processes, top_processes_list
+from .config import _norm_proc_name, gb, load_config, log, update_config
 from .winapi import (SM_CXSMICON, get_mem, icon_handle, set_window_class_icons,
                      toplevel_hwnd, user32)
 
@@ -131,6 +131,19 @@ def message_box(title: str, text: str) -> None:
         target=lambda: user32.MessageBoxW(0, text, title, 0x00000000 | 0x00040000),
         daemon=True,
     ).start()
+
+def confirm_box(title: str, text: str) -> bool:
+    """弹 Yes/No 确认对话框：点 Yes 返回 True，点 No/关闭/异常返回 False。
+
+    由「结束进程」调用，防止误杀；异常只记日志，不把确认失败当成杀进程失败。
+    """
+    try:
+        res = user32.MessageBoxW(0, text, title, 0x00000004 | 0x00040000)
+        return res == 6  # IDYES
+    except Exception as e:
+        log(f"confirm_box 异常: {e!r}")
+        return False
+
 # 窗口图标给多个尺寸：标题栏和任务栏按钮各取最接近的一张，不会糊
 _APP_ICON_SIZES = (16, 32, 64)
 _APP_ICON_CACHE: dict = {}
@@ -533,6 +546,38 @@ def show_top_window() -> None:
 
     threading.Thread(target=worker, daemon=True).start()
 
+
+def run_kill(procs, refresh=None) -> None:
+    """Top10 右键「结束选中的进程」的判定流程：总开关 -> 确认框 -> 逐个结束 -> 汇报。
+
+    procs 是 [(name, pid), ...]（同一名字的多个实例一起结束）。整段抽成模块级函数
+    是为了让保护判定可被直接测试——闭包在 tk 里，测试碰不到。任何一步只弹提示、
+    不抛异常：选中的进程已经被用户明确点过一次了。
+    """
+    cfg = load_config()
+    if not bool(cfg.get("process_kill_enabled", True)):
+        message_box("结束进程", "「关闭进程」功能已关闭，请在托盘菜单中打开后再试。")
+        return
+    names = {nm for nm, _ in procs}
+    if len(names) == 1:
+        prompt = f"确定要结束进程「{next(iter(names))}」及其 {len(procs)} 个实例吗？"
+    else:
+        prompt = f"确定要结束选中的 {len(procs)} 个进程吗？"
+    if cfg.get("process_kill_confirm", True) and not confirm_box("MemGuard - 结束进程", prompt):
+        return
+    ok_list, fail_list = [], []
+    for nm, pid in procs:
+        r = kill_process(pid, nm, cfg)
+        (ok_list if r.get("ok") else fail_list).append((nm, pid, r.get("msg", "")))
+    lines = []
+    if ok_list:
+        lines.append("已结束：" + "，".join(f"{nm}(PID {pid})" for nm, pid, _ in ok_list))
+    if fail_list:
+        lines.append("失败：" + "，".join(f"{nm}(PID {pid}): {msg}" for nm, pid, msg in fail_list))
+    message_box("MemGuard - 结束结果", "\n".join(lines) if lines else "没有可结束的进程。")
+    if refresh is not None:
+        refresh()
+
 def _build_top(tk, ttk) -> None:
     root = tk.Tk()
     root.title("MemGuard - 内存占用 Top10")
@@ -554,19 +599,44 @@ def _build_top(tk, ttk) -> None:
         table.heading(col, text=text)
         table.column(col, width=w, anchor=anchor)
     table.pack(fill="both", expand=True, padx=12)
+
+    # 右键「结束选中的进程」菜单（Top10 窗口操作入口）
+    popup = tk.Menu(root, tearoff=0)
+
+    def on_kill() -> None:
+        sel = table.selection()
+        if not sel:
+            return
+        procs = item_procs.get(sel[0], [])
+        if not procs:
+            return
+        run_kill(procs, refresh)
+
+    popup.add_command(label="结束选中的进程", command=on_kill)
+    table.bind("<Button-3>", lambda e: popup.tk_popup(e.x_root, e.y_root))
     for i in range(10):
         table.tag_configure("odd" if i % 2 else "even",
                             background="#f7f9fb" if i % 2 else "#ffffff")
 
+    item_procs: dict = {}
 
     def refresh() -> None:
         st = get_mem()
         bars, detail, free = _mem_lines(st)
         header.config(text=f"物理内存 {bars[0]}    提交内存 {bars[1]}\n{detail}\n{free}")
         table.delete(*table.get_children())
-        for i, values in enumerate(_table_rows(_top_grouped(10), st["total_phys"])):
-            table.insert("", "end", values=(i + 1,) + values,
-                         tags=(("odd" if i % 2 else "even"),))
+        item_procs.clear()
+        rows = _top_grouped(10)
+        raw = top_processes_list(40)
+        for i, values in enumerate(_table_rows(rows, st["total_phys"])):
+            item = table.insert("", "end", values=(i + 1,) + values,
+                                tags=(("odd" if i % 2 else "even"),))
+            shown = str(values[0])
+            base = shown.split(" ×")[0]
+            # 保留原始行数据：按名字匹配所有实例的 (name, pid)，避免组行「最大 PID」
+            # 导致杀错进程或只杀掉其中一个实例（见 memguard/ui.py 右键结束进程语义）。
+            item_procs[item] = [(nm, pid) for nm, _rss, pid in raw
+                                if _norm_proc_name(nm) == _norm_proc_name(base)]
 
     ttk.Button(root, text="刷新", command=refresh).pack(pady=8)
     refresh()

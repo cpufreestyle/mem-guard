@@ -294,7 +294,7 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     monkeypatch.setattr(clean, "_bump_stats",
                         lambda freed, escalated=False, targeted=False, preventive=False,
                         short_relief=False, bg_trimmed=False, sticky=False,
-                        deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False:
+                        deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False:
                             {"count": 9, "freed": freed})
     monkeypatch.setattr(clean, "log", lambda msg: None)   # 别往真实日志文件里写测试噪声
 
@@ -469,7 +469,7 @@ def test_do_clean_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False:
+               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -486,7 +486,7 @@ def test_do_clean_no_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False:
+               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -609,7 +609,7 @@ def test_do_clean_target_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append(targeted)
         return {"count": 9, "freed": freed}
 
@@ -771,7 +771,7 @@ def test_do_clean_deepen_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append(deepen_rounds)
         return {"count": 9, "freed": freed}
 
@@ -872,7 +872,7 @@ def test_do_clean_deepen_stats_count_rounds(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append(deepen_rounds)
         return {"count": 9, "freed": freed}
 
@@ -1192,7 +1192,7 @@ def test_do_clean_passes_preventive_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append(preventive)
         return {"count": 9, "freed": freed}
 
@@ -1223,7 +1223,7 @@ def test_do_clean_passes_low_relief_to_stats(monkeypatch):
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
-                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append((short_relief, low_mem))
         return {"count": 9, "freed": freed}
 
@@ -1252,7 +1252,7 @@ def test_do_clean_passes_low_mem_to_stats(monkeypatch):
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
-                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append((short_relief, low_mem))
         return {"count": 9, "freed": freed}
 
@@ -1270,7 +1270,7 @@ def test_do_clean_passes_predictive_missed_to_stats(monkeypatch):
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
                    deepened=False, low_mem=False, deepen_capped=False,
-                   predictive_missed=False, fg_protected=False):
+                   predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append(predictive_missed)
         return {"count": 9, "freed": freed}
 
@@ -1404,7 +1404,7 @@ def test_do_clean_passes_bg_trimmed_to_stats(monkeypatch):
     ]
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append(bg_trimmed)
         return {"count": 9, "freed": freed}
 
@@ -1658,7 +1658,7 @@ def test_do_clean_sticky_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append(sticky)
         return {"count": 9, "freed": freed}
 
@@ -2089,7 +2089,7 @@ def test_do_clean_passes_deepen_capped_to_stats(monkeypatch):
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
-                   deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
+                   deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False, process_killed=False):
         seen.append(deepen_capped)
         return {"count": 9, "freed": freed}
 
