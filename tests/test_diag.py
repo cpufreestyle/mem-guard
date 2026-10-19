@@ -81,6 +81,35 @@ def test_adaptive_trace_has_one_line_per_adapter(monkeypatch, tmp_path):
     assert "开关 on" in joined, "没配过的开关按缺省开算"
 
 
+def test_export_includes_guard_status(monkeypatch, tmp_path):
+    """守护状态三行 + 用户空闲秒数进 zip：现场报告不必再问「热键生没生效」。"""
+    _fake_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(diag.idle, "idle_seconds", lambda: 1900.0)
+    lines = ["全局热键：Ctrl+Alt+M→立即清理", "全屏让路：开（未暂停）",
+             "前台进程保护：开"]
+    path = diag.export_diagnostics(lines)
+    assert not path.startswith("ERR:"), path
+    with zipfile.ZipFile(path) as z:
+        txt = z.read("diagnostics.txt").decode("utf-8")
+    assert "--- 守护状态 ---" in txt
+    for line in lines:
+        assert line in txt
+    assert "用户空闲: 1900 秒" in txt
+    assert "notify_idle_sec=300" in txt
+
+
+def test_export_without_status_lines_still_works(monkeypatch, tmp_path):
+    """调用方没给（旧调用点 / 手动跑脚本）也要出 zip，只少那三行。"""
+    _fake_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(diag.idle, "idle_seconds", lambda: None)
+    path = diag.export_diagnostics()
+    assert not path.startswith("ERR:"), path
+    with zipfile.ZipFile(path) as z:
+        txt = z.read("diagnostics.txt").decode("utf-8")
+    assert "--- 守护状态 ---" in txt
+    assert "用户空闲: 未知" in txt
+
+
 def test_export_survives_missing_config_and_log(monkeypatch, tmp_path):
     """配置文件 / 日志不在时也要出得了 zip，只少两个附件。"""
     _fake_env(monkeypatch, tmp_path, with_config=False, with_log=False)

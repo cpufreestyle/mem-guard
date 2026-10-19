@@ -131,7 +131,6 @@ def message_box(title: str, text: str) -> None:
         target=lambda: user32.MessageBoxW(0, text, title, 0x00000000 | 0x00040000),
         daemon=True,
     ).start()
-
 # 窗口图标给多个尺寸：标题栏和任务栏按钮各取最接近的一张，不会糊
 _APP_ICON_SIZES = (16, 32, 64)
 _APP_ICON_CACHE: dict = {}
@@ -256,7 +255,25 @@ def _mem_lines(s: dict) -> tuple:
     return bars, detail, free
 
 
-def _overview_text(rows=None) -> str:
+def _guard_lines(hooks: dict) -> list:
+    """「守护状态」行：全局热键 / 全屏让路 / 前台保护的当前状态（v1.24.0）。
+
+    纯函数：只认 hooks["status"]（tray 注入的回调），拿不到就返回空列表——
+    概览窗与无 tkinter 的回退文案共用这一份口径，两边不会说不同的话。
+    """
+    if not isinstance(hooks, dict):
+        return []
+    getter = hooks.get("status")
+    if not callable(getter):
+        return []
+    try:
+        lines = [str(x) for x in (getter() or []) if str(x).strip()]
+    except Exception:
+        return []
+    return lines
+
+
+def _overview_text(rows=None, hooks: dict | None = None) -> str:
     """概览纯文本版：无 tkinter 时的回退，也供测试断言内容。"""
     s = get_mem()
     bars, detail, free = _mem_lines(s)
@@ -265,6 +282,10 @@ def _overview_text(rows=None) -> str:
                                          else top_processes_list(5), start=1):
         share = rss / s["total_phys"] * 100 if s["total_phys"] else 0
         lines.append(f"{i}. {name[:26]:<26} {gb(rss):>7}  {share:4.1f}%  PID {pid}")
+    guards = _guard_lines(hooks or {})
+    if guards:
+        lines.append("-" * 46)
+        lines.extend(guards)
     return "\n".join(lines)
 
 
@@ -337,12 +358,12 @@ def show_overview_window(hooks: dict) -> None:
             from tkinter import ttk
         except Exception:
             _overview_window_open = False
-            message_box("MemGuard - 内存概览", _overview_text())
+            message_box("MemGuard - 内存概览", _overview_text(hooks=hooks))
             return
         try:
             _build_overview(tk, ttk, hooks)
         except Exception as e:
-            message_box("MemGuard - 内存概览", f"窗口打开失败：{e!r}\n\n" + _overview_text())
+            message_box("MemGuard - 内存概览", f"窗口打开失败：{e!r}\n\n" + _overview_text(hooks=hooks))
         finally:
             _overview_window_open = False
 
@@ -405,6 +426,12 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
         detail_lbl.config(text=detail_text)
         free.config(text=free_text)
 
+        if guard_label is not None:
+            try:
+                guard_label.config(text="  ".join(_guard_lines(hooks)))
+            except Exception:
+                pass
+
         if with_table:
             rows = _top_grouped(5)
             stats["rows"] = rows
@@ -422,6 +449,17 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
                ).pack(side="left", padx=6)
     ttk.Button(btns, text="优化建议",
                command=lambda: hooks.get("advice") and hooks["advice"]()).pack(side="left")
+
+    # 守护状态行（v1.24.0）：把全局热键 / 全屏让路 / 前台保护的当前状态摆在最显眼处，
+    # 用户不必为了确认「热键到底生没生效」再翻一遍右键菜单
+    guard_label = None
+    if _guard_lines(hooks):
+        try:
+            guard_label = ttk.Label(root, text="  ".join(_guard_lines(hooks)),
+                                    foreground="#5a6472", padding=(12, 0))
+            guard_label.pack(fill="x")
+        except Exception:
+            guard_label = None
 
     refresh()
 
@@ -495,7 +533,6 @@ def show_top_window() -> None:
 
     threading.Thread(target=worker, daemon=True).start()
 
-
 def _build_top(tk, ttk) -> None:
     root = tk.Tk()
     root.title("MemGuard - 内存占用 Top10")
@@ -520,6 +557,7 @@ def _build_top(tk, ttk) -> None:
     for i in range(10):
         table.tag_configure("odd" if i % 2 else "even",
                             background="#f7f9fb" if i % 2 else "#ffffff")
+
 
     def refresh() -> None:
         st = get_mem()

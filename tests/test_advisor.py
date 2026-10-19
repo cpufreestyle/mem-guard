@@ -12,6 +12,34 @@ from memguard.config import DEFAULT_CONFIG, normalize_config
 GB = 1024 ** 3
 
 
+def test_v24_advises_turning_the_new_switches_back_on():
+    """v1.24.0 三个默认开的开关被关掉时，建议引擎要说出代价并给一键应用。"""
+    cfg = normalize_config({"fs_pause": False, "fs_protect": False,
+                           "hotkey_enabled": False})
+    items = advisor.analyze(cfg, mem=_mem(), top=[])
+    titles = [i["title"] for i in items]
+    assert "全屏应用时暂停自动清理已关闭" in titles
+    assert "前台进程保护已关闭" in titles
+    assert "全局热键已关闭" in titles
+    acts = {a["label"]: a["changes"] for a in advisor.advice_actions(items)}
+    assert acts["开启全屏让路"] == {"fs_pause": True}
+    assert acts["开启前台保护"] == {"fs_protect": True}
+    assert acts["开启全局热键"] == {"hotkey_enabled": True}
+
+
+def test_v24_no_guard_advice_when_switches_are_on():
+    cfg = normalize_config({})
+    titles = [i["title"] for i in advisor.analyze(cfg, mem=_mem(), top=[])]
+    assert "全屏应用时暂停自动清理已关闭" not in titles
+    assert "前台进程保护已关闭" not in titles
+    assert "全局热键已关闭" not in titles
+    labels = [a["label"] for a in
+              advisor.advice_actions(advisor.analyze(cfg, mem=_mem(), top=[]))]
+    assert "开启全屏让路" not in labels
+    assert "开启前台保护" not in labels
+    assert "开启全局热键" not in labels
+
+
 def _mem(phys_pct=50.0, commit_pct=60.0, total_phys=16 * GB, avail_phys=8 * GB,
          total_commit=32 * GB, avail_commit=16 * GB):
     return {

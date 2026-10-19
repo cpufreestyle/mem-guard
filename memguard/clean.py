@@ -14,6 +14,7 @@ import time
 
 import psutil
 
+from . import foreground as fg
 from .actions import (
     clear_system_file_cache,
     empty_background_working_sets,
@@ -142,12 +143,24 @@ def _wait_avail_rise(before: dict) -> dict:
     return after
 
 
+def _gain(after: dict) -> tuple:
+    """结算一个阶梯阶段的收益：等一次回补，返回 (最新采样, 本级释放字节数)。
+
+    传进来的 after 必须是**动手之前**那次采样——基线取在动手之后就等于拿最终采样
+    减它自己，本级收益恒为 0（升档一级曾长期如此）。四个阶段共用这一处口径，
+    「哪一级真的清出了东西」才可比；返回的最新采样供下一级与升档判断继续用。
+    """
+    new = _wait_avail_rise(after)
+    return new, max(new["avail_phys"] - after["avail_phys"], 0)
+
+
 def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
                 preventive: bool = False, short_relief: bool = False,
                 bg_trimmed: bool = False, sticky: bool = False,
                 deepen_rounds: int = 0, low_mem: bool = False,
                 deepen_capped: bool = False,
-                predictive_missed: bool = False) -> dict:
+                predictive_missed: bool = False,
+                fg_protected: bool = False) -> dict:
     """累计清理次数与释放量并落盘（对标 Mem Reduct 的统计），返回写入口径。
 
     在 _CONFIG_LOCK 内重新读盘再改：do_clean 开头读的那份配置可能已被菜单勾选
@@ -176,7 +189,10 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
     predictive_missed=True 时同步累计「预防式清理没防住次数」：v1.21.0 起预防式清理
     后压力仍很快复发（距上次清理比当时预测的触阈时间还短，见 tray._note_relief），
     作为放宽预测窗口的证据（口径同上）。
+    fg_protected=True 时同步累计「前台进程被保护次数」：v1.24.0 起激进档（含升档 /
+    粘滞）按 fs_protect 跳过前台进程工作集的清理频次（口径同上）。
     """
+
     with _CONFIG_LOCK:
         cfg = load_config()
         st = cfg.get("stats") or {}
@@ -202,12 +218,14 @@ def _bump_stats(freed: int, escalated: bool = False, targeted: bool = False,
             st["deepen_capped"] = int(st.get("deepen_capped", 0)) + 1
         if predictive_missed:
             st["preventive_missed"] = int(st.get("preventive_missed", 0)) + 1
+        if fg_protected:
+            st[fg.FG_STAT_KEY] = int(st.get(fg.FG_STAT_KEY, 0)) + 1
         cfg["stats"] = st
         save_config(cfg)
         return dict(st)
 
 
-def _run_clean_actions(aggressive: bool, areas: dict, blacklist) -> tuple:
+def _run_clean_actions(aggressive: bool, areas: dict, blacklist, protect_pids=()) -> tuple:
     """在「用完即关」的特权窗口内执行全部清理动作。
 
     返回 (detail, core, failed_privs)：detail 是人看的明细文案，core 是参与整体
@@ -248,9 +266,12 @@ def _run_clean_actions(aggressive: bool, areas: dict, blacklist) -> tuple:
             r_lp = purge_low_priority_standby()
             detail.append(f"清理低优先级Standby:{_status(r_lp)}")
 
+        protect = tuple(int(p) for p in (protect_pids or ()) if p)
         if aggressive:
-            n, skipped = empty_process_working_sets(blacklist)
-            detail.append(f"进程工作集:{n} 个" + (f"（白名单跳过 {skipped}）" if skipped else ""))
+            n, skipped = empty_process_working_sets(blacklist, protect)
+            detail.append(f"进程工作集:{n} 个"
+                          + (f"（白名单跳过 {skipped}）" if skipped else "")
+                          + (f"（前台保护 {len(protect)}）" if protect else ""))
         else:
             detail.append("进程工作集:已跳过(保守档)")
 
@@ -718,10 +739,18 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         lvl = "aggressive"
     bl = cfg.get("user_blacklist") if user_blacklist is None else user_blacklist
     areas = cfg.get("clean_areas") or {}
+    # v1.24.0 前台进程保护（fs_protect）：要清进程工作集的档位都会经过这里，
+    # 但用户正在用的那个进程一个页都不该动——正在被访问的页全在它工作集里，
+    # 清了就是一次卡顿。取不到前台 PID 时为空，行为与旧版完全一致。
+    protect = ()
+    if aggressive:
+        fg_pid = fg.protected_pid(cfg)
+        if fg_pid:
+            protect = (fg_pid,)
 
     # before 必须在动手前采样，否则"释放了多少"无从算起
     before = get_mem()
-    detail, core, failed_privs = _run_clean_actions(aggressive, areas, bl)
+    detail, core, failed_privs = _run_clean_actions(aggressive, areas, bl, protect)
     if sticky:
         detail.append("粘滞激进(持续高压)")
 
@@ -754,14 +783,12 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         except Exception:
             cands = []
         if cands:
-            pre = after["avail_phys"]
             n, skipped = _run_target_clean(cands, bl)
             names = "、".join(f"{name} {gb(rss)}" for name, rss, _ in cands)
             if n:
                 # 采纳定向：再等一次把回补计入，供下面的升档判断复用最新 after
-                after = _wait_avail_rise(after)
+                after, targeted_freed = _gain(after)
                 targeted = list(cands)
-                targeted_freed = max(after["avail_phys"] - pre, 0)
                 detail.append(f"定向清理大户({names}): {n} 个"
                               + (f"（跳过 {skipped}）" if skipped else ""))
             else:
@@ -798,15 +825,13 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
                      if int(c[2]) not in {int(p) for _, _, p in targeted}]
             if not extra:
                 break               # 没有还没碰过的候选：再撒也是空转
-            pre = after["avail_phys"]
             n, skipped = _run_target_clean(extra, bl)
             if not n:
                 detail.append(f"定向加深(第 {rnd} 轮): 未成功")
                 break               # 清不动：照常走后面的后台级与升档
             # 采纳加深：再等一次把回补计入，供后面的后台/升档判断复用最新 after
-            after = _wait_avail_rise(after)
+            after, round_freed = _gain(after)
             targeted = list(targeted) + extra
-            round_freed = max(after["avail_phys"] - pre, 0)
             deepen_freed += round_freed
             targeted_freed += round_freed
             deepened += n
@@ -854,15 +879,13 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         else:
             # v1.14.0 后台级去重：定向/加深已经逐个清过的进程，后台这一级别再碰一遍
             exclude = set(exclude) | {int(p) for _, _, p in targeted}
-            pre = after["avail_phys"]
             try:
                 bg_trimmed, skipped = _run_bg_trim(exclude, bl)
             except Exception:
                 bg_trimmed, skipped = 0, 0
             if bg_trimmed:
                 # 采纳后台清理：再等一次把回补计入，供下面的升档判断复用最新 after
-                after = _wait_avail_rise(after)
-                bg_freed = max(after["avail_phys"] - pre, 0)
+                after, bg_freed = _gain(after)
                 detail.append(f"后台进程工作集:{bg_trimmed} 个"
                               + (f"（跳过 {skipped}）" if skipped else ""))
             else:
@@ -871,16 +894,14 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     # 自动升档：保守清理后若仍超阈值，立即补一次激进清理（最多一次、带开关、最小打扰）
     if (not aggressive and bool(cfg.get("escalate_clean", True))
             and _still_pressured(after, cfg)):
-        detail2, core2, _ = _run_clean_actions(True, areas, bl)
+        detail2, core2, _ = _run_clean_actions(True, areas, bl, protect)
         # 第二遍核心操作全部失败就不记升档，只在日志里留痕，保留第一次的保守结果
         if core2 and all(rc != 0 for rc in core2):
             log(f"{reason}升档未采纳 | 二次激进清理核心操作全部失败 | " + ", ".join(detail2))
         else:
             # 采纳升档：再等一次把激进清理的回补计入；整体释放量按 before->最终 after 合计
-            after = _wait_avail_rise(after)
-            pre = after["avail_phys"]
+            after, escalated_freed = _gain(after)
             escalated = True
-            escalated_freed = max(after["avail_phys"] - pre, 0)
             lvl = "aggressive"
             detail.append("升档重效(激进)")
             detail.extend(detail2)
@@ -917,7 +938,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
         result["stats"] = _bump_stats(freed, escalated, bool(targeted), preventive,
                                      low_relief, bool(bg_trimmed), sticky,
                                      deepen_rounds, low_mem, deepen_capped,
-                                     predictive_missed)
+                                     predictive_missed, bool(protect))
     except Exception:
         pass
     log(f"{reason}清理 | 可用物理 {gb(before['avail_phys'])} -> {gb(after['avail_phys'])} "

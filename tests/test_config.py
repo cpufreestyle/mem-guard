@@ -43,6 +43,30 @@ def test_norm_proc_name(raw, expected):
     assert _norm_proc_name(raw) == expected
 
 
+def test_normalize_config_notify_idle_sec_clamped():
+    """人不在就不打扰（v1.24.0）：阈值 0=关闭，上限一天，脏值回落默认。"""
+    assert normalize_config({})["notify_idle_sec"] == 300
+    assert normalize_config({"notify_idle_sec": 999999})["notify_idle_sec"] == 86400
+    assert normalize_config({"notify_idle_sec": -5})["notify_idle_sec"] == 0
+    assert normalize_config({"notify_idle_sec": 0})["notify_idle_sec"] == 0
+    assert normalize_config({"notify_idle_sec": "x"})["notify_idle_sec"] == 300
+
+
+def test_name_in_blacklist_supports_wildcards():
+    """白名单支持 * / ? 通配符（v1.24.0，对标 Mem Reduct 的排除列表）。"""
+    stems = _blacklist_stems(["*chrome*", "code", "*edge*"])
+    assert config.name_in_blacklist("Chrome.exe", stems) is True
+    assert config.name_in_blacklist("chrome_helper.exe", stems) is True
+    assert config.name_in_blacklist("notchrome.exe", stems) is True  # *chrome* 含 chrome 即命中
+    assert config.name_in_blacklist("firefox.exe", stems) is False
+    assert config.name_in_blacklist("Code.EXE", stems) is True
+    assert config.name_in_blacklist("msedge.exe", stems) is True
+    assert config.name_in_blacklist("p.exe", stems) is False
+    # 普通名字仍走精确匹配：通配符不该让白名单变成「全都命中」
+    assert config.name_in_blacklist("csrss.exe", config.CLEAN_BLACKLIST_STEMS) is True
+    assert config.name_in_blacklist("p.exe", config.CLEAN_BLACKLIST_STEMS) is False
+
+
 def test_blacklist_stems_filters_and_normalizes():
     assert _blacklist_stems(["Chrome.EXE", "chrome", 123, "", None]) == {"chrome"}
     assert _blacklist_stems(None) == set()
@@ -598,6 +622,27 @@ def test_default_config_v22_keys_present():
     d = normalize_config({})
     assert d["threshold_adapt"] is True
     assert d["threshold_adapt_done"] == 0, "下调计数：0=从未降过"
+
+
+def test_default_config_v24_keys_present():
+    """v1.24.0：全局热键 + 前台 / 全屏让路两组键都要在默认配置里。"""
+    for k in ("hotkey_enabled", "hotkey_clean", "hotkey_overview", "hotkey_auto",
+              "fs_pause", "fs_protect"):
+        assert k in DEFAULT_CONFIG, k
+    assert DEFAULT_CONFIG["hotkey_clean"] == "ctrl+alt+m"
+    assert DEFAULT_CONFIG["fs_pause"] is True
+
+
+def test_normalize_config_hotkey_and_fullscreen_coercion():
+    assert normalize_config({"hotkey_enabled": "x"})["hotkey_enabled"] is True
+    assert normalize_config({"fs_pause": 0})["fs_pause"] is False
+    assert normalize_config({"fs_protect": None})["fs_protect"] is False
+    # 键位串统一小写规范形；显式空串保留（用户就是要单独关掉那一条）
+    assert normalize_config({"hotkey_clean": " Ctrl + Alt + M "})["hotkey_clean"] == "ctrl+alt+m"
+    assert normalize_config({"hotkey_overview": ""})["hotkey_overview"] == ""
+    # fg_protected 计数：非 0 才落盘，没保护过的配置保持原两键形状
+    assert normalize_config({"stats": {"fg_protected": 7}})["stats"]["fg_protected"] == 7
+    assert "fg_protected" not in normalize_config({"stats": {}})["stats"]
 
 
 def test_normalize_config_threshold_adapt_coercion():

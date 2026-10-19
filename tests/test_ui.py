@@ -238,6 +238,26 @@ def test_overview_text_includes_summary_and_top(monkeypatch):
 # ------------------------------------------------ 无 tkinter 的回退（不弹窗）
 
 
+def test_guard_lines_only_react_to_the_status_hook():
+    """没有 status 钩子就一个字都不多加：老调用方（菜单 / 一次性调用）行为不变。"""
+    assert ui._guard_lines({}) == []
+    assert ui._guard_lines(None) == []
+    assert ui._guard_lines({"status": None}) == []
+    assert ui._guard_lines({"status": lambda: ["全屏让路：开"]}) == ["全屏让路：开"]
+    assert ui._guard_lines({"status": lambda: [" ", ""]}) == []
+    assert ui._guard_lines({"status": lambda: 1 / 0}) == [], "状态回调炸了也不能拖垮概览"
+
+
+def test_overview_text_appends_guard_lines(monkeypatch):
+    """回退文案底部带上守护状态：确认热键生没生效不必再翻菜单。"""
+    _stub_sys(monkeypatch)
+    plain = _overview_text()
+    text = _overview_text(hooks={"status": lambda: ["全屏让路：开（未暂停）"]})
+    assert text.startswith(plain)
+    assert "全屏让路：开（未暂停）" in text
+    assert _overview_text(hooks={}) == plain
+
+
 def test_overview_falls_back_to_messagebox_without_tkinter(monkeypatch):
     monkeypatch.setitem(sys.modules, "tkinter", None)
     _stub_sys(monkeypatch)

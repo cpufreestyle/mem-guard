@@ -28,6 +28,46 @@ def _quiet(monkeypatch, argv):
     monkeypatch.setattr(sys, "argv", list(argv))
 
 
+def test_status_prints_memory_and_guard_state(monkeypatch, capsys):
+    """--status 只读：内存概况 + 守护状态三行，不起托盘也不清理。"""
+    _quiet(monkeypatch, ["mem_guard.py", "--status"])
+    monkeypatch.setattr(cli, "get_mem", lambda: {
+        "phys_pct": 81.5, "commit_pct": 62.0,
+        "used_phys": 13 * 1024 ** 3, "total_phys": 16 * 1024 ** 3,
+        "avail_phys": 3 * 1024 ** 3,
+        "used_commit": 10 * 1024 ** 3, "total_commit": 24 * 1024 ** 3,
+        "avail_commit": 14 * 1024 ** 3})
+    monkeypatch.setattr(cli.idle, "idle_seconds", lambda: 42.0)
+    monkeypatch.setattr(cli, "load_config", lambda: {"notify_idle_sec": 300})
+
+    class _G:
+        def _status_lines(self):
+            return ["全局热键：Ctrl+Alt+M→立即清理", "全屏让路：开（未暂停）",
+                    "前台进程保护：开"]
+
+    monkeypatch.setattr(cli, "Guard", _G)
+    started = []
+    monkeypatch.setattr(cli, "Guard", lambda: started.append(1) or _G())
+
+    assert cli.status() == 0
+    out = capsys.readouterr().out
+    assert "物理内存" in out and "提交内存" in out
+    assert "用户空闲  42 秒" in out
+    assert "Ctrl+Alt+M→立即清理" in out
+    assert "前台进程保护：开" in out
+
+
+def test_status_flag_exits_without_starting_the_tray(monkeypatch):
+    _quiet(monkeypatch, ["mem_guard.py", "--status"])
+    monkeypatch.setattr(cli, "status", lambda: 0)
+    ran = []
+    monkeypatch.setattr(cli, "Guard", lambda: ran.append(1))
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert ran == [], "--status 只读，绝不把托盘拉起来"
+
+
 def test_show_start_signals_running_instance(monkeypatch):
     """已有实例时 --show 只负责唤窗：发完信号静默退场，不再弹「已在运行」。"""
     _quiet(monkeypatch, ["mem_guard.py", "--show"])

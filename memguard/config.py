@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import fnmatch
+
 import json
 import os
 import sys
@@ -14,7 +16,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.23.0"
+__version__ = "1.24.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -92,6 +94,8 @@ DEFAULT_CONFIG = {
     "user_blacklist": [],    # 额外跳过清空工作集的进程名，如 ["chrome", "code.exe"]（不区分大小写）
     "warn_margin": 15,       # 距阈值还差多少个百分点时先弹预警(0=关闭预警)
     "advice_refresh_sec": 60,  # 后台刷新「优化建议条数」的最小间隔(秒)，越低越跟手但越费 CPU
+    # ---- 人不在就不打扰（v1.24.0）：超过这个空闲秒数的通知只记账，回来时汇总成一条 ----
+    "notify_idle_sec": 300,
     # ---- 清理触发方式（对标 Mem Reduct / WinMemoryCleaner）----
     "min_avail_mb": 0,       # 可用物理内存低于该值(MB)也触发清理；0=关闭
     "scheduled_minutes": 0,  # 每隔 N 分钟主动清理一次（不看内存占用）；0=关闭
@@ -111,11 +115,26 @@ DEFAULT_CONFIG = {
     "last_update_check": 0,     # 上次检查时间戳(epoch 秒)，程序维护
     "update_notified_tag": "",  # 已气泡提醒过的版本 tag，去重
     "verify_update_sha256": True,  # 下载更新包后先比对 Release 的 sha256 清单；默认开，关掉就不再校验
+    # ---- 全局热键（v1.24.0，对标 Mem Reduct / ISLC：一键清理不必点右键菜单）----
+    "hotkey_enabled": True,    # 总开关；把某个键位留空即单独关掉那一条
+    "hotkey_clean": "ctrl+alt+m",     # 立即清理一次
+    "hotkey_overview": "ctrl+alt+o",  # 打开内存概览窗口
+    "hotkey_auto": "ctrl+alt+p",      # 切换自动清理开关
+    # ---- 前台 / 全屏让路（v1.24.0，对标 ISLC 用户的「游戏不卡」诉求）----
+    "fs_pause": True,    # 检测到全屏应用时暂停自动清理（手动清理不受限）
+    "fs_protect": True,  # 前台进程不被清空工作集（激进档也跳过它）
     # ---- 累计统计（由 do_clean 维护并持久化）----
     "stats": {"count": 0, "freed": 0},
 }
 
 CLEAN_LEVELS = ("conservative", "aggressive")
+
+# 全局热键动作名 → 默认键位（小写规范形 "ctrl+alt+m"，解析见 hotkeys.parse_hotkey）
+HOTKEY_DEFAULTS = {
+    "clean": "ctrl+alt+m",
+    "overview": "ctrl+alt+o",
+    "auto": "ctrl+alt+p",
+}
 
 # 单次定向清理最多精确清空的进程数（target_clean_top 的钳制上限）
 TARGET_CLEAN_TOP_MAX = 10
@@ -155,6 +174,18 @@ def _blacklist_stems(items) -> set:
 CLEAN_BLACKLIST_STEMS = _blacklist_stems(CLEAN_BLACKLIST)
 
 
+def name_in_blacklist(name, stems) -> bool:
+    """进程名是否命中黑名单；命中支持 * / ? 通配符（对标 Mem Reduct 的排除列表）。
+
+    通配符单独挑出来 fnmatch：普通名字仍走集合精确匹配（热路径上多一个 any 都不必），
+    带 * / ? 的条目才逐条比对。白名单条目同样经 _blacklist_stems 归一（去 .exe、小写），
+    所以 "*CHROME*" 与 "chrome" 两种写法都对 chrome.exe 生效。
+    """
+    n = _norm_proc_name(name)
+    if n in stems:
+        return True
+    return any(("*" in s or "?" in s) and fnmatch.fnmatchcase(n, s) for s in stems)
+
 def _clamp_int(value, low: int, high: int, default: int) -> int:
     """把配置值钳制到 [low, high]；非法值回落到默认值。"""
     try:
@@ -175,6 +206,7 @@ _FIELD_SPECS = (
     ("debounce_sec", 0, 3600),
     ("warn_margin", 0, 50),
     ("advice_refresh_sec", 15, 600),
+    ("notify_idle_sec", 0, 86400),
     ("target_clean_min_mb", 128, 32768),
     ("target_clean_top", 1, TARGET_CLEAN_TOP_MAX),
     ("predict_window_min", 1, 60),
@@ -207,6 +239,9 @@ _BOOL_KEYS = (
     "auto_update",
     "auto_install",
     "verify_update_sha256",
+    "hotkey_enabled",
+    "fs_pause",
+    "fs_protect",
 )
 
 
@@ -241,6 +276,13 @@ def normalize_config(raw) -> dict:
     cfg["clean_areas"] = {
         k: bool(raw_areas.get(k, DEFAULT_CONFIG["clean_areas"][k])) for k in CLEAN_AREA_KEYS
     }
+    # 全局热键键位：统一成小写规范形；显式空串保留（用户就是要关掉这一条）。
+    # 合不合法不在配置层判断（键位解析在 hotkeys，config 只依赖 adapters），
+    # 真到注册时由 hotkeys.action_specs 逐条校验并跳过，绝不静默乱注册。
+    for _name in HOTKEY_DEFAULTS:
+        _key = "hotkey_" + _name
+        cfg[_key] = "+".join(p for p in (
+            t.strip().lower() for t in str(cfg.get(_key, "") or "").split("+")) if p)
     # 自动更新的时间戳与已提醒 tag：间隔和开关已在 _FIELD_SPECS / _BOOL_KEYS 里钳过
     try:
         cfg["last_update_check"] = max(0.0, float(cfg.get("last_update_check") or 0))
@@ -289,6 +331,10 @@ def normalize_config(raw) -> dict:
     if raw_stats.get("preventive_missed"):
         cfg["stats"]["preventive_missed"] = _clamp_int(
             raw_stats.get("preventive_missed"), 0, 10 ** 9, 0)
+    # fg_protected（v1.24.0 前台进程被保护的清理次数）口径同上：非 0 才落键
+    if raw_stats.get("fg_protected"):
+        cfg["stats"]["fg_protected"] = _clamp_int(
+            raw_stats.get("fg_protected"), 0, 10 ** 9, 0)
     return cfg
 
 

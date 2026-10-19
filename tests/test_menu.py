@@ -859,3 +859,30 @@ def test_verify_sha256_toggle_writes_current_config(monkeypatch):
     assert item.checked is False
     item(guard.icon)
     assert merged[-1] == {"verify_update_sha256": True}
+
+
+def test_v24_toggles_present_and_write_increments(monkeypatch):
+    """v1.24.0 三个新开关都要在菜单里，且只提交自己那一键。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+    guard = _FakeGuard()
+    tree = build_menu(guard)
+    for label, key in (
+        ("全局热键（一键清理/概览/自动清理）", "hotkey_enabled"),
+        ("全屏应用时暂停自动清理", "fs_pause"),
+        ("保护前台进程（不清空工作集）", "fs_protect"),
+    ):
+        item = _find_item(tree, label)
+        assert item.checked is True, label
+        item(guard.icon)
+        assert merged[-1] == {key: False}, label
+        assert guard.cfg[key] is False, "合并结果要立刻回填"
+
+
+def test_v24_menu_shows_effective_hotkey_bindings():
+    """键位摘要要跟着配置变：关掉总开关就明说关掉了，别让人猜。"""
+    texts = [str(i.text) for i in build_menu(_FakeGuard()).items]
+    assert any("Ctrl+Alt+M" in t and "立即清理" in t for t in texts), texts
+    off = _FakeGuard({"hotkey_enabled": False})
+    assert "全局热键：已关闭" in [str(i.text) for i in build_menu(off).items]

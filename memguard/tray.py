@@ -16,6 +16,7 @@ import time
 import pystray
 
 from . import adapters
+from . import foreground as fg
 from . import update
 from .advisor import (advice_actions, analyze, deepen_round_saturated,
                       frequent_escalation, frequent_short_relief,
@@ -30,6 +31,8 @@ from .clean import (GROWTH_MAX_SAMPLES, _DEEPEN_MAX_ROUNDS, _HEADROOM_MAX,
                     predictive_due, top_processes_list)
 from .config import (CONFIG_PATH, TARGET_CLEAN_TOP_MAX, __version__, gb,
                      load_config, log, update_config)
+from .hotkeys import HotkeyListener, action_specs, summary as hotkey_summary
+from .idle import is_user_away
 from .menu import build_menu
 from .ui import (make_icon, show_advice_window, show_overview_window,
                 show_top_window, show_trend_window)
@@ -117,6 +120,15 @@ class Guard:
         self._last_clean_escalated = False
         self._threshold_short_streak = 0
 
+        # v1.24.0 全局热键（对标 Mem Reduct / ISLC）：监听线程 + 当前键位快照
+        self._hotkeys = None
+        self._hotkey_specs = {}
+        # v1.24.0 全屏应用让路（对标 ISLC 用户的「游戏不卡」诉求）：记住当前是否
+        # 因全屏暂停，只在「进 / 出」翻转时打扰一次，其余轮次零打扰
+        self._fs_paused = False
+        # 离开期间被静默的通知条数：回来后第一条前面汇总提示（v1.24.0）
+        self._away_notes = 0
+
 
     # -- 循环 ----------------------------------------------------
 
@@ -125,6 +137,20 @@ class Guard:
 
     # -- 概览窗口（对标 WinMemoryCleaner / Mem Reduct：左键点托盘就打开主窗口）----
 
+    def _status_lines(self) -> list:
+        """概览窗 / 回退文案底部的「守护状态」行（v1.24.0）。
+
+        三行分别回答三个最常被问的问题：热键生没生效、全屏让路开没开、前台进程
+        保不保护。热键那行直接复用 hotkeys.summary，与右键菜单看到的完全一致。
+        """
+        cfg = self.cfg
+        return [
+            hotkey_summary(cfg, self.hotkey_failures()),
+            "全屏让路：" + ("开" if cfg.get("fs_pause", True) else "关")
+            + ("（已暂停）" if self._fs_paused else "（未暂停）"),
+            "前台进程保护：" + ("开" if cfg.get("fs_protect", True) else "关"),
+        ]
+
     def open_overview(self) -> None:
         """打开内存概览窗口。
 
@@ -132,6 +158,7 @@ class Guard:
         """
         show_overview_window({
             "clean": lambda: do_clean("手动", growth_rows=self.leaks),
+            "status": self._status_lines,
             "top": show_top_window,
             "trend": lambda: show_trend_window(lambda: list(self.history)),
             # 传 callable 而非 dict：窗口内「一键应用」会经 update_config 换掉
@@ -269,7 +296,7 @@ class Guard:
                 body += f"\n{note}"
             title = "MemGuard 自动清理" if reason == "自动" else f"MemGuard {reason}清理"
             try:
-                self.icon.notify(
+                self._notify_balloon(
                     body,
                     title,
                 )
@@ -492,6 +519,9 @@ class Guard:
                     # 配置刚变（可能换了档位/阈值），把建议节流计时清零，让菜单上的
                     # 「优化建议（N 条）」立刻反映新配置，而不是最多再等一个周期
                     self._advice_at = 0.0
+                    # 全局热键的键位 / 总开关可能变了：重新注册，旧注册还占着键
+                    if action_specs(self.cfg) != self._hotkey_specs:
+                        self.restart_hotkeys()
                     log("配置已热重载（来自 mem_guard.json）")
         except Exception as e:
             log(f"配置重载检查失败: {e}")
@@ -588,7 +618,7 @@ class Guard:
                         + "\n已自动切换为激进档：一次清到位，少跑一遍少打扰一次\n"
                         "（右键菜单可随时改回保守；改回保守档会重新武装）")
                 try:
-                    self.icon.notify(
+                    self._notify_balloon(
                         body,
                         "MemGuard 自动优化",
                     )
@@ -625,7 +655,7 @@ class Guard:
                 f"单次大户数 {top}），已自动加大户数为 {new_top}（可随时手动改回）")
             if self.icon:
                 try:
-                    self.icon.notify(
+                    self._notify_balloon(
                         f"定向大户榜长期集中在同几个进程\n"
                         f"单次大户数 {top} → {new_top}：一次多清几个，"
                         f"旁边新长出来的中等进程也排得上号\n"
@@ -667,7 +697,7 @@ class Guard:
                 f"触发阈值已自动提前 {hr} → {new_hr} 个百分点（可随时手动改回）")
             if self.icon:
                 try:
-                    self.icon.notify(
+                    self._notify_balloon(
                         f"清理效果连续偏短（短效 {self._relief_short_streak} 连发）\n"
                         f"触发阈值已自动提前 {hr} → {new_hr} 个百分点："
                         f"清理发生在压力顶上来之前\n"
@@ -713,7 +743,7 @@ class Guard:
                 f"可用内存下限已自动抬高 {cur} → {new} MB（可随时手动改回）")
             if self.icon:
                 try:
-                    self.icon.notify(
+                    self._notify_balloon(
                         f"低内存下限触发的清理连续偏短（短效 {self._lowmem_short_streak} 连发）\n"
                         f"可用内存下限已自动抬高 {cur} → {new} MB：\n"
                         f"清理发生在可用内存见底之前\n"
@@ -750,7 +780,7 @@ class Guard:
                 f"已自动把大户下限降为 {new}MB（可随时手动改回）")
             if self.icon:
                 try:
-                    self.icon.notify(
+                    self._notify_balloon(
                         f"定向大户榜长期在榜的进程够不着大户下限\n"
                         f"大户下限 {cur} → {new} MB：榜上进程重新进得了定向清理的网\n"
                         f"（右键菜单或 mem_guard.json 可随时改回 "
@@ -786,7 +816,7 @@ class Guard:
                 f"stage_deepen_rounds）")
             if self.icon:
                 try:
-                    self.icon.notify(
+                    self._notify_balloon(
                         f"定向加深反复把轮数上限跑满仍在释放、压力仍没按住，"
                         f"加深轮数上限 {cur} → {new}：多给温和加深一轮机会，"
                         f"不必改激进清理（右键菜单或 mem_guard.json 可随时改回 "
@@ -828,7 +858,7 @@ class Guard:
                 f"predict_window_min）")
             if self.icon:
                 try:
-                    self.icon.notify(
+                    self._notify_balloon(
                         f"预防式清理连续没防住（未中 "
                         f"{self._predict_miss_streak} 连发）\n"
                         f"预测窗口 {cur} → {new} 分钟：更早的斜率上就提前清理，"
@@ -906,7 +936,7 @@ class Guard:
                 f"{new_commit}%（可随时手动改回）")
             if self.icon:
                 try:
-                    self.icon.notify(
+                    self._notify_balloon(
                         f"清理效果连续偏短（短效 {self._threshold_short_streak} 连发），"
                         f"温和手段已用尽\n"
                         f"触发阈值已自动下调：{phys}% → {new_phys}% / "
@@ -975,14 +1005,8 @@ class Guard:
             self._update_checking = False
 
     def _notify_update(self, msg: str, title: str) -> None:
-        """更新通知：走托盘气泡，图标还没就绪时静默跳过。"""
-        icon = self.icon
-        if not icon:
-            return
-        try:
-            icon.notify(msg, title)
-        except Exception:
-            pass
+        """更新通知：走托盘气泡（与其它通知共用空闲静默口径）。"""
+        self._notify_balloon(msg, title)
 
     def _stop_for_update(self) -> None:
         """安装开始前的收尾：停监控循环、收托盘图标，让目标 exe 不被占用。"""
@@ -1016,6 +1040,11 @@ class Guard:
         while not self.stop.is_set():
             try:
                 self.maybe_reload_config()
+                # v1.24.0 全屏应用让路：这一轮整轮跳过四类自动清理触发源；
+                # 手动清理、菜单操作、热键都不受影响
+                if self._fullscreen_gate():
+                    self.stop.wait(self.cfg["interval"])
+                    continue
                 self.refresh()
                 s = self.state
                 self.history.append((time.time(), s["phys_pct"], s["commit_pct"]))
@@ -1041,7 +1070,7 @@ class Guard:
                         log(f"预警 | 物理 {s['phys_pct']:.0f}% 接近阈值 {self.cfg['phys_threshold']}%")
                         if self.icon:
                             try:
-                                self.icon.notify(
+                                self._notify_balloon(
                                     f"物理内存 {s['phys_pct']:.0f}%，接近阈值 {self.cfg['phys_threshold']}%\n"
                                     f"可右键托盘手动清理",
                                     "MemGuard 内存预警",
@@ -1110,6 +1139,104 @@ class Guard:
             log("托盘常驻：注册表已是常驻（IsPromoted=1）")
 
 
+    # -- 全局热键（v1.24.0）-----------------------------------------
+
+    def _hotkey_callbacks(self) -> dict:
+        """三个热键动作接回 Guard：与菜单 / 概览窗的按钮同一条清理入口。"""
+        return {
+            "clean": lambda: do_clean("热键", growth_rows=self.leaks),
+            "overview": self.open_overview,
+            "auto": self._toggle_auto_from_hotkey,
+        }
+
+    def _start_hotkeys(self) -> None:
+        """注册全局热键。一条都没注册上也不影响托盘与监控——最坏情况就是没热键。"""
+        if not self.cfg.get("hotkey_enabled", True):
+            return
+        specs = action_specs(self.cfg)
+        if not specs:
+            return
+        try:
+            listener = HotkeyListener(specs, self._hotkey_callbacks())
+            listener.start()
+            self._hotkeys = listener
+            self._hotkey_specs = specs
+        except Exception as e:
+            log(f"全局热键启动失败: {e!r}")
+
+    def hotkey_failures(self) -> list:
+        """注册失败的热键展示串（被别的程序占用）：菜单据此提示，不静默失效。"""
+        listener = self._hotkeys
+        return list(listener.failures) if listener is not None else []
+
+    def restart_hotkeys(self) -> None:
+        """键位 / 总开关变化后重新注册：旧注册还占着键，必须先解注册再注册。"""
+        self._stop_hotkeys()
+        self._start_hotkeys()
+
+    def _stop_hotkeys(self) -> None:
+        listener, self._hotkeys = self._hotkeys, None
+        self._hotkey_specs = {}
+        if listener is None:
+            return
+        try:
+            listener.stop()
+        except Exception as e:
+            log(f"全局热键停止失败: {e!r}")
+
+    def _toggle_auto_from_hotkey(self) -> None:
+        on = not bool(self.cfg.get("auto_clean"))
+        self.cfg = update_config({"auto_clean": on})
+        log(f"全局热键 | 自动清理 -> {'开' if on else '关'}")
+
+    # -- 全屏应用让路（v1.24.0）--------------------------------------
+
+    def reset_fullscreen_state(self) -> None:
+        """开关被菜单切换后清掉暂停记忆，让下一次判定按新开关重新开始。"""
+        self._fs_paused = False
+
+    def _fullscreen_gate(self) -> str | None:
+        """全屏应用运行中时返回理由串（只在「进 / 出」翻转时通知一次），否则 None。"""
+        reason = fg.pause_reason(self.cfg)
+        paused = reason is not None
+        if paused == self._fs_paused:
+            return reason
+        self._fs_paused = paused
+        if paused:
+            log(f"全屏应用让路 | {reason}，自动清理暂停（手动清理不受限）")
+            self._notify_balloon(f"{reason}，自动清理已暂停\n需要时可右键手动清理",
+                                 "MemGuard 全屏让路")
+        else:
+            log("全屏应用让路 | 已退出全屏，自动清理恢复")
+        return reason
+
+    def _send_balloon(self, msg: str, title: str) -> None:
+        """原样发气泡：图标还没就绪时静默跳过（托盘自愈期间会走到）。"""
+        icon = self.icon
+        if not icon:
+            return
+        try:
+            icon.notify(msg, title)
+        except Exception:
+            pass
+
+    def _notify_balloon(self, msg: str, title: str) -> None:
+        """发气泡，但用户离开超过 notify_idle_sec 时只记账、不弹（v1.24.0）。
+
+        离开期间的通知一条都不丢：全部计数，用户回来后第一条通知前面缀一行
+        「（离开期间另有 N 条通知）」——既不漏信息，也不在空办公室里刷屏。
+        取不到空闲时间时按「不离开」处理，行为与旧版一致。
+        """
+        if is_user_away(self.cfg.get("notify_idle_sec", 300)):
+            self._away_notes += 1
+            log(f"通知已静默（用户离开中）| {title} | {msg}")
+            return
+        if self._away_notes:
+            pending, self._away_notes = self._away_notes, 0
+            log(f"通知补发：离开期间另有 {pending} 条已静默")
+            msg = f"（离开期间另有 {pending} 条通知）\n{msg}"
+        self._send_balloon(msg, title)
+
     def run(self, show_on_start: bool = False) -> None:
         s = get_mem()
         log(f"MemGuard v{__version__} 启动 | 管理员={is_admin()} | 物理 {s['phys_pct']:.0f}% | "
@@ -1118,6 +1245,7 @@ class Guard:
             log("提示：非管理员运行，自动清理不会生效，请右键以管理员身份运行")
         # 监控线程只启动一次；托盘图标在循环内可被重建，实现"托盘自愈"
         threading.Thread(target=self.monitor, daemon=True).start()
+        self._start_hotkeys()
 
         self._start_show_waiter()
         while not self.stop.is_set():
@@ -1142,6 +1270,7 @@ class Guard:
             # 避免出现"程序还在跑、托盘图标却不见了"的假死状态
             log("托盘未正常退出，1 秒后重建图标（自愈）")
             time.sleep(1.0)
+        self._stop_hotkeys()
         log("MemGuard 已退出")
 
         close_show_event(self._show_event)

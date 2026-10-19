@@ -257,7 +257,7 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     monkeypatch.setattr(clean, "clear_system_file_cache",
                         lambda: _rec("fc", bool((results or {}).get("file_cache", True))))
     monkeypatch.setattr(clean, "empty_process_working_sets",
-                        lambda bl: _rec("epw", (results or {}).get("proc", (3, 1))))
+                        lambda bl, *protect: _rec("epw", (results or {}).get("proc", (3, 1))))
     # 定向清理（v1.7.0）：Top 采样与「只清指定 PID」全部造假，绝不碰真实进程表
     rows = [("small.exe", 100 * 1024 ** 2, 9)] if top_rows is None else top_rows
     monkeypatch.setattr(clean, "top_processes_list", lambda n=15: list(rows))
@@ -294,7 +294,7 @@ def _admin_env(monkeypatch, level="conservative", areas=None, results=None,
     monkeypatch.setattr(clean, "_bump_stats",
                         lambda freed, escalated=False, targeted=False, preventive=False,
                         short_relief=False, bg_trimmed=False, sticky=False,
-                        deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False:
+                        deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False:
                             {"count": 9, "freed": freed})
     monkeypatch.setattr(clean, "log", lambda msg: None)   # 别往真实日志文件里写测试噪声
 
@@ -469,7 +469,7 @@ def test_do_clean_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False:
+               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -486,7 +486,7 @@ def test_do_clean_no_escalation_feeds_stats_counter(monkeypatch):
     monkeypatch.setattr(
         clean, "_bump_stats",
         lambda freed, escalated=False, targeted=False, preventive=False,
-               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False:
+               short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False:
             seen.append(escalated) or {"count": 9, "freed": freed})
     r = clean.do_clean("测试")
 
@@ -609,7 +609,7 @@ def test_do_clean_target_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append(targeted)
         return {"count": 9, "freed": freed}
 
@@ -771,7 +771,7 @@ def test_do_clean_deepen_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append(deepen_rounds)
         return {"count": 9, "freed": freed}
 
@@ -872,7 +872,7 @@ def test_do_clean_deepen_stats_count_rounds(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append(deepen_rounds)
         return {"count": 9, "freed": freed}
 
@@ -997,6 +997,19 @@ def test_empty_selected_working_sets_skips_blacklist_and_system_pids(monkeypatch
     assert k.opened == [14]
 
 
+def test_empty_selected_working_sets_matches_wildcard_blacklist(monkeypatch):
+    """user_blacklist 支持 * / ? 通配符（对标 Mem Reduct 的排除列表）。"""
+    k = _FakeKernel()
+    monkeypatch.setattr(actions, "kernel32", k)
+    monkeypatch.setattr(actions, "psapi", SimpleNamespace(EmptyWorkingSet=lambda h: True))
+    monkeypatch.setattr(actions, "psutil", SimpleNamespace(
+        Process=lambda pid: _proc_named("Code.exe" if pid == 13 else "p.exe")))
+
+    # "*co*e" 命中 code，p.exe 不在范围内
+    assert actions.empty_selected_working_sets([11, 13], ["*co*e"]) == (1, 1)
+    assert k.opened == [11]
+
+
 def test_empty_selected_working_sets_tolerates_single_failure(monkeypatch):
     """单个进程已退出或清空失败不影响其余，只回报成功的个数。"""
     k = _FakeKernel()
@@ -1013,6 +1026,50 @@ def test_empty_selected_working_sets_tolerates_single_failure(monkeypatch):
 
     assert actions.empty_selected_working_sets([11, 12, 14], []) == (1, 0)
     assert k.opened == [11, 14]
+
+
+def _procs(*pairs):
+    """假 psutil：只提供固定的 (pid, name) 进程表，绝不遍历真实系统。"""
+    return SimpleNamespace(
+        process_iter=lambda attrs=None: [
+            SimpleNamespace(info={"pid": pid, "name": name}) for pid, name in pairs])
+
+
+def test_empty_process_working_sets_matches_wildcard_blacklist(monkeypatch):
+    """全量激进清空也必须认通配符白名单：用户保护里的进程一个都不能碰。"""
+    k = _FakeKernel()
+    monkeypatch.setattr(actions, "kernel32", k)
+    monkeypatch.setattr(actions, "psapi", SimpleNamespace(EmptyWorkingSet=lambda h: True))
+    monkeypatch.setattr(actions, "psutil",
+                        _procs((11, "chrome.exe"), (12, "p.exe")))
+
+    assert actions.empty_process_working_sets(["*chrome*"], ()) == (1, 1)
+    assert k.opened == [12]
+
+
+def test_empty_process_working_sets_excludes_given_pids(monkeypatch):
+    """exclude_pids（前台进程保护）跳过，且开过的句柄全部关闭。"""
+    k = _FakeKernel()
+    monkeypatch.setattr(actions, "kernel32", k)
+    monkeypatch.setattr(actions, "psapi", SimpleNamespace(EmptyWorkingSet=lambda h: True))
+    monkeypatch.setattr(actions, "psutil",
+                        _procs((0, "System"), (11, "fg.exe"), (12, "p.exe")))
+
+    assert actions.empty_process_working_sets([], [11]) == (1, 2)
+    assert k.opened == [12]
+    assert k.closed == [1012]
+
+
+def test_empty_background_working_sets_matches_wildcard_blacklist(monkeypatch):
+    """后台档同样认通配符：三条清空路径的黑名单语义必须一致。"""
+    k = _FakeKernel()
+    monkeypatch.setattr(actions, "kernel32", k)
+    monkeypatch.setattr(actions, "psapi", SimpleNamespace(EmptyWorkingSet=lambda h: True))
+    monkeypatch.setattr(actions, "psutil",
+                        _procs((11, "Code.exe"), (12, "p.exe")))
+
+    assert actions.empty_background_working_sets([], ["*code*"]) == (1, 1)
+    assert k.opened == [12]
 
 
 def _proc_named(name):
@@ -1135,7 +1192,7 @@ def test_do_clean_passes_preventive_to_stats(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append(preventive)
         return {"count": 9, "freed": freed}
 
@@ -1166,7 +1223,7 @@ def test_do_clean_passes_low_relief_to_stats(monkeypatch):
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
-                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append((short_relief, low_mem))
         return {"count": 9, "freed": freed}
 
@@ -1195,7 +1252,7 @@ def test_do_clean_passes_low_mem_to_stats(monkeypatch):
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
-                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append((short_relief, low_mem))
         return {"count": 9, "freed": freed}
 
@@ -1213,7 +1270,7 @@ def test_do_clean_passes_predictive_missed_to_stats(monkeypatch):
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
                    deepened=False, low_mem=False, deepen_capped=False,
-                   predictive_missed=False):
+                   predictive_missed=False, fg_protected=False):
         seen.append(predictive_missed)
         return {"count": 9, "freed": freed}
 
@@ -1347,7 +1404,7 @@ def test_do_clean_passes_bg_trimmed_to_stats(monkeypatch):
     ]
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append(bg_trimmed)
         return {"count": 9, "freed": freed}
 
@@ -1601,7 +1658,7 @@ def test_do_clean_sticky_feeds_stats_counter(monkeypatch):
     seen = []
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
-                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   short_relief=False, bg_trimmed=False, sticky=False, deepened=False, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append(sticky)
         return {"count": 9, "freed": freed}
 
@@ -1664,6 +1721,23 @@ def test_do_clean_reports_per_stage_release(monkeypatch):
     assert r["freed"] == 4096
     # 阶梯各级加起来就是「保守第一遍之后」又释放的部分，另 2048 来自第一遍本身
     assert r["targeted_freed"] + r["bg_freed"] + r["escalated_freed"] == 2048
+
+
+def test_do_clean_escalation_measures_its_own_gain(monkeypatch):
+    """升档的收益基线必须取在动手前：等回补之后的采样不能减去它自己。"""
+    base = 8 * 1024 ** 3
+    wait_after = [
+        {"avail_phys": base + 1024, "phys_pct": 92.0, "commit_pct": 40.0},   # 保守后仍受压
+        {"avail_phys": base + 4096, "phys_pct": 60.0, "commit_pct": 40.0},   # 升档后回落
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, cfg_over={"target_clean": False})
+
+    r = clean.do_clean("测试")
+
+    # 定向与后台两级都没开（cfg_over / 默认），所以 3072 只可能来自升档这一级
+    assert r["escalated"] is True
+    assert r["escalated_freed"] == 3072
+    assert r["freed"] == 4096
 
 # ---------------- 加深收益衰减（v1.15.0：边际收益见底就收尾，别加码竞赛）
 
@@ -2015,7 +2089,7 @@ def test_do_clean_passes_deepen_capped_to_stats(monkeypatch):
 
     def _fake_bump(freed, escalated=False, targeted=False, preventive=False,
                    short_relief=False, bg_trimmed=False, sticky=False,
-                   deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False):
+                   deepen_rounds=0, low_mem=False, deepen_capped=False, predictive_missed=False, fg_protected=False):
         seen.append(deepen_capped)
         return {"count": 9, "freed": freed}
 

@@ -14,12 +14,13 @@ import pystray
 
 from .advisor import analyze
 from . import adapters
+from . import hotkeys
 from .autostart import autostart_enabled, install_autostart, remove_autostart
 from .clean import do_clean, top_processes_list
 from .config import LOG_PATH, __version__, gb, log, update_config
 from .diag import export_diagnostics
-from .ui import (apply_advice_actions, show_advice_window, show_top_window,
-                show_trend_window)
+from .ui import (apply_advice_actions,
+                show_advice_window, show_top_window, show_trend_window)
 from .update import fetch_latest_release, install_latest
 from .winapi import is_admin
 
@@ -298,7 +299,9 @@ def build_menu(guard) -> pystray.Menu:
         log("优化建议一键应用 | " + "、".join(a.get("label", "应用") for a in done))
 
     def on_export(icon=None, item=None) -> None:
-        path = export_diagnostics()
+        # 守护状态三行一并进 zip：现场报告不必再问「热键到底生没生效」
+        path = export_diagnostics(
+            guard._status_lines() if hasattr(guard, "_status_lines") else None)
         if path.startswith("ERR:"):
             icon.notify("诊断导出失败：" + path, "MemGuard")
         else:
@@ -374,6 +377,65 @@ def build_menu(guard) -> pystray.Menu:
         log(f"更新包 sha256 校验 -> "
             f"{'开' if guard.cfg['verify_update_sha256'] else '关'}")
 
+    def on_toggle_hotkeys(icon, item) -> None:
+        """v1.24.0 全局热键总开关。键位变化同样要走重启（旧的注册还占着键）。"""
+        guard.cfg = update_config(
+            {"hotkey_enabled": not bool(guard.cfg.get("hotkey_enabled", True))})
+        on = guard.cfg["hotkey_enabled"]
+        log(f"全局热键 -> {'开' if on else '关'}"
+            + (f"（{hotkeys.summary(guard.cfg)}）" if on else ""))
+        if hasattr(guard, "restart_hotkeys"):
+            guard.restart_hotkeys()
+
+    def on_toggle_fs_pause(icon, item) -> None:
+        """v1.24.0 全屏应用期间暂停自动清理。"""
+        guard.cfg = update_config(
+            {"fs_pause": not bool(guard.cfg.get("fs_pause", True))})
+        log(f"全屏应用时暂停自动清理 -> {'开' if guard.cfg['fs_pause'] else '关'}")
+        if hasattr(guard, "reset_fullscreen_state"):
+            guard.reset_fullscreen_state()
+
+    def on_toggle_fs_protect(icon, item) -> None:
+        """v1.24.0 前台进程保护：激进档也不清空用户正在用的进程。"""
+        guard.cfg = update_config(
+            {"fs_protect": not bool(guard.cfg.get("fs_protect", True))})
+        log(f"保护前台进程（不清空工作集） -> {'开' if guard.cfg['fs_protect'] else '关'}")
+
+    def _set_hotkey(action, spec):
+        def setter(icon, item):
+            changes = {"hotkey_" + action: spec}
+            # 同一个组合只能登记一条（重复注册会失败）：占了别的动作的键就把那条清掉，
+            # 别在用户配置里留一个「设了却不生效」的影子键位
+            if spec:
+                for other in hotkeys.ACTIONS:
+                    if other == action:
+                        continue
+                    cur = str(guard.cfg.get("hotkey_" + other) or "").strip().lower()
+                    if cur == spec:
+                        changes["hotkey_" + other] = ""
+            guard.cfg = update_config(changes)
+            log(f"全局热键[{hotkeys.ACTION_LABELS[action]}] -> "
+                f"{hotkeys.format_hotkey(spec) if spec else '关闭'}")
+            if hasattr(guard, "restart_hotkeys"):
+                guard.restart_hotkeys()
+        return setter
+
+    def hotkey_menu():
+        """快捷键设置（v1.24.0，对标 Mem Reduct 的键位选择）：三个动作各一组单选。"""
+        groups = []
+        for action in hotkeys.ACTIONS:
+            rows = [pystray.MenuItem(
+                "关闭", _set_hotkey(action, ""), radio=True,
+                checked=(lambda i, a=action: not guard.cfg.get("hotkey_" + a)))]
+            for spec in hotkeys.choice_specs()[action]:
+                rows.append(pystray.MenuItem(
+                    hotkeys.format_hotkey(spec), _set_hotkey(action, spec), radio=True,
+                    checked=(lambda i, a=action, s=spec:
+                             str(guard.cfg.get("hotkey_" + a) or "").strip().lower() == s)))
+            groups.append(pystray.MenuItem(hotkeys.ACTION_LABELS[action],
+                                           pystray.Menu(*rows)))
+        return pystray.Menu(*groups)
+
     # -- 菜单结构 ------------------------------------------------
 
     def line_phys(_):
@@ -444,6 +506,18 @@ def build_menu(guard) -> pystray.Menu:
                          checked=lambda i: bool(guard.cfg.get("target_clean", True))),
         pystray.MenuItem("后台进程工作集清理", on_toggle_bg_trim,
                          checked=lambda i: bool(guard.cfg.get("bg_trim", True))),
+        pystray.MenuItem("全局热键（一键清理/概览/自动清理）", on_toggle_hotkeys,
+                         checked=lambda i: bool(guard.cfg.get("hotkey_enabled", True))),
+        pystray.MenuItem("快捷键设置", hotkey_menu()),
+        pystray.MenuItem(
+            lambda i: hotkeys.summary(
+                guard.cfg,
+                guard.hotkey_failures() if hasattr(guard, "hotkey_failures") else ()),
+            None, enabled=False),
+        pystray.MenuItem("全屏应用时暂停自动清理", on_toggle_fs_pause,
+                         checked=lambda i: bool(guard.cfg.get("fs_pause", True))),
+        pystray.MenuItem("保护前台进程（不清空工作集）", on_toggle_fs_protect,
+                         checked=lambda i: bool(guard.cfg.get("fs_protect", True))),
         *adapter_menu_items(),
         pystray.MenuItem(
             lambda i: "复位自适应闩（" + adapters.reset_status(guard.cfg) + "）",

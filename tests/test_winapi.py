@@ -653,6 +653,34 @@ def test_restart_explorer_kills_and_reports_fresh_pid(monkeypatch):
 
 def test_restart_explorer_gives_up_after_timeout(monkeypatch):
     """外壳没被拉起来：等满超时返回 None，而不是死等。"""
+    state = {"pids": [32500]}
+    opened = []
+
+    def _fake_open(rights, inherit, pid):
+        opened.append(pid)
+        state["pids"] = []            # 外壳被杀掉，系统没有重拉
+        return 99
+
+    clock = {"t": 0.0}
+    slept = []
+
+    def _fake_time():
+        return clock["t"]
+
+    def _fake_sleep(sec):
+        clock["t"] += sec             # 假时钟随 sleep 前进：用例不真的等 10 秒
+        slept.append(sec)
+
+    monkeypatch.setattr(winapi, "_explorer_pids", lambda: list(state["pids"]))
+    monkeypatch.setattr(winapi, "kernel32", types.SimpleNamespace(
+        OpenProcess=_fake_open, TerminateProcess=lambda h, c: True,
+        CloseHandle=lambda h: True))
+    monkeypatch.setattr(winapi, "time", types.SimpleNamespace(
+        time=_fake_time, sleep=_fake_sleep))
+
+    assert winapi.restart_explorer(timeout_sec=1.0) is None
+    assert opened == [32500]
+    assert sum(slept) >= 1.0, "没等到新外壳也要把超时窗口等满，别提前放弃"
 
 
 def test_notify_rect_reads_corner_slot(monkeypatch):

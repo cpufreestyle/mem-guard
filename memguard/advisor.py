@@ -2,10 +2,9 @@
 """
 优化建议引擎：基于实时内存状态与配置，给出可操作的「实用建议」。
 
-只依赖标准库 + config / winapi / clean，被 tray（菜单展示）、ui（建议窗口一键应用）
-与 cli（自检）调用；
-自身不含 UI、不含网络，纯本地分析。模块依赖落在 clean 之后：
-    config ← winapi ← clean ← advisor ← tray ← cli
+只依赖标准库 + config / winapi / clean / adapters，被 tray（菜单与自适应）、ui（建议
+窗口一键应用）、menu 与 cli（自检）调用；自身不含 UI、不含网络，纯本地分析。
+完整依赖边见 HANDOFF.md §3。
 """
 from __future__ import annotations
 
@@ -479,6 +478,43 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
             "title": "阈值关系建议",
             "text": "提交阈值(commit_threshold)建议高于物理阈值(phys_threshold)：commit 上限含"
                     "页面文件，通常能比物理内存更高，二者倒挂会削弱监控意义。",
+        })
+    # ---- 3c. 前台 / 全屏让路与全局热键（v1.24.0）：默认开的开关被关掉时说明代价 ----
+    if not cfg.get("fs_pause", True):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "全屏应用时暂停自动清理已关闭",
+            "text": "游戏 / 全屏播放器运行期间，自动清理仍会照常执行——一次工作集清理就可能把"
+                    "帧率砸出个坑。开启后按「前台窗口是否铺满整块显示器」判定，与进程名无关，"
+                    "不必为每个游戏维护白名单。",
+            "action": {"label": "开启全屏让路", "changes": {"fs_pause": True}},
+        })
+    if not cfg.get("fs_protect", True):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "前台进程保护已关闭",
+            "text": "激进档（含自动升档 / 粘滞）会清空你正在用的前台进程的工作集，而正在被"
+                    "访问的页全在它里面——清掉就是一次卡顿。开启后前台进程一律跳过，"
+                    "只清真正后台的进程。",
+            "action": {"label": "开启前台保护", "changes": {"fs_protect": True}},
+        })
+    if not cfg.get("notify_idle_sec", 300):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "离开期间不静默已关闭",
+            "text": "notify_idle_sec=0 表示人不在也照常弹气泡——下班后它还在空办公室里"
+                    "叭叭地报。开启（默认 300 秒）后，离开超过该时长的通知只记账，"
+                    "回来时汇总成一条，一条都不漏。",
+            "action": {"label": "开启离开静默(300s)", "changes": {"notify_idle_sec": 300}},
+        })
+    if not cfg.get("hotkey_enabled", True):
+        items.append({
+            "level": LEVEL_INFO,
+            "title": "全局热键已关闭",
+            "text": "开启后可用 Ctrl+Alt+M 一键清理、Ctrl+Alt+O 打开内存概览、"
+                    "Ctrl+Alt+P 切换自动清理；键位可在右键「快捷键设置」里改，"
+                    "某条被别的程序占用时菜单摘要会直接写明。",
+            "action": {"label": "开启全局热键", "changes": {"hotkey_enabled": True}},
         })
     level = str(cfg.get("clean_level", "conservative")).strip().lower()
     if level == "aggressive" and cfg.get("phys_threshold", 85) >= 95:

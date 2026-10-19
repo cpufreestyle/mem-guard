@@ -435,7 +435,6 @@ def visible_window_pids() -> set | None:
         return None
     return pids
 
-
 # ---------------------------------------------------------------- 权限 / 单实例
 
 # 管理员身份在进程生命周期内不变，缓存一次即可（菜单/建议/清理/自检都会反复调用）
@@ -648,6 +647,77 @@ class RECT(ctypes.Structure):
         ("bottom", ctypes.c_long),
     ]
 
+
+# ---------------------------------------------------------------- 前台窗口 / 全屏判定
+
+# 全屏判定用（v1.24.0）：前台窗口铺满整块显示器即视为全屏应用（游戏 / 投屏）
+MONITOR_DEFAULTTONEAREST = 2
+
+
+class MONITORINFO(ctypes.Structure):
+    """GetMonitorInfoW 的数据结构；cbSize 必须打头，Windows 按它决定读哪些字段。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+user32.MonitorFromWindow.restype = wintypes.HANDLE
+user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+
+# ---------------------------------------------------------------- 用户空闲（v1.24.0）
+
+class LASTINPUTINFO(ctypes.Structure):
+    """GetLastInputInfo 的数据结构；cbSize 必须打头，否则返回 FALSE。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("dwTime", wintypes.DWORD),
+    ]
+
+
+user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+user32.GetLastInputInfo.restype = wintypes.BOOL
+kernel32.GetTickCount.restype = wintypes.DWORD
+
+
+# ---------------------------------------------------------------- 全局热键（v1.24.0）
+
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+PM_REMOVE = 0x0001
+PM_NOREMOVE = 0x0000
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000   # 按住不重复触发：按一下清一次，别连发
+
+user32.RegisterHotKey.argtypes = [
+    wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+    wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = ctypes.c_ssize_t
 
 shell32.Shell_NotifyIconGetRect.argtypes = [
     ctypes.POINTER(NOTIFYICONIDENTIFIER),

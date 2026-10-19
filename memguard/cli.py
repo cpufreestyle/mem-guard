@@ -13,12 +13,18 @@ from .config import (
     DEFAULT_CONFIG,
     CLEAN_BLACKLIST_STEMS,
     __version__,
+    _blacklist_stems,
     _norm_proc_name,
     gb,
     log,
     load_config,
+    name_in_blacklist,
     normalize_config,
 )
+from . import foreground
+from .hotkeys import (action_specs, choice_clashes, choice_specs,
+                     choices_are_usable, parse_hotkey)
+from . import idle
 from .clean import do_clean, top_processes
 from .advisor import analyze, format_advice
 from .autostart import autostart_enabled
@@ -77,6 +83,28 @@ def once() -> None:
     print(f"明细: {r['detail']}")
 
 
+def status() -> int:
+    """--status：打印一次内存状态与守护状态，不起托盘、不清理。
+
+    对标 EmptyStandbyList 那类命令行工具：脚本 / 计划任务 / 远程排查时想确认
+    「程序在不在干活、热键生没生效」，不必去点托盘。内容与概览窗的守护状态行
+    同源（Guard._status_lines），两边不会说不同的话。
+    """
+    s = get_mem()
+    print(f"MemGuard v{__version__} 状态")
+    print(f"  物理内存  {s['phys_pct']:5.1f}%   "
+          f"({gb(s['used_phys'])} / {gb(s['total_phys'])}，可用 {gb(s['avail_phys'])})")
+    print(f"  提交内存  {s['commit_pct']:5.1f}%   "
+          f"({gb(s['used_commit'])} / {gb(s['total_commit'])}，可用 {gb(s['avail_commit'])})")
+    idle_sec = idle.idle_seconds()
+    print(f"  用户空闲  {'未知' if idle_sec is None else f'{idle_sec:.0f} 秒'}"
+          f"（通知静默阈值 {load_config().get('notify_idle_sec', 300)} 秒）")
+    guard = Guard()
+    for line in guard._status_lines():
+        print(f"  {line}")
+    return 0
+
+
 def selftest() -> int:
     """内置自检：验证关键功能可用，返回退出码（0=全部通过）。"""
     print(f"MemGuard 自检 (v{__version__})")
@@ -99,7 +127,11 @@ def selftest() -> int:
         f"越界阈值->{normalize_config({'phys_threshold': 999})['phys_threshold']}, "
         f"白名单->{normalize_config({'user_blacklist': ['Chrome.EXE', 'chrome']})['user_blacklist']}"
     ))
-    check("blacklist匹配", lambda: f"csrss.exe->{_norm_proc_name('csrss.exe') in CLEAN_BLACKLIST_STEMS}")
+    check("blacklist匹配", lambda: (
+        f"csrss.exe->{_norm_proc_name('csrss.exe') in CLEAN_BLACKLIST_STEMS}, "
+        f"通配符->{name_in_blacklist('Chrome.exe', _blacklist_stems(['*chrome*']))}, "
+        f"不误伤->{not name_in_blacklist('notchrome.exe', _blacklist_stems(['*chrome*']))}"
+    ))
     check("_parse_version", lambda: (
         f"v1.10.2 > 1.9.9 -> {_parse_version('v1.10.2') > _parse_version('1.9.9')}, "
         f"同版本 -> {_parse_version('1.3.0') == _parse_version('v1.3.0')}"
@@ -119,6 +151,28 @@ def selftest() -> int:
         f"挑清单->{find_checksums_asset([{'name': 'checksums.txt', 'browser_download_url': 'u'}])['name']}, "
         f"自身哈希->{sha256_of(__file__)[:12]}…, "
         f"缺摘要->{verify_asset(__file__, '')['skipped']}"
+    ))
+    check("快捷键菜单键位", lambda: (
+        f"{len(choice_specs())} 组可选, "
+        f"不可用->{choices_are_usable()}, 跨组撞车->{choice_clashes()}"
+    ))
+    check("空闲判定", lambda: (
+        f"当前空闲->{idle.idle_seconds()}, "
+        f"阈值0不静默->{not idle.is_user_away(0)}, "
+        f"阈值10亿静默->{idle.is_user_away(10 ** 9)}"
+    ))
+    check("全局热键解析", lambda: (
+        f"ctrl+alt+m->{parse_hotkey('ctrl+alt+m') is not None}, "
+        f"无修饰->{parse_hotkey('m')}, 双主键->{parse_hotkey('ctrl+m+k')}, "
+        f"非法键->{parse_hotkey('ctrl+alt+f99')}, "
+        f"默认键位->{sorted(action_specs(normalize_config({})))}"
+    ))
+    check("全屏/前台判定", lambda: (
+        f"覆盖整屏->{foreground.covers_rect((0, 0, 1920, 1080), (0, 0, 1920, 1080))}, "
+        f"窗口化不算->{foreground.covers_rect((0, 0, 1000, 800), (0, 0, 1920, 1080))}, "
+        f"1px缝隙算->{foreground.covers_rect((-1, -1, 1921, 1081), (0, 0, 1920, 1080))}, "
+        f"当前全屏->{foreground.fullscreen_hwnd() is not None}, "
+        f"前台PID->{foreground.foreground_pid()}"
     ))
     check("adapters注册表", lambda: (
         f"{len(ADAPTERS)} 条自适应 / 复位 {len(reset_patch())} 键 / "
@@ -201,11 +255,12 @@ _USAGE = """MemGuard 用法: mem_guard [选项]
 --check-update  检查一次 GitHub Release，只打印不弹窗
 --update    发现新版本则下载并静默安装（完成后自动重启）
 --pin-tray   写 IsPromoted 注册表并重启 Explorer（首装需先手动拖出图标一次，任务栏会闪一下）
+--status    打印一次内存状态与守护状态（热键/全屏让路/前台保护），不起托盘也不清理
 --help/-h   打印本说明
 """
 
 _HELP_FLAGS = ("--help", "-h", "/?")
-_KNOWN_ARGS = ("--once", "--selftest", "--show", "--check-update",
+_KNOWN_ARGS = ("--once", "--selftest", "--show", "--check-update", "--status",
                "--update", "--pin-tray") + _HELP_FLAGS
 
 
@@ -255,6 +310,8 @@ def main() -> None:
         sys.exit(check_update_cli())
     elif "--update" in sys.argv:
         sys.exit(update_cli())
+    elif "--status" in sys.argv:
+        sys.exit(status())
     elif "--pin-tray" in sys.argv:
         sys.exit(pin_tray_cli())
     else:

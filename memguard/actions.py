@@ -14,7 +14,7 @@ import os
 
 import psutil
 
-from .config import CLEAN_BLACKLIST_STEMS, _blacklist_stems, _norm_proc_name
+from .config import CLEAN_BLACKLIST_STEMS, _blacklist_stems, name_in_blacklist
 from .winapi import (
     MemoryEmptyWorkingSets,
     MemoryFlushModifiedList,
@@ -56,36 +56,16 @@ def clear_system_file_cache() -> bool:
     return clear_file_cache()
 
 
-def empty_process_working_sets(extra_blacklist=()) -> tuple:
+def empty_process_working_sets(extra_blacklist=(), exclude_pids=()) -> tuple:
     """逐个进程清空工作集（把不活跃的物理页移到 standby list）。
 
-    extra_blacklist 为用户附加白名单（进程名，可带可不带 .exe），命中者跳过，
-    避免清空浏览器/IDE 等工作集造成前台卡顿。返回 (已清理数, 白名单跳过数)。
+    extra_blacklist 为用户附加白名单（进程名，可带可不带 .exe，支持 * / ? 通配符），
+    命中者跳过，避免清空浏览器/IDE 等工作集造成前台卡顿。返回 (已清理数, 白名单跳过数)。
+    exclude_pids 是额外保护的 PID（v1.24.0 前台进程保护）：命中者跳过——激进
+    档也不会把用户正在用的那个进程清空，正在被访问的页全在它工作集里。
     """
-    PROCESS_QUERY_INFORMATION = 0x0400
-    PROCESS_SET_QUOTA = 0x0100
-    # psapi.EmptyWorkingSet / kernel32.OpenProcess 的类型声明见 winapi.py
-
-    blocked = CLEAN_BLACKLIST_STEMS | _blacklist_stems(extra_blacklist)
-    count = 0
-    skipped = 0
-    for p in psutil.process_iter(["pid", "name"]):
-        try:
-            if _norm_proc_name(p.info.get("name")) in blocked or p.info["pid"] in (0, 4):
-                skipped += 1
-                continue
-            h = kernel32.OpenProcess(
-                PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, p.info["pid"]
-            )
-            if h:
-                try:
-                    if psapi.EmptyWorkingSet(h):
-                        count += 1
-                finally:
-                    kernel32.CloseHandle(h)
-        except Exception:
-            continue
-    return count, skipped
+    return _empty_working_sets(_all_process_pairs(), extra_blacklist,
+                               _pid_set(exclude_pids), skip_self=False)
 
 
 def empty_background_working_sets(exclude_pids=(), extra_blacklist=()) -> tuple:
@@ -95,32 +75,8 @@ def empty_background_working_sets(exclude_pids=(), extra_blacklist=()) -> tuple:
     调用方用 winapi.visible_window_pids() 现算，再叠加自身与黑名单，只对真正后台
     的进程下手——前台零感知，覆盖面又比定向大户全。返回 (已清理数, 跳过数)。
     """
-    PROCESS_QUERY_INFORMATION = 0x0400
-    PROCESS_SET_QUOTA = 0x0100
-    # psapi.EmptyWorkingSet / kernel32.OpenProcess 的类型声明见 winapi.py
-
-    blocked = CLEAN_BLACKLIST_STEMS | _blacklist_stems(extra_blacklist)
-    exclude = {os.getpid()} | {int(pid) for pid in exclude_pids}
-    count = 0
-    skipped = 0
-    for p in psutil.process_iter(["pid", "name"]):
-        try:
-            pid = p.info["pid"]
-            if pid in (0, 4) or pid in exclude or _norm_proc_name(p.info.get("name")) in blocked:
-                skipped += 1
-                continue
-            h = kernel32.OpenProcess(
-                PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid
-            )
-            if h:
-                try:
-                    if psapi.EmptyWorkingSet(h):
-                        count += 1
-                finally:
-                    kernel32.CloseHandle(h)
-        except Exception:
-            continue
-    return count, skipped
+    return _empty_working_sets(_all_process_pairs(), extra_blacklist,
+                               _pid_set(exclude_pids), skip_self=True)
 
 
 def empty_selected_working_sets(pids, extra_blacklist=()) -> tuple:
@@ -131,26 +87,39 @@ def empty_selected_working_sets(pids, extra_blacklist=()) -> tuple:
     进程表。每个 PID 仍会重新核对进程名是否命中白名单（采样后进程可能已退出、
     PID 可能被复用），跳过 Idle/System 与单个失败，返回 (已清理数, 跳过数)。
     """
-    PROCESS_QUERY_INFORMATION = 0x0400
-    PROCESS_SET_QUOTA = 0x0100
-    # psapi.EmptyWorkingSet / kernel32.OpenProcess 的类型声明见 winapi.py
+    return _empty_working_sets(_selected_process_pairs(pids), extra_blacklist,
+                               (), skip_self=False)
 
+
+def _pid_set(pids) -> set:
+    """把 PID 序列归一成 int 集合（None / 空序列 → 空集）。"""
+    return {int(pid) for pid in pids or ()}
+
+
+# OpenProcess needs minimal access for EmptyWorkingSet; type decls live in winapi.py
+_PROCESS_ACCESS = 0x0400 | 0x0100      # PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA
+
+
+def _empty_working_sets(pairs, extra_blacklist, exclude_pids, skip_self) -> tuple:
+    """三条清空路径共用的唯一实现：核对名单 → 开句柄 → 清空 → 关句柄。
+
+    pairs 提供 (pid, name) 来源（全量进程表或按 PID 现场重取），黑名单语义含通配符
+    （与用户白名单配置一致，见 config.name_in_blacklist），Idle/System(0/4) 与
+    exclude_pids 跳过；skip_self 额外保护本进程。单个进程失败只跳过它自己，
+    返回 (已清理数, 跳过数)。
+    """
     blocked = CLEAN_BLACKLIST_STEMS | _blacklist_stems(extra_blacklist)
+    exclude = set(exclude_pids)
+    if skip_self:
+        exclude.add(os.getpid())
     count = 0
     skipped = 0
-    for pid in pids:
+    for pid, name in pairs:
         try:
-            pid = int(pid)
-            if pid in (0, 4):
+            if pid in (0, 4) or pid in exclude or name_in_blacklist(name, blocked):
                 skipped += 1
                 continue
-            # 重新取进程名：上一步采样到现在进程可能已退出、PID 可能被复用
-            if _norm_proc_name(psutil.Process(pid).name()) in blocked:
-                skipped += 1
-                continue
-            h = kernel32.OpenProcess(
-                PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid
-            )
+            h = kernel32.OpenProcess(_PROCESS_ACCESS, False, pid)
             if h:
                 try:
                     if psapi.EmptyWorkingSet(h):
@@ -160,3 +129,23 @@ def empty_selected_working_sets(pids, extra_blacklist=()) -> tuple:
         except Exception:
             continue
     return count, skipped
+
+
+def _all_process_pairs():
+    """整个进程表的 (pid, name)；psutil 拿不到的名字是 None。"""
+    for p in psutil.process_iter(["pid", "name"]):
+        yield p.info["pid"], p.info.get("name")
+
+
+def _selected_process_pairs(pids):
+    """按 PID 现场重取名：上一步采样到现在进程可能已退出、PID 可能被复用。
+
+    取不到名字的 PID 整条丢弃（不计入跳过），与调用方「单个失败不影响其余」一致。
+    """
+    for pid in pids:
+        try:
+            pid = int(pid)
+            name = None if pid in (0, 4) else psutil.Process(pid).name()
+        except Exception:
+            continue
+        yield pid, name
