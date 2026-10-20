@@ -168,6 +168,8 @@ def test_kill_process_success_terminates_and_counts(monkeypatch):
     """放行的进程被真结束，且只累计 process_killed，不写 count/freed 账本。"""
     fake = _patch_kernel(monkeypatch)
     _patch_proc(monkeypatch, _FakeProc(5000))
+    # 结束后要等目标真正退出；这里固定为“已退出”，不依赖真实系统 PID 状态
+    monkeypatch.setattr(clean, "_wait_process_gone", lambda pid, timeout=None: True)
     seen = []
     _bump(monkeypatch, seen)
     r = clean.kill_process(5000, "victim.exe", {"process_kill_min_mb": 64})
@@ -202,6 +204,7 @@ def test_kill_process_loads_config_when_cfg_is_none(monkeypatch):
     monkeypatch.setattr(clean, "load_config",
                         lambda: {"process_kill_min_mb": 1})
     _bump(monkeypatch, [])
+    monkeypatch.setattr(clean, "_wait_process_gone", lambda pid, timeout=None: True)
     assert clean.kill_process(5000, "victim.exe")["ok"] is True
     assert fake.terminated == [77]
 
@@ -466,3 +469,35 @@ def test_overview_kill_path_requires_confirmation(monkeypatch):
     ui.run_kill([("victim.exe", 5000)], lambda: refreshed.append(1))
     assert refreshed == []
 
+def test_kill_process_waits_for_real_exit(monkeypatch):
+    """TerminateProcess 返回成功但进程还活着：不得上报成功。
+
+    TerminateProcess 是异步的，返回 True 只代表终止请求被接受。若此时就报
+    “已结束”，用户会看到进程还在，看起来就像关不掉。
+    """
+    fake = _patch_kernel(monkeypatch)
+    _patch_proc(monkeypatch, _FakeProc(5000))
+    seen = []
+    _bump(monkeypatch, seen)
+    monkeypatch.setattr(clean, "_wait_process_gone", lambda pid, timeout=None: False)
+    r = clean.kill_process(5000, "victim.exe", {})
+    assert r["ok"] is False
+    assert fake.terminated == [77]
+    assert seen == []
+
+
+def test_wait_process_gone_polls_until_gone(monkeypatch):
+    """等待函数自己：进程在前几轮还活着，之后消失时返回 True。"""
+    seq = iter([True, True, True, False])
+    monkeypatch.setattr(clean.psutil, "pid_exists", lambda pid: next(seq))
+    monkeypatch.setattr(clean.time, "sleep", lambda s: None)
+    assert clean._wait_process_gone(5000) is True
+
+
+def test_wait_process_gone_times_out(monkeypatch):
+    """超过上限还活着时返回 False，不无限等下去。"""
+    monkeypatch.setattr(clean.psutil, "pid_exists", lambda pid: True)
+    clock = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+    monkeypatch.setattr(clean.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(clean.time, "sleep", lambda s: None)
+    assert clean._wait_process_gone(5000, timeout=3.0) is False

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-界面层：托盘图标绘制、气泡提示、Top10 / 趋势 / 优化建议窗口。
+界面层：托盘图标绘制、气泡提示，内存概览 / Top10 / 趋势 / 优化建议窗口。
 
 只负责「怎么展示」，不做业务编排：
     - 进程遍历 / 清理编排见 clean.py
@@ -428,6 +428,22 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
         table.tag_configure("odd" if i % 2 else "even",
                             background="#f7f9fb" if i % 2 else "#ffffff")
 
+    # 右键「结束选中的进程」菜单（概览窗 Top5 操作入口，v1.25.0 补丁）
+    item_procs: dict = {}
+    popup = tk.Menu(root, tearoff=0)
+
+    def on_kill() -> None:
+        sel = table.selection()
+        if not sel:
+            return
+        procs = item_procs.get(sel[0], [])
+        if not procs:
+            return
+        run_kill(procs, refresh)
+
+    popup.add_command(label="结束选中的进程", command=on_kill)
+    table.bind("<Button-3>", lambda e: popup.tk_popup(e.x_root, e.y_root))
+
     def refresh(with_table: bool = True) -> None:
         s = get_mem()
         pct_texts, detail_text, free_text = _mem_lines(s)
@@ -449,8 +465,16 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
             rows = _top_grouped(5)
             stats["rows"] = rows
             table.delete(*table.get_children())
+            item_procs.clear()
+            raw = top_processes_list(20)
             for i, values in enumerate(_table_rows(rows, s["total_phys"])):
-                table.insert("", "end", values=values, tags=(("odd" if i % 2 else "even"),))
+                item = table.insert("", "end", values=values, tags=(("odd" if i % 2 else "even"),))
+                shown = str(values[0])
+                base = shown.split("×")[0]
+                # 与 Top10 同一口径：按名字匹配全部
+                # 实例 (name, pid)，不用组行的「最大 PID」
+                item_procs[item] = [(nm, pid) for nm, _rss, pid in raw
+                                    if _norm_proc_name(nm) == _norm_proc_name(base)]
 
     btns = ttk.Frame(root, padding=12)
     btns.pack(fill="x")
@@ -548,7 +572,7 @@ def show_top_window() -> None:
 
 
 def run_kill(procs, refresh=None) -> None:
-    """Top10 右键「结束选中的进程」的判定流程：总开关 -> 确认框 -> 逐个结束 -> 汇报。
+    """概览窗 / Top10 右键「结束选中的进程」的判定流程：总开关 -> 确认框 -> 逐个结束 -> 汇报。
 
     procs 是 [(name, pid), ...]（同一名字的多个实例一起结束）。整段抽成模块级函数
     是为了让保护判定可被直接测试——闭包在 tk 里，测试碰不到。任何一步只弹提示、

@@ -1020,6 +1020,14 @@ def kill_process(pid: int, name: str | None = None, cfg: dict | None = None) -> 
         return result
     # 真正结束（terminate_process 内部再核对名防 PID 复用）
     ok = terminate_process(pid, expected_name=pname)
+    # TerminateProcess 是异步的：返回 True 只代表终止请求被接受，目标进程还要
+    # 一会儿才真正消失。这里等到它退出（或超时）再上报，否则界面说「已结束」
+    # 而任务管理器里进程还在，看起来就像结束失败。
+    if ok:
+        ok = _wait_process_gone(pid)
+        if not ok:
+            log(f"kill_process: PID {pid} 终止请求已接受但进程未在 "
+                f"{_KILL_EXIT_TIMEOUT:.0f}s 内退出")
     result["ok"] = bool(ok)
     if ok:
         result["msg"] = f"已结束进程 {pname} (PID {pid})"
@@ -1080,3 +1088,21 @@ def top_processes(n: int = 10) -> str:
     lines = [f"{i + 1:>2}. {name:<28} {rss / 1024 ** 3:>6.2f} GB   (PID {pid})"
              for i, (name, rss, pid) in enumerate(top_processes_list(n))]
     return "\n".join(lines)
+_KILL_EXIT_TIMEOUT = 3.0   # TerminateProcess 后等待进程真正退出的上限（秒）
+_KILL_EXIT_POLL = 0.05     # 轮询间隔（秒）
+
+
+def _wait_process_gone(pid: int, timeout: float = _KILL_EXIT_TIMEOUT) -> bool:
+    """等待 pid 真正退出：TerminateProcess 是异步的，返回成功只表示终止请求已被接受。
+
+    Windows 让目标进程跑完 DLL 通知 / 句柄关闭 / I/O 刷新后才真正消失，
+    这中间有几百毫秒到数秒的窗口。不等待就上报成功，
+    用户会看到进程还在，看起来就像"关不掉"。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if not psutil.pid_exists(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_KILL_EXIT_POLL)

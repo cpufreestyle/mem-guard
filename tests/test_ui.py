@@ -570,3 +570,284 @@ def test_advice_window_passes_proc_history(monkeypatch):
     show_advice_window(lambda: {}, lambda: hist)
     assert _wait(box["ev"].is_set)
     assert seen and seen[-1] is hist, "callable 形式每次刷新现取 proc_history"
+
+# --------------------------------------- 概览窗 Top5 右键「结束选中的进程」（v1.25.0 补丁）
+
+
+class _FakeMenu:
+    """假右键菜单：记录注册的命令项与 tk_popup 坐标。"""
+
+    def __init__(self):
+        self.commands = {}
+        self.popped = None
+
+    def add_command(self, label=None, command=None):
+        self.commands[label] = command
+
+    def tk_popup(self, x, y):
+        self.popped = (x, y)
+
+
+class _FakeTable:
+    """假 Treeview：insert 发自增 item id，并记住每行 values，供右键语义断言。"""
+
+    def __init__(self):
+        self.items = []
+        self.rows = {}
+        self.bindings = {}
+        self.selected = []
+        self._seq = 0
+
+    def insert(self, parent, index, values=None, tags=()):
+        item = "i%d" % self._seq
+        self._seq += 1
+        self.items.append(item)
+        self.rows[item] = tuple(values or ())
+        return item
+
+    def delete(self, *items):
+        """只从表里摘掉这些 item；self.rows 的记录留着当「历史台账」。
+
+        真 Treeview 的 delete 会让 item 彻底不存在，测试里若要断言
+        「item_procs 不再引用它」，就必须有一份不被 delete 抹掉的记录
+        ——否则断言看到的只是替身自己的行为，实现里忘不掉映射也照样过。
+        """
+        for item in (items or tuple(self.items)):
+            if item in self.items:
+                self.items.remove(item)
+
+    def get_children(self):
+        return tuple(self.items)
+
+    def selection(self):
+        return tuple(self.selected)
+
+    def bind(self, sequence, handler):
+        self.bindings[sequence] = handler
+
+    def heading(self, *args, **kwargs):
+        pass
+
+    def column(self, *args, **kwargs):
+        pass
+
+    def pack(self, *args, **kwargs):
+        pass
+
+    def tag_configure(self, *args, **kwargs):
+        pass
+
+
+class _FakeWidget:
+    """空转替身构件；Button 的 command 留着，测试用它触发「刷新」。"""
+
+    def __init__(self, command=None):
+        self.command = command
+
+    def pack(self, *args, **kwargs):
+        pass
+
+    def config(self, *args, **kwargs):
+        pass
+
+    def __setitem__(self, key, value):
+        pass
+
+    def __getitem__(self, key):
+        return 0
+
+
+class _FakeTtk:
+    """假 ttk：Treeview / Menu / Button 走替身，其余构件一律空转。"""
+
+    def __init__(self, table):
+        self.table = table
+        self.buttons = []
+
+    def Treeview(self, *args, **kwargs):
+        return self.table
+
+    def Menu(self, *args, **kwargs):
+        return _FakeMenu()
+
+    def Button(self, *args, **kwargs):
+        button = _FakeWidget(command=kwargs.get("command"))
+        self.buttons.append(button)
+        return button
+
+    def __getattr__(self, name):
+        return lambda *a, **kw: _FakeWidget()
+
+
+class _FakeTk:
+    """假 tkinter：Tk() 给空转根窗口，Menu() 给可断言的右键菜单。"""
+
+    def __init__(self, table):
+        self.table = table
+        self.menus = []
+
+    def Tk(self):
+        return _FakeOverviewRoot()
+
+    def Menu(self, *args, **kwargs):
+        menu = _FakeMenu()
+        self.menus.append(menu)
+        return menu
+
+
+class _FakeOverviewRoot:
+    def title(self, *args, **kwargs):
+        pass
+
+    def geometry(self, *args, **kwargs):
+        pass
+
+    def attributes(self, *args, **kwargs):
+        pass
+
+    def iconphoto(self, *args, **kwargs):
+        pass
+
+    def update_idletasks(self):
+        pass
+
+    def winfo_exists(self):
+        return False
+
+    def after(self, delay, handler=None):
+        return None
+
+    def mainloop(self):
+        pass
+
+    def bind(self, *args, **kwargs):
+        pass
+
+    def pack(self, *args, **kwargs):
+        pass
+
+
+_MB = 1024 * 1024
+_GB = 1024 * 1024 * 1024
+
+_FAKE_MEM = {
+    "phys_pct": 61.2, "commit_pct": 55.0,
+    "used_phys": 10 * _GB, "total_phys": 16 * _GB, "avail_phys": 6 * _GB,
+    "used_commit": 12 * _GB, "total_commit": 24 * _GB, "avail_commit": 12 * _GB,
+}
+
+
+def _build_fake_overview(monkeypatch, hooks=None, groups=None, raw=None):
+    """用假 tkinter 把概览窗建起来，返回 (table, ttk, menus, killed)。
+
+    不碰真窗口：apply_window_icon 换空操作，after 不排程，mainloop 空转。
+    groups / raw 传列表或 callable 均可（callable 用来模拟「刷新前后数据变了」）。
+    """
+    table = _FakeTable()
+    tk = _FakeTk(table)
+    ttk = _FakeTtk(table)
+    monkeypatch.setattr(ui, "apply_window_icon", lambda root: None)
+    monkeypatch.setattr(ui, "get_mem", lambda: _FAKE_MEM)
+
+    def grouped(n):
+        if callable(groups):
+            return list(groups(n))
+        return list(groups) if groups is not None else []
+
+    def raw_list(n):
+        if callable(raw):
+            return list(raw(n))
+        return list(raw) if raw is not None else []
+
+    monkeypatch.setattr(ui, "_top_grouped", grouped)
+    monkeypatch.setattr(ui, "top_processes_list", raw_list)
+    killed = []
+    monkeypatch.setattr(ui, "run_kill",
+                        lambda procs, refresh: killed.append(list(procs)))
+    ui._build_overview(tk, ttk, {"clean": lambda: None} if hooks is None else hooks)
+    return table, ttk, tk.menus, killed
+
+
+def test_overview_right_click_kills_every_instance_of_selected_row(monkeypatch):
+    """概览窗 Top5 右键：多实例行要结束该名字的全部实例。
+
+    组行只带一个「最大 PID」，照它结束就只剩一个 chrome 被杀掉，剩下的还在吃内存。
+    """
+    raw = [("chrome.exe", 300 * _MB, 1111),
+           ("chrome.exe", 300 * _MB, 2222),
+           ("chrome.exe", 300 * _MB, 3333),
+           ("Code.exe", 500 * _MB, 4444)]
+    groups = [("chrome.exe", 900 * _MB, 3, 3333), ("Code.exe", 500 * _MB, 1, 4444)]
+    table, ttk, menus, killed = _build_fake_overview(
+        monkeypatch, groups=groups, raw=raw)
+
+    assert len(table.items) == 2
+    assert "×3" in table.rows[table.items[0]][0]
+    menu = menus[-1]
+    assert "结束选中的进程" in menu.commands
+    assert "<Button-3>" in table.bindings
+
+    table.selected = [table.items[0]]
+    menu.commands["结束选中的进程"]()
+    assert killed == [[("chrome.exe", 1111), ("chrome.exe", 2222),
+                       ("chrome.exe", 3333)]]
+
+
+def test_overview_right_click_without_selection_does_nothing(monkeypatch):
+    """没选中行时右键不结束任何进程，菜单本身仍要能弹出来。"""
+    table, ttk, menus, killed = _build_fake_overview(
+        monkeypatch,
+        groups=[("chrome.exe", 300 * _MB, 1, 1111)],
+        raw=[("chrome.exe", 300 * _MB, 1111)])
+    menu = menus[-1]
+
+    table.selected = []
+    menu.commands["结束选中的进程"]()
+    assert killed == []
+
+    event = type("E", (), {"x_root": 5, "y_root": 7})()
+    assert table.bindings["<Button-3>"](event) is None
+    assert menu.popped == (5, 7)
+
+
+def test_overview_refresh_remaps_rows_to_current_processes(monkeypatch):
+    """重建表格后旧 item 必须失效，否则右键会把上一轮的进程也带上。
+
+    表格是 delete 后重新 insert 的，item_procs 若只增不减，用户刷新前右键一次
+    就可能杀掉已经不在榜上的进程——杀错比不杀更糟。
+    """
+    rounds = [
+        ([("chrome.exe", 300 * _MB, 1, 1111)], [("chrome.exe", 300 * _MB, 1111)]),
+        ([("Code.exe", 500 * _MB, 1, 4444)], [("Code.exe", 500 * _MB, 4444)]),
+    ]
+    step = {"n": 0}
+
+    def grouped(n):
+        return rounds[min(step["n"], 1)][0]
+
+    def raw_list(n):
+        return rounds[min(step["n"], 1)][1]
+
+    table, ttk, menus, killed = _build_fake_overview(
+        monkeypatch, groups=grouped, raw=raw_list)
+
+    old = table.items[0]
+    assert "chrome.exe" in table.rows[old][0]
+
+    step["n"] = 1
+    ttk.buttons[1].command()                 # 「刷新」按钮
+    assert table.items[0] != old, "重建后应拿到新的 item id"
+    assert old not in table.items, "旧 item 已不在表里"
+    # The ledger keeps the old row (delete does not wipe rows), so these assertions
+    # exercise the implementation, not the fake table: item_procs must be cleared
+    # together with the rebuild, otherwise a right click before the next refresh
+    # would also end the processes of the previous round.
+    assert table.rows.get(old) and "chrome.exe" in table.rows[old][0], "ledger keeps the old row"
+    table.selected = [old]
+    menus[-1].commands["结束选中的进程"]()
+    assert killed == [], "item_procs must be cleared with the rebuild"
+
+    # Clearing must not wipe the fresh row either: the current round still works.
+    table.selected = [table.items[0]]
+    menus[-1].commands["结束选中的进程"]()
+    assert killed == [[("Code.exe", 4444)]], "fresh row only"
