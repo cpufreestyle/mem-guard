@@ -22,10 +22,12 @@ from .config import (
     normalize_config,
 )
 from . import foreground
+from . import menutips
 from .hotkeys import (action_specs, choice_clashes, choice_specs,
                      choices_are_usable, parse_hotkey)
 from . import idle
 import psutil
+import pystray
 from .clean import do_clean, kill_process, top_processes
 from .advisor import analyze, format_advice
 from .autostart import autostart_enabled
@@ -147,6 +149,48 @@ def selftest() -> int:
         f"{len(format_advice(analyze(normalize_config({}))))} 字符"
     ))
     check("build_menu", lambda: f"菜单构建成功（{type(build_menu(Guard())).__name__}）")
+
+    def _menu_tips_probe() -> str:
+        """只核对菜单悬停说明与真实菜单项的对应关系，不建窗口、不起线程。
+
+        三条都要成立，否则说明窗会在用户划过菜单时静默失灵：
+        ① 每条说明的键都能命中一个叶子项（带子菜单的父项划不出说明窗）；
+        ② 每条自适应档位（adapters.label）自己就带着说明；
+        ③ 至少 40 个叶子项有说明——低于这个数说明菜单大改后这里没跟上。
+        分隔线不算项：v1.27.0 分组收纳后菜单里多了十条八条 - - - -，
+        把它们计进分母，「43/108」这种数字就再也看不出覆盖率是升是降了。
+        """
+        tree = build_menu(Guard())
+        leaf, popup = [], []
+
+        def walk(items):
+            for it in items:
+                if it is pystray.Menu.SEPARATOR:
+                    continue
+                label = str(it.text)
+                sub = getattr(it, "submenu", None)
+                (popup if sub else leaf).append(label)
+                if sub:
+                    walk(sub)
+
+        walk(tree.items)
+        dead = sorted(k for k in menutips.tip_keys()
+                      if k not in leaf and not any(l.startswith(k) for l in leaf))
+        assert not dead, f"说明键在菜单里划不到: {dead}"
+        on_parent = sorted(k for k in menutips.tip_keys()
+                          if k in popup and k not in leaf)
+        assert not on_parent, f"说明写在了带子菜单的父项上: {on_parent}"
+        no_tip = [a.label for a in ADAPTERS if not a.tip]
+        assert not no_tip, f"自适应档位缺说明: {no_tip}"
+        covered = sum(1 for l in leaf if menutips.tip_for(l))
+        assert covered >= 40, f"只有 {covered} 个叶子项有说明"
+        keys = menutips.tip_keys()
+        assert len(keys) == menutips.tip_count(), "tip_keys 与 tip_count 口径不一致"
+        return (f"{covered}/{len(leaf)} 叶子项有说明, {len(keys)} 条键"
+                f"（精确 {len(menutips.TIPS)} + 动态前缀 {len(keys) - len(menutips.TIPS)}）"
+                f"全部可达")
+
+    check("菜单悬停说明对账", _menu_tips_probe)
     check("sha256校验", lambda: (
         f"清单解析->{parse_checksums('a' * 64 + '  mem_guard.exe', 'mem_guard.exe') == 'a' * 64}, "
         f"挑清单->{find_checksums_asset([{'name': 'checksums.txt', 'browser_download_url': 'u'}])['name']}, "
@@ -184,18 +228,23 @@ def selftest() -> int:
     def _kill_probe() -> str:
         """只验证 kill_process 的保护判定，绝不真的结束任何进程。
 
-        三条都是必然被拒绝的输入：PID 0 是系统保留、本进程 PID 触发自杀保护、
-        不存在的 PID 取不到进程信息（RSS=0）走到 terminate_process 仍失败。
+        四条都是必然被拒绝的输入：PID 0 是系统保留、本进程 PID 触发自杀保护、
+        不存在的 PID 取不到进程信息（RSS=0）走到 terminate_process 仍失败、
+        名字是 vmmemWSL 时撞虚拟机宿主保护（v1.28.0：这类进程读的是传入的名字，
+        不依赖机器上此刻到底有没有在跑 WSL）。
         任何一条返回 ok=True 就说明保护形同虚设。
         """
         cfg = normalize_config({})
         dead = 2 ** 22
         while psutil.pid_exists(dead):
             dead += 1
-        rows = [(0, "PID 0"), (os.getpid(), "本进程"), (dead, "不存在 PID")]
+        rows = [(0, "probe.exe", "PID 0"),
+                (os.getpid(), "probe.exe", "本进程"),
+                (dead, "probe.exe", "不存在 PID"),
+                (dead, "vmmemWSL", "虚拟机宿主")]
         rejected = []
-        for pid, label in rows:
-            r = kill_process(pid, "probe.exe", cfg)
+        for pid, name, _label in rows:
+            r = kill_process(pid, name, cfg)
             rejected.append(not r["ok"])
         return "全部拒绝->%s" % all(rejected)
 

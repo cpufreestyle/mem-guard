@@ -19,10 +19,11 @@ from memguard import actions, clean, config, foreground, menu, ui
 class _FakeKernel:
     """顶掉 winapi.kernel32：OpenProcess 给假句柄，TerminateProcess 只记账。"""
 
-    def __init__(self, handle=77, open_ok=True, term_ok=True):
+    def __init__(self, handle=77, open_ok=True, term_ok=True, last_error=5):
         self.handle = handle
         self.open_ok = open_ok
         self.term_ok = term_ok
+        self.last_error = last_error
         self.opened = []
         self.terminated = []
         self.closed = []
@@ -38,6 +39,9 @@ class _FakeKernel:
     def CloseHandle(self, handle):
         self.closed.append(handle)
         return True
+
+    def GetLastError(self):
+        return self.last_error
 
 
 class _FakeProc:
@@ -501,3 +505,131 @@ def test_wait_process_gone_times_out(monkeypatch):
     monkeypatch.setattr(clean.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(clean.time, "sleep", lambda s: None)
     assert clean._wait_process_gone(5000, timeout=3.0) is False
+
+
+# ------------------------------------------------ v1.28.0 失败必须带原因（用户报「无法删除」）
+
+
+def test_open_denied_reason_reaches_the_user(monkeypatch):
+    """OpenProcess 被拒（错误码 5）：对话框要说清是权限不足，不能只回一句「失败」。
+
+    v1.27.0 真机反馈：点 vmmemWSL 只弹「结束进程 vmmemWSL (PID 29300) 失败」，
+    用户据此反复点、并判定软件坏了。原因在系统那侧（Session 0 / SYSTEM 拥有）。
+    """
+    fake = _patch_kernel(monkeypatch, open_ok=False, last_error=5)
+    _patch_proc(monkeypatch, _FakeProc(29300, name="someproc.exe"))
+    monkeypatch.setattr(clean, "_wait_process_gone", lambda pid, timeout=None: True)
+    r = clean.kill_process(29300, "someproc.exe", {})
+    assert r["ok"] is False
+    assert "权限不足" in r["msg"], r["msg"]
+    assert "SYSTEM" in r["msg"]
+    assert fake.opened == [29300]
+
+
+def test_unknown_error_code_still_reports_the_code(monkeypatch):
+    """没列进翻译表的错误码也要带出来：一句「失败」和一句「失败（错误码 1168）」差很多。"""
+    _patch_kernel(monkeypatch, open_ok=False, last_error=1167)
+    _patch_proc(monkeypatch, _FakeProc(6000))
+    r = clean.kill_process(6000, "victim.exe", {})
+    assert r["ok"] is False
+    assert "1167" in r["msg"], r["msg"]
+
+
+def test_terminate_rejected_reason_and_handle_still_closed(monkeypatch):
+    """句柄开到了但 TerminateProcess 被拒：同样要说清原因，且句柄照样关掉。"""
+    fake = _patch_kernel(monkeypatch, term_ok=False, last_error=5)
+    _patch_proc(monkeypatch, _FakeProc(6000))
+    r = clean.kill_process(6000, "victim.exe", {})
+    assert r["ok"] is False
+    assert "权限不足" in r["msg"]
+    assert fake.closed == [77]
+
+
+def test_wait_timeout_says_the_exit_is_still_pending(monkeypatch):
+    """终止请求已接受却没按时退出：要说「还在退出」，不是笼统的失败。"""
+    _patch_kernel(monkeypatch)
+    _patch_proc(monkeypatch, _FakeProc(5000))
+    monkeypatch.setattr(clean, "_wait_process_gone", lambda pid, timeout=None: False)
+    r = clean.kill_process(5000, "victim.exe", {})
+    assert r["ok"] is False
+    assert "终止请求" in r["msg"] and "没有退出" in r["msg"]
+
+
+def test_terminate_process_bool_shell_unchanged(monkeypatch):
+    """老外壳仍是纯布尔：别为了带原因把每个调用点都改成解包。"""
+    fake = _patch_kernel(monkeypatch, open_ok=False)
+    _patch_proc(monkeypatch, _FakeProc(6000))
+    assert actions.terminate_process(6000, "victim.exe") is False
+    ok, why = actions.terminate_process_with_reason(6000, "victim.exe")
+    assert ok is False and "权限不足" in why
+    assert fake.opened == [6000, 6000]
+
+
+# ------------------------------------------------ v1.28.0 虚拟机宿主：挡结束，不挡清理
+
+
+def test_vm_host_names_are_kill_protected():
+    """vmmem / vmmemWSL / vmmemNetProxy / vmcompute / vmwp 全部拒杀，普通进程照旧放行。"""
+    for nm in ("vmmem", "vmmemWSL", "vmmemNetProxy", "vmcompute.exe", "vmwp"):
+        assert clean.can_kill(nm) is False, nm
+        reason = clean.kill_protect_reason(nm)
+        assert "虚拟机宿主" in reason and "wsl --shutdown" in reason, nm
+    for nm in ("chrome.exe", "Qoder CN.exe", "comet.exe"):
+        assert clean.can_kill(nm) is True, nm
+
+
+def test_vm_host_is_not_clean_blacklisted():
+    """只挡结束，绝不能挡清理：清空 vmmem 的工作集是这台机器上最划算的一刀。"""
+    for nm in ("vmmem", "vmmemWSL"):
+        assert config.name_in_blacklist(nm, config.CLEAN_BLACKLIST_STEMS) is False, nm
+        assert config.name_in_blacklist(nm, config.PROCESS_KILL_VMHOST_STEMS) is True, nm
+
+
+def test_kill_process_rejects_vm_host_before_touching_handles(monkeypatch):
+    """命中虚拟机宿主保护：一个句柄都不开，话术给出「用立即清理 / wsl --shutdown」。"""
+    fake = _patch_kernel(monkeypatch)
+    _patch_proc(monkeypatch, _FakeProc(29300, name="vmmemWSL", rss=2 * 1024 ** 3))
+    r = clean.kill_process(29300, "vmmemWSL", {})
+    assert r["ok"] is False
+    assert fake.opened == []
+    assert "虚拟机宿主" in r["msg"] and "黑名单" not in r["msg"]
+
+
+def test_menu_lists_vm_host_as_unprotected_free_but_unkillable(monkeypatch):
+    """Top8 里 vmmem 仍然列出来（占榜首，删掉会让人以为没看见），但标「受保护」点不动。"""
+    rows = [("vmmemWSL", 2 * 1024 ** 3, 29300),
+            ("victim.exe", 256 * 1024 * 1024, 5000)]
+    monkeypatch.setattr(menu, "top_processes_list", lambda n: rows)
+    guard, m = _build_menu(monkeypatch, {"process_kill_enabled": True})
+
+    def submenu_items(label):
+        """深度找到父项并取其子菜单——按**求值后**的文案找。
+
+        pystray 把字符串也存成 callable，所以要比 `.text`；而根菜单头几行是实时状态
+        （要 guard.state），读它们的 `.text` 会抛 AttributeError，getattr 的默认值
+        正好把它们跳过去——这个假 guard 只带 cfg，逐行求值整棵树会在无关处炸掉。
+        """
+        def find(node):
+            for it in node.items:
+                sub = getattr(it, "submenu", None)
+                if str(getattr(it, "text", "")) == label and sub is not None:
+                    return sub
+                if sub is not None:
+                    got = find(sub)
+                    if got is not None:
+                        return got
+            return None
+
+        got = find(m)
+        assert got is not None, f"菜单里没有「{label}」"
+        return list(got.items)
+
+    items = submenu_items("结束进程（内存占用 Top8）")
+    found = {str(it.text): it for it in items}
+    vm = next(t for t in found if t.startswith("vmmemWSL"))
+    vic = next(t for t in found if t.startswith("victim.exe"))
+    assert vm.endswith("· 受保护"), vm
+    assert found[vm]._enabled(None) is False
+    assert found[vic]._enabled(None) is True
+    # 只有能安全结束的行才点得动
+    assert [t for t in found if found[t]._enabled(None)] == [vic]

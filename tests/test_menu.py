@@ -38,17 +38,29 @@ class _FakeGuard:
         pass
 
 
-def _find_item(menu_tree, label):
-    """按文案取一级菜单项（动态文案菜单项会先求值，这里只取静态文案项）。"""
+def _walk_items(menu_tree):
+    """深度优先摊平整棵树（v1.27.0 起菜单分了组，按一级查找会找不到项）。"""
     for item in menu_tree.items:
+        yield item
+        sub = getattr(item, "submenu", None)
+        if sub:
+            yield from _walk_items(sub)
+
+
+def _find_item(menu_tree, label):
+    """按文案取菜单项（递归；v1.27.0 起低频项都收进了父项）。
+
+    动态文案菜单项会先求值，这里只取静态文案项。
+    """
+    for item in _walk_items(menu_tree):
         if item.text == label:
             return item
     raise AssertionError(f"菜单里找不到「{label}」")
 
 
 def _find_item_by_text(menu_tree, needle):
-    """按文案片段取菜单项：动态文案项会先求值，故只能按包含关系找。"""
-    for item in menu_tree.items:
+    """按文案片段取菜单项：动态文案项会先求值，故只能按包含关系找（递归）。"""
+    for item in _walk_items(menu_tree):
         if needle in str(item.text):
             return item
     raise AssertionError(f"菜单里找不到含「{needle}」的菜单项")
@@ -265,13 +277,13 @@ def test_update_now_reads_live_config(monkeypatch):
 def test_stats_line_shows_escalation_count():
     """统计行：有升档次数时追加「（升档 N 次）」，一次都没升档时不出现该字样。"""
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "escalated": 3}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "累计清理 5 次" in line
     assert "（升档 3 次）" in line
 
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "升档" not in line
 
@@ -279,13 +291,13 @@ def test_stats_line_shows_escalation_count():
 def test_stats_line_shows_targeted_count():
     """统计行：有定向清理次数时追加「（定向 N 次）」，没定向过时不出现该字样。"""
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "targeted": 2}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "累计清理 5 次" in line
     assert "（定向 2 次）" in line
 
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "定向" not in line
 
@@ -503,13 +515,13 @@ def test_menu_toggle_predict_clean_writes_current_config(monkeypatch):
 def test_stats_line_shows_preventive_count():
     """统计行：有预防次数时追加「（预防 N 次）」，没预防过时不出现该字样。"""
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "preventive": 2}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "累计清理 5 次" in line
     assert "（预防 2 次）" in line
 
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "预防" not in line
 
@@ -517,13 +529,13 @@ def test_stats_line_shows_preventive_count():
 def test_stats_line_shows_short_relief_count():
     """统计行：有效果偏短次数时追加「（短效 N 次）」，没短效过时不出现该字样。"""
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "short_relief": 2}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "累计清理 5 次" in line
     assert "（短效 2 次）" in line
 
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "短效" not in line
 
@@ -550,13 +562,13 @@ def test_menu_toggle_bg_trim_writes_current_config(monkeypatch):
 def test_stats_line_shows_bg_trim_count():
     """统计行：有后台工作集清理次数时追加「（后台 N 次）」，没清理过时不出现该字样。"""
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "bg_trimmed": 2}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "累计清理 5 次" in line
     assert "（后台 2 次）" in line
 
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                 if isinstance(i.text, str) and "累计清理" in i.text)
     assert "后台" not in line
 
@@ -613,26 +625,26 @@ def test_menu_toggle_stage_deepen_writes_current_config(monkeypatch):
 def test_stats_line_shows_deepen_count():
     """统计行：有定向加深次数时追加「（加深 N 次）」，没走过时不出现该字样。"""
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "deepen": 2}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                  if isinstance(i.text, str) and "累计清理" in i.text)
     assert "累计清理 5 次" in line
     assert "（加深 2 次）" in line
 
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                  if isinstance(i.text, str) and "累计清理" in i.text)
     assert "加深" not in line
 
 def test_stats_line_shows_sticky_count():
     """统计行：有粘滞激进次数时追加「（粘滞 N 次）」，没走过时不出现该字样。"""
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "sticky": 2}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                  if isinstance(i.text, str) and "累计清理" in i.text)
     assert "累计清理 5 次" in line
     assert "（粘滞 2 次）" in line
 
     guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
-    line = next(i.text for i in build_menu(guard).items
+    line = next(i.text for i in _walk_items(build_menu(guard))
                  if isinstance(i.text, str) and "累计清理" in i.text)
     assert "粘滞" not in line
 
@@ -760,7 +772,7 @@ def test_menu_toggle_threshold_adapt_writes_current_config(monkeypatch):
 
 def test_all_adapter_toggles_present_and_labelled_from_registry():
     """8 条自适应开关必须都在菜单里，文案与注册表逐字一致。"""
-    labels = {i.text for i in build_menu(_FakeGuard()).items}
+    labels = {i.text for i in _walk_items(build_menu(_FakeGuard()))}
     for a in adapters.ADAPTERS:
         assert a.label in labels, a.label
 
@@ -882,7 +894,109 @@ def test_v24_toggles_present_and_write_increments(monkeypatch):
 
 def test_v24_menu_shows_effective_hotkey_bindings():
     """键位摘要要跟着配置变：关掉总开关就明说关掉了，别让人猜。"""
-    texts = [str(i.text) for i in build_menu(_FakeGuard()).items]
+    texts = [str(i.text) for i in _walk_items(build_menu(_FakeGuard()))]
     assert any("Ctrl+Alt+M" in t and "立即清理" in t for t in texts), texts
     off = _FakeGuard({"hotkey_enabled": False})
-    assert "全局热键：已关闭" in [str(i.text) for i in build_menu(off).items]
+    assert "全局热键：已关闭" in [str(i.text) for i in _walk_items(build_menu(off))]
+
+
+# -- v1.27.0 分组收纳：菜单只改形状，一个配置键都没删 --
+# 断言的是「形状」而不是「条数」：低频项必须待在指定父项里、日常项必须留在根菜单。
+# 谁哪天把这些项挪回根菜单（或者挪错父项、删掉某项），这里立刻红。
+
+SEPARATOR = "- - - -"
+
+GROUPED = {
+    "触发与阶梯": ["定时清理", "低内存触发", "启动时清理", "清理未达标自动升档",
+                   "定向清理内存大户", "后台进程工作集清理"],
+    "自适应与进阶": [a.label for a in adapters.ADAPTERS]
+                   + ["复位自适应闩", "持续高压粘滞激进", "阶段自学习(跳过无效阶段)",
+                      "定向清理加深(不达标前再撒宽一轮)", "趋势预防式清理"],
+    "热键与前台": ["全局热键（一键清理/概览/自动清理）", "快捷键设置",
+                   "全屏应用时暂停自动清理", "保护前台进程（不清空工作集）",
+                   "鼠标悬停显示说明"],
+    "结束进程": ["关闭进程功能", "结束进程前弹确认框", "结束进程（内存占用 Top8）"],
+    "更新设置": ["立即更新到最新版", "自动更新（后台检查）", "下载后自动安装",
+                 "更新包 sha256 校验"],
+}
+
+GUIDES = {
+    "触发与阶梯": "什么时候动手、动手按什么顺序；动手线在「清理阈值」与「清理冷却」里",
+    "自适应与进阶": "自适应 = MemGuard 自己改配置（会落盘）；下面每条都能单独关掉",
+    "结束进程": "六层保护：总开关 / 确认框 / 工作集下限 / 系统进程 / 自身进程 / 确认真退出；"
+              "「受保护」的行不给点",
+    "更新设置": "更新 = 后台查 Release + 下载；下面三项决定要不要自动装、装前验不验 sha256",
+}
+
+DAILY_AT_ROOT = ["内存概览（左键）", "立即清理", "内存占用 Top10", "内存趋势",
+                 "自动清理", "清理阈值", "清理力度", "清理冷却", "清理区域",
+                 "开机自启", "打开日志", "导出诊断", "退出"]
+
+
+def _root_labels(menu_tree):
+    """根级可见项文案（分隔线不算项）。"""
+    return [str(i.text) for i in menu_tree.items if str(i.text) != SEPARATOR]
+
+
+def _parent_map(menu_tree):
+    """{项文案: 父项文案或 None}；同名项只记第一次出现（父项归属看的是首次遍历）。"""
+    out = {}
+
+    def walk(items, owner):
+        for item in items:
+            label = str(item.text)
+            if label == SEPARATOR:
+                continue
+            out.setdefault(label, owner)
+            sub = getattr(item, "submenu", None)
+            if sub:
+                walk(sub, label)
+
+    walk(menu_tree.items, None)
+    return out
+
+
+def _parent_of(menu_tree, label):
+    """取某项的父项文案；动态文案项（如「复位自适应闩（…）」）按前缀匹配。"""
+    owners = _parent_map(menu_tree)
+    if label in owners:
+        return owners[label]
+    for text, owner in owners.items():
+        if text.startswith(label):
+            return owner
+    raise AssertionError(f"菜单里找不到「{label}」")
+
+
+def test_root_menu_is_short_after_grouping():
+    """整合的目标是根菜单别再一屏滚不到底：收进父项后根级项不超过 30 个。"""
+    roots = _root_labels(build_menu(_FakeGuard()))
+    assert len(roots) <= 30, f"根菜单 {len(roots)} 项：{roots}"
+    for parent, members in GROUPED.items():
+        assert parent in roots, f"父项「{parent}」没在根菜单里"
+        leaked = [m for m in members if m in roots]
+        assert not leaked, f"这些项还占着根菜单：{leaked}"
+
+
+def test_grouped_items_sit_under_their_parent():
+    tree = build_menu(_FakeGuard())
+    for parent, members in GROUPED.items():
+        for member in members:
+            assert _parent_of(tree, member) == parent,                 f"「{member}」应在「{parent}」里，实际在「{_parent_of(tree, member)}」"
+
+
+def test_each_group_opens_with_its_one_line_guide():
+    """父项自己划不出说明窗，所以该说的一句话放在组内第一条不可点的说明行上。"""
+    tree = build_menu(_FakeGuard())
+    for parent, guide in GUIDES.items():
+        first = _find_item(tree, parent).submenu.items[0]
+        assert str(first.text) == guide, f"「{parent}」首行文案变了：{first.text}"
+        assert first.enabled is False, f"「{parent}」首行必须不可点"
+
+
+def test_daily_controls_stay_at_root():
+    """日常要动的项不能被收进任何父项——整合只挪低频项，不藏常用项。"""
+    tree = build_menu(_FakeGuard())
+    roots = _root_labels(tree)
+    for label in DAILY_AT_ROOT:
+        assert label in roots, f"「{label}」被收进了父项，日常操作要多点一层"
+        assert _parent_of(tree, label) is None, f"「{label}」不再是根级项"

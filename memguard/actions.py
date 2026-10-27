@@ -95,6 +95,88 @@ def empty_selected_working_sets(pids, extra_blacklist=()) -> tuple:
 # OpenProcess 所需的最小权限；EmptyWorkingSet / OpenProcess 的类型声明见 winapi.py
 _PROCESS_ACCESS = 0x0400 | 0x0100      # PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA
 
+# OpenProcess 失败时的人话原因（错误码 -> 说明）。没列出来的码走兜底文案，
+# 至少把码号带给用户，别再让他对着一句「失败」猜。
+_TERMINATE_ERROR_REASONS = {
+    2: "进程已经不存在（可能刚自己退出了）",
+    3: "进程路径无效或已经被回收",
+    5: "权限不足：这个进程由 SYSTEM 或别的账户拥有，当前令牌拿不到终止句柄。"
+       "以管理员运行也常常不够——清理时临时启用的 SeDebugPrivilege 只在清理那几秒开着，"
+       "结束进程不走那条路",
+    87: "参数无效（PID 不存在或已被回收）",
+    1168: "该进程受系统保护，拒绝打开句柄",
+}
+
+
+def _last_error() -> int | None:
+    """取上一次 Win32 调用失败的错误码；取不到返回 None（测试替身常不带 GetLastError）。"""
+    try:
+        return int(kernel32.GetLastError())
+    except Exception:
+        return None
+
+
+def _error_reason(code: int | None, fallback: str) -> str:
+    why = _TERMINATE_ERROR_REASONS.get(code)
+    if why:
+        return why
+    return f"{fallback}（错误码 {code}）" if code is not None else fallback
+
+
+def terminate_process_with_reason(pid: int,
+                                  expected_name: str | None = None) -> tuple[bool, str]:
+    """terminate_process 的带原因版本：返回 (是否成功, 失败原因)。
+
+    成功时原因为空串。v1.28.0 加这一层，是因为「结束进程 X 失败」这句废话把真正的
+    门槛藏住了：vmmemWSL 这类 Session 0 / SYSTEM 拥有的进程，OpenProcess 直接
+    ERROR_ACCESS_DENIED，用户在菜单里只会反复点到同一句失败。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        log(f"terminate_process: 非法 PID {pid!r}，已跳过")
+        return False, "PID 无效"
+    if pid in (0, 4):
+        log(f"terminate_process: PID {pid} 是系统保留进程，已跳过")
+        return False, "PID 0/4 是系统保留进程"
+    if pid == os.getpid():
+        log(f"terminate_process: PID {pid} 是本进程，已跳过（自杀保护）")
+        return False, "这是 MemGuard 自己"
+    if expected_name is not None:
+        try:
+            actual = psutil.Process(pid).name()
+        except Exception:
+            log(f"terminate_process: 无法读取 PID {pid} 进程名（可能已退出），已跳过")
+            return False, "已经找不到这个进程（可能刚退出）"
+        if _norm_proc_name(actual) != _norm_proc_name(expected_name):
+            log(f"terminate_process: PID {pid} 名 {actual!r} 与期望 {expected_name!r} 不符（PID 可能已复用），已跳过")
+            return False, f"PID {pid} 上现在是另一个进程（{actual}），为防止杀错已停手"
+    handle = None
+    try:
+        handle = kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
+        if not handle:
+            code = _last_error()
+            why = _error_reason(code, "系统拒绝打开该进程的终止句柄")
+            log(f"terminate_process: OpenProcess(PID={pid}) 失败"
+                f"{'' if code is None else f'（错误码 {code}）'}，已跳过")
+            return False, why
+        ok = bool(kernel32.TerminateProcess(handle, 0))
+        if not ok:
+            code = _last_error()
+            log(f"terminate_process: TerminateProcess(PID={pid}) 返回 False")
+            return False, _error_reason(code, "终止请求被系统拒绝")
+        return True, ""
+    except Exception as e:
+        log(f"terminate_process: PID {pid} 异常 {e!r}，已跳过")
+        return False, f"调用系统接口时出错（{e!r}）"
+    finally:
+        if handle:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+
 def terminate_process(pid: int, expected_name: str | None = None) -> bool:
     """强制结束指定 PID 的进程（TerminateProcess），失败-软，绝不抛出。
 
@@ -105,46 +187,10 @@ def terminate_process(pid: int, expected_name: str | None = None) -> bool:
         用 _norm_proc_name 比对，不符直接返回 False（防 PID 复用：刚采样到的
         PID 可能已被另一个进程复用，直接 TerminateProcess 会杀错目标）；
       - 任何异常只记日志、返回 False，不影响主流程。
+
+    需要知道「为什么失败」请调 terminate_process_with_reason，本函数是它的布尔外壳。
     """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        log(f"terminate_process: 非法 PID {pid!r}，已跳过")
-        return False
-    if pid in (0, 4):
-        log(f"terminate_process: PID {pid} 是系统保留进程，已跳过")
-        return False
-    if pid == os.getpid():
-        log(f"terminate_process: PID {pid} 是本进程，已跳过（自杀保护）")
-        return False
-    if expected_name is not None:
-        try:
-            actual = psutil.Process(pid).name()
-        except Exception:
-            log(f"terminate_process: 无法读取 PID {pid} 进程名（可能已退出），已跳过")
-            return False
-        if _norm_proc_name(actual) != _norm_proc_name(expected_name):
-            log(f"terminate_process: PID {pid} 名 {actual!r} 与期望 {expected_name!r} 不符（PID 可能已复用），已跳过")
-            return False
-    handle = None
-    try:
-        handle = kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
-        if not handle:
-            log(f"terminate_process: OpenProcess(PID={pid}) 失败，已跳过")
-            return False
-        ok = bool(kernel32.TerminateProcess(handle, 0))
-        if not ok:
-            log(f"terminate_process: TerminateProcess(PID={pid}) 返回 False")
-        return ok
-    except Exception as e:
-        log(f"terminate_process: PID {pid} 异常 {e!r}，已跳过")
-        return False
-    finally:
-        if handle:
-            try:
-                kernel32.CloseHandle(handle)
-            except Exception:
-                pass
+    return terminate_process_with_reason(pid, expected_name=expected_name)[0]
 
 
 def _pid_set(pids) -> set:

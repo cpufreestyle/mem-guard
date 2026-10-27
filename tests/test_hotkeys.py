@@ -17,6 +17,24 @@ from memguard.menu import build_menu
 from memguard.tray import Guard
 
 
+def _by_label(tree):
+    """摊平整棵树按文案建索引。
+
+    v1.27.0 起「快捷键设置」收进了父项「热键与前台」，只查一级会 KeyError。
+    """
+    found = {}
+
+    def walk(items):
+        for it in items:
+            found.setdefault(str(it.text), it)
+            sub = getattr(it, "submenu", None)
+            if sub:
+                walk(sub.items)
+
+    walk(tree.items)
+    return found
+
+
 def menu_guard():
     """菜单测试用的桩 Guard：只提供 build_menu 需要的属性，不写真配置。"""
 
@@ -244,7 +262,7 @@ def test_menu_hotkey_picker_writes_only_that_key(monkeypatch):
                         lambda changes: merged.append(dict(changes)) or dict(changes))
     guard = menu_guard()
     monkeypatch.setattr(guard, "restart_hotkeys", lambda: restarts.append(1))
-    groups = {i.text: i for i in build_menu(guard).items}
+    groups = _by_label(build_menu(guard))
     sub = groups["快捷键设置"]
     by_label = {c.text: c for c in sub.submenu.items}
     pick = {c.text: c for c in by_label["立即清理"].submenu.items}
@@ -261,7 +279,7 @@ def test_menu_hotkey_picker_clears_the_clashing_key(monkeypatch):
                         lambda changes: merged.append(dict(changes)) or dict(changes))
     guard = menu_guard()
     monkeypatch.setattr(guard, "restart_hotkeys", lambda: None)
-    sub = {i.text: i for i in build_menu(guard).items}["快捷键设置"]
+    sub = _by_label(build_menu(guard))["快捷键设置"]
     pick = {c.text: c for c in
             {c.text: c for c in sub.submenu.items}["立即清理"].submenu.items}
     # 先把「内存概览」误设成 Ctrl+Alt+C（本属「立即清理」组），再从本组选它
@@ -278,7 +296,7 @@ def test_menu_hotkey_picker_can_disable_one_action(monkeypatch):
                         lambda changes: merged.append(dict(changes)) or dict(changes))
     guard = menu_guard()
     monkeypatch.setattr(guard, "restart_hotkeys", lambda: None)
-    sub = {i.text: i for i in build_menu(guard).items}["快捷键设置"]
+    sub = _by_label(build_menu(guard))["快捷键设置"]
     pick = {c.text: c for c in
             {c.text: c for c in sub.submenu.items}["自动清理"].submenu.items}
     pick["关闭"](guard.icon)

@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.25.0"
+__version__ = "1.28.0"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -126,6 +126,10 @@ DEFAULT_CONFIG = {
     "process_kill_enabled": True,   # 总开关：关闭后托盘/Top10 的「结束进程」全部不可点
     "process_kill_confirm": True,   # 执行前弹确认对话框，防误杀
     "process_kill_min_mb": 64,      # 只有工作集 ≥ 该值(MB) 的进程才允许结束，拒杀轻量进程
+    # ---- 托盘菜单悬停说明（v1.26.0）----
+    # 菜单里二十来个开关只写了一句「什么时候会动」，划过时浮出「凭什么判、最多动几次、
+    # 关掉会怎样」。实现见 menutips.py；关掉它划过菜单什么都不弹，与未实现该特性一致。
+    "menu_tips": True,
 
     # ---- 累计统计（由 do_clean 维护并持久化）----
     "stats": {"count": 0, "freed": 0},
@@ -179,6 +183,13 @@ CLEAN_BLACKLIST_STEMS = _blacklist_stems(CLEAN_BLACKLIST)
 
 # 关闭进程保护名单：与清理黑名单共用，不要另起一套匹配逻辑（见 §5 依赖方向）。
 PROCESS_KILL_PROTECT_STEMS = CLEAN_BLACKLIST_STEMS
+
+# 只挡「结束进程」、不进清理黑名单的一批：虚拟机宿主（v1.28.0）。
+# vmmem / vmmemWSL / vmmemNetProxy… 是 WSL2 与 Hyper-V 的虚拟机内存宿主，常年占据
+# 工作集榜首：清空它的工作集安全且收益最大（清理照旧允许），但 TerminateProcess 它
+# 等于给虚拟机断电。而且这类进程跑在 Session 0、属主是 SYSTEM，普通令牌连
+# OpenProcess(PROCESS_TERMINATE) 都拿不到——点它注定失败，只会在菜单里给个假按钮。
+PROCESS_KILL_VMHOST_STEMS = _blacklist_stems(("*vmmem*", "vmcompute", "vmwp"))
 
 
 def name_in_blacklist(name, stems) -> bool:
@@ -253,6 +264,7 @@ _BOOL_KEYS = (
     "fs_protect",
     "process_kill_enabled",
     "process_kill_confirm",
+    "menu_tips",
 )
 
 

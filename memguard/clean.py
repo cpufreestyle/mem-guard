@@ -25,11 +25,11 @@ from .actions import (
     purge_low_priority_standby,
     purge_standby_list,
     purge_working_sets,
-    terminate_process,
+    terminate_process_with_reason,
 )
 from .config import (CLEAN_BLACKLIST_STEMS, CLEAN_LEVELS, _CONFIG_LOCK, _norm_proc_name, gb,
                      load_config, log, name_in_blacklist, PROCESS_KILL_PROTECT_STEMS,
-                     save_config)
+                     PROCESS_KILL_VMHOST_STEMS, save_config)
 from .privileges import clean_privileges
 from .winapi import get_mem, is_admin, process_working_sets, visible_window_pids
 
@@ -956,6 +956,31 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
 
 
 
+def kill_protect_reason(pname: str) -> str | None:
+    """这个进程名该不该挡住「结束进程」；该挡就给人话原因，不挡返回 None。
+
+    虚拟机宿主（WSL / Hyper-V 的 vmmem* / vmcompute / vmwp）单列一条：它常年是这台
+    机器上工作集最大的一行，清得动却杀不得——TerminateProcess 它等于给虚拟机拔电，
+    所有 Linux 发行版一起中断。v1.27.0 的实测反馈就是这条：用户在 Top8 里点了
+    vmmemWSL，只拿到一句没有信息的「结束失败」。
+
+    注意与清理黑名单是分开的：vmmem 不在 CLEAN_BLACKLIST 里，清空它的工作集是划算的。
+    """
+    if name_in_blacklist(pname, PROCESS_KILL_VMHOST_STEMS):
+        return ("这是虚拟机宿主进程（vmmem / Hyper-V）：结束它等于给虚拟机断电，"
+                "所有 WSL 发行版和容器会一起中断。要收回它的内存用「立即清理」就够了；"
+                "真要关掉请在命令行执行 wsl --shutdown")
+    if name_in_blacklist(pname, CLEAN_BLACKLIST_STEMS) or name_in_blacklist(
+            pname, PROCESS_KILL_PROTECT_STEMS):
+        return f"进程 {pname} 在保护黑名单内，已跳过"
+    return None
+
+
+def can_kill(pname: str) -> bool:
+    """菜单/列表用：这一行值不值得做成可点的按钮。"""
+    return kill_protect_reason(pname) is None
+
+
 def kill_process(pid: int, name: str | None = None, cfg: dict | None = None) -> dict:
     """编排式结束单个进程：保护判定 -> TerminateProcess -> 返回结构化结果。
 
@@ -963,9 +988,11 @@ def kill_process(pid: int, name: str | None = None, cfg: dict | None = None) -> 
       1. PID 0/4：系统保留，拒绝；
       2. 本进程 os.getpid()：自杀保护，拒绝；
       3. 前台进程 fg.protected_pid(cfg)：fs_protect 下用户正在用的进程，拒绝；
-      4. 黑名单 name_in_blacklist（含通配符）：系统/关键进程，拒绝；
+      4. 保护名单 kill_protect_reason（含通配符）：系统/关键进程与虚拟机宿主，拒绝；
       5. process_kill_min_mb 门槛：RSS 低于阈值拒绝，拒杀轻量进程；
-      6. actions.terminate_process 真正下手（内部再核对名防 PID 复用）。
+      6. actions.terminate_process_with_reason 真正下手（内部再核对名防 PID 复用）。
+
+    失败时 msg 一定带原因（错误码翻译成人话），不再只回一句「结束进程 X 失败」。
 
     返回 {"ok": bool, "msg": str, "pid": int, "name": str, "rss": int}。
     任何异常只记日志、返回 ok=False，绝不抛出、不影响主流程。
@@ -1006,11 +1033,11 @@ def kill_process(pid: int, name: str | None = None, cfg: dict | None = None) -> 
         prss = 0
     result["name"] = pname
     result["rss"] = prss
-    # 黑名单（含通配符）
-    if name_in_blacklist(pname, CLEAN_BLACKLIST_STEMS) or name_in_blacklist(
-            pname, PROCESS_KILL_PROTECT_STEMS):
-        result["msg"] = f"进程 {pname} 在保护黑名单内，已跳过"
-        log(f"kill_process: {result['msg']} (pid={pid})")
+    # 保护名单（含通配符）：虚拟机宿主单独一句话，普通黑名单走通用话术
+    protected = kill_protect_reason(pname)
+    if protected:
+        result["msg"] = protected
+        log(f"kill_process: {result['msg']} (pid={pid}, name={pname})")
         return result
     # min_mb 门槛（MB 字节比较）
     min_mb = int(cfg.get("process_kill_min_mb", 64))
@@ -1018,16 +1045,17 @@ def kill_process(pid: int, name: str | None = None, cfg: dict | None = None) -> 
         result["msg"] = f"工作集 {prss / 1024 / 1024:.0f}MB < 下限 {min_mb}MB，已拒绝"
         log(f"kill_process: {result['msg']} (pid={pid}, name={pname})")
         return result
-    # 真正结束（terminate_process 内部再核对名防 PID 复用）
-    ok = terminate_process(pid, expected_name=pname)
+    # 真正结束（terminate_process_with_reason 内部再核对名防 PID 复用）
+    ok, why = terminate_process_with_reason(pid, expected_name=pname)
     # TerminateProcess 是异步的：返回 True 只代表终止请求被接受，目标进程还要
     # 一会儿才真正消失。这里等到它退出（或超时）再上报，否则界面说「已结束」
     # 而任务管理器里进程还在，看起来就像结束失败。
-    if ok:
-        ok = _wait_process_gone(pid)
-        if not ok:
-            log(f"kill_process: PID {pid} 终止请求已接受但进程未在 "
-                f"{_KILL_EXIT_TIMEOUT:.0f}s 内退出")
+    if ok and not _wait_process_gone(pid):
+        ok = False
+        why = (f"终止请求已经被接受，但 {_KILL_EXIT_TIMEOUT:.0f} 秒内它没有退出"
+               "（系统还在等它释放资源，稍后会自己消失）")
+        log(f"kill_process: PID {pid} 终止请求已接受但进程未在 "
+            f"{_KILL_EXIT_TIMEOUT:.0f}s 内退出")
     result["ok"] = bool(ok)
     if ok:
         result["msg"] = f"已结束进程 {pname} (PID {pid})"
@@ -1038,7 +1066,7 @@ def kill_process(pid: int, name: str | None = None, cfg: dict | None = None) -> 
         except Exception:
             pass
     else:
-        result["msg"] = f"结束进程 {pname} (PID {pid}) 失败"
+        result["msg"] = f"结束进程 {pname} (PID {pid}) 失败：{why}"
         log(f"kill_process: {result['msg']}")
     return result
 

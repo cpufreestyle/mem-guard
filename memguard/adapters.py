@@ -9,9 +9,10 @@ tray 里判据与落闩、advisor 里重复一遍判据、菜单里开关、norm
 
 本模块把每条自适应收敛成一行声明：
 
-    Adapter(key=开关键, latch=闩键, kind=计数/布尔, cap=级数上限, label=菜单文案)
+    Adapter(key=开关键, latch=闩键, kind=计数/布尔, cap=级数上限, label=菜单文案,
+            tip=悬停说明)
 
-菜单开关、诊断摘要、一键复位闩、normalize_config 的钳制区间都从这张表推导。
+菜单开关、诊断摘要、一键复位闩、normalize_config 的钳制区间、托盘悬停说明都从这张表推导。
 新增自适应只需要在这里加一行，再写它自己的判据逻辑（判据是每条自适应唯一
 真正不同的部分，收不进表里）。
 
@@ -28,16 +29,20 @@ FLAG = "flag"
 
 
 class Adapter:
-    """一条自适应的声明：开关键 + 闩键 + 字型 + 级数上限 + 菜单文案。"""
+    """一条自适应的声明：开关键 + 闩键 + 字型 + 级数上限 + 菜单文案 + 悬停说明。"""
 
-    __slots__ = ("key", "latch", "kind", "cap", "label")
+    __slots__ = ("key", "latch", "kind", "cap", "label", "tip")
 
-    def __init__(self, key: str, latch: str, kind: str, cap: int, label: str):
+    def __init__(self, key: str, latch: str, kind: str, cap: int, label: str,
+                 tip: str = ""):
         self.key = key
         self.latch = latch
         self.kind = kind
         self.cap = cap
         self.label = label
+        # 菜单文案只有一句「什么时候会动」，说不清判据与代价；tip 补上「凭什么判、
+        # 最多动几次、关掉会怎样」，供托盘菜单悬停说明（menutips）直接取用。
+        self.tip = tip
 
     @property
     def short(self) -> str:
@@ -93,21 +98,47 @@ _LATCH_NAME_EXCEPTIONS = {"auto_level_adapt": "level_adapt_done"}
 
 ADAPTERS = (
     Adapter("auto_level_adapt", "level_adapt_done", FLAG, 1,
-            "保守档不给力自动改激进"),
+            "保守档不给力自动改激进",
+            "判据：保守档累计清理里「补一次激进才按住」的占比过半且 ≥3 次。\n"
+            "动作：自动把清理档位改成激进，整个生命周期只动一次。\n"
+            "关掉：档位只由你手动决定；你手动切回保守时这个闩会自动重新武装。"),
     Adapter("target_top_adapt", "target_top_adapt_done", COUNTER, 10,
-            "定向覆盖面自适应(大户数不足时+1)"),
+            "定向覆盖面自适应(大户数不足时+1)",
+            "判据：定向清理确实动过手，但大户榜长期集中在同几个进程、清完仍受压。\n"
+            "动作：单次清空的大户数 target_clean_top +1，撒宽覆盖面，最多爬到 10。\n"
+            "关掉：固定在当前大户数，不再自己加码（你手动改的 target_clean_top 保留）。"),
     Adapter("headroom_adapt", "headroom_adapt_done", FLAG, 1,
-            "清理提前量自适应(效果偏短时阈值提前)"),
+            "清理提前量自适应(效果偏短时阈值提前)",
+            "判据：清理「效果偏短」（清完没多久又被顶回阈值）连续出现。\n"
+            "动作：降压余量 target_headroom_pct 提前 5 个百分点——清到留有余量才算按住。\n"
+            "关掉：判定阈值不让余量，每次只清到刚好回到阈值线。"),
     Adapter("min_avail_adapt", "min_avail_adapt_done", FLAG, 1,
-            "低内存下限自适应(可用内存偏低时抬高)"),
+            "低内存下限自适应(可用内存偏低时抬高)",
+            "判据：靠「可用物理内存低于下限」触发的清理连续偏短，说明动手时已经太紧。\n"
+            "动作：把 min_avail_mb 抬高一级，让它在可用内存还宽裕时就先动手。\n"
+            "关掉：下限始终是你设的值。"),
     Adapter("min_mb_adapt", "min_mb_adapt_done", FLAG, 1,
-            "定向大户下限自适应(榜上够不着下限时减半)"),
+            "定向大户下限自适应(榜上够不着下限时减半)",
+            "判据：累计清理 ≥3 次却一次都没定向清到东西——是门槛太高，不是没有大户可清。\n"
+            "动作：大户下限 target_clean_min_mb 减半，让次一档的进程也能入选。\n"
+            "关掉：够不着下限的进程永远不进定向清理，只由后台撒宽或升档兜底。"),
     Adapter("deepen_rounds_adapt", "deepen_rounds_adapt_done", COUNTER, 3,
-            "加深轮数自适应(加深卡住时+1轮)"),
+            "加深轮数自适应(加深卡住时+1轮)",
+            "判据：定向加深把轮数上限跑满、末轮仍在释放且压力没按住，累计 ≥3 次。\n"
+            "动作：加深轮数上限 +1（1→2→3 封顶）——多给一轮加深比直接升档全清打扰小。\n"
+            "关掉：轮数上限始终是你设的 stage_deepen_rounds。"),
     Adapter("predict_window_adapt", "predict_window_adapt_done", COUNTER, 30,
-            "预防窗口自适应(没防住时加宽窗口)"),
+            "预防窗口自适应(没防住时加宽窗口)",
+            "判据：预防式清理连续没防住——清完仍比当时预测的触阈时间更早复发，累计 ≥3 次。\n"
+            "动作：预测窗口 predict_window_min 加宽 5 分钟（5→10→…→30 封顶），"
+            "曲线比预判更陡，提前更早才拦得住。\n"
+            "关掉：窗口固定，可能出现「每次都防晚一步」。"),
     Adapter("threshold_adapt", "threshold_adapt_done", COUNTER, 2,
-            "触发线自适应(短效反复且温和手段用尽时提前)"),
+            "触发线自适应(短效反复且温和手段用尽时提前)",
+            "判据：温和阶梯全部用尽（升过档或按粘滞激进执行过、提前量也已用尽），"
+            "且超阈值触发的清理连续偏短 3 次。\n"
+            "动作：物理 / 提交触发线各降 5 个百分点，最多两次，兜底 60% / 65% 不许跌破。\n"
+            "关掉：触发线只按你设的值走——激进都被证明不够时，也不会更早动手。"),
 )
 
 # 开关键 / 闩键清单，供测试与需要按名查找的调用方使用

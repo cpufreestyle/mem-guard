@@ -17,6 +17,7 @@ import pystray
 
 from . import adapters
 from . import foreground as fg
+from . import menutips
 from . import update
 from .advisor import (advice_actions, analyze, deepen_round_saturated,
                       frequent_escalation, frequent_short_relief,
@@ -128,6 +129,9 @@ class Guard:
         self._fs_paused = False
         # 离开期间被静默的通知条数：回来后第一条前面汇总提示（v1.24.0）
         self._away_notes = 0
+        # v1.26.0 托盘菜单悬停说明：挂在 _menu_hwnd 上的子类化 + 自绘悬浮窗线程。
+        # 开关（menu_tips）每次划过菜单现读，改完即生效，不用重启托盘。
+        self.menu_tips = menutips.MenuTips(lambda: self.cfg)
 
 
     # -- 循环 ----------------------------------------------------
@@ -1253,6 +1257,7 @@ class Guard:
                 self.icon = _GuardIcon(
                     "MemGuard", make_icon(self.state["phys_pct"], self.cfg["phys_threshold"]),
                     "MemGuard 运行中", build_menu(self), on_left_click=self.open_overview,
+                    on_ready=self.menu_tips.attach,
                 )
                 self._declare_tray_pin()
                 if show_on_start:
@@ -1271,6 +1276,8 @@ class Guard:
             log("托盘未正常退出，1 秒后重建图标（自愈）")
             time.sleep(1.0)
         self._stop_hotkeys()
+        # 说明窗线程收掉；_menu_hwnd 上的子类化随窗口销毁一起消失，不用还原
+        self.menu_tips.detach()
         log("MemGuard 已退出")
 
         close_show_event(self._show_event)
@@ -1281,11 +1288,25 @@ class _GuardIcon(pystray.Icon):
 
     pystray 默认左键展开右键菜单（`Icon.__call__`），同类工具（WinMemoryCleaner /
     Mem Reduct）都是左键开主窗口、右键给菜单；这里只覆盖左键行为，右键菜单不变。
+
+    `on_ready` 在 pystray 建好图标窗口与菜单宿主窗口、进主循环之前回调一次，
+    而且正跑在托盘线程上——菜单悬停说明（menutips）要子类化那个宿主窗口，跨线程
+    SetWindowLongPtrW 会被系统拒掉，只有这条调用栈能名正言顺地拿到属主线程。
     """
 
-    def __init__(self, *args, on_left_click=None, **kwargs):
+    def __init__(self, *args, on_left_click=None, on_ready=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._on_left_click = on_left_click
+        self._on_ready = on_ready
+
+    def _mark_ready(self):
+        super()._mark_ready()
+        if self._on_ready is None:
+            return
+        try:
+            self._on_ready(self)
+        except Exception as e:
+            log(f"菜单悬停说明挂载失败: {e!r}")
 
     def __call__(self):
         if self._on_left_click is None:

@@ -20,6 +20,9 @@ ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 psapi = ctypes.WinDLL("psapi", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+# 画悬停说明的悬浮窗要用 GDI（字体 / 画刷 / SelectObject），与其它 DLL 句柄一样
+# 在这里统一开一次，业务模块只 import 不重复 WinDLL，避免同一模块被加载两遍。
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 
 # ---------------------------------------------------------------- Win32 类型声明（统一）
 # 统一声明所有用到的 Win32 函数的参数/返回类型。64 位 Python 下若不声明，

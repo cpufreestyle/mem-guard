@@ -16,7 +16,7 @@ from .advisor import analyze
 from . import adapters
 from . import hotkeys
 from .autostart import autostart_enabled, install_autostart, remove_autostart
-from .clean import do_clean, kill_process, top_processes_list
+from .clean import do_clean, kill_process, kill_protect_reason, top_processes_list
 from .config import LOG_PATH, __version__, gb, log, update_config
 from .diag import export_diagnostics
 from .ui import (apply_advice_actions, confirm_box, message_box,
@@ -248,6 +248,16 @@ def build_menu(guard) -> pystray.Menu:
             {"predict_clean": not bool(guard.cfg.get("predict_clean", True))})
         log(f"趋势预防式清理 -> {'开' if guard.cfg['predict_clean'] else '关'}")
 
+    def on_toggle_menu_tips(icon, item) -> None:
+        """v1.26.0 托盘菜单悬停说明总开关。
+
+        只写配置：menutips 每次收到 WM_MENUSELECT 现读 menu_tips，关掉即「划过什么都不
+        弹」，不需要重启托盘去解挂子类化。
+        """
+        guard.cfg = update_config(
+            {"menu_tips": not bool(guard.cfg.get("menu_tips", True))})
+        log(f"鼠标悬停显示说明 -> {'开' if guard.cfg['menu_tips'] else '关'}")
+
     def line_stats(_):
         st = guard.cfg.get("stats") or {}
         esc = int(st.get('escalated', 0))
@@ -430,13 +440,22 @@ def build_menu(guard) -> pystray.Menu:
         log(f"结束进程前确认 -> {'开' if guard.cfg['process_kill_confirm'] else '关'}")
 
     def _kill_submenu(guard):
-        """托盘子菜单：列出内存占用 Top8，点一项即结束该进程。"""
+        """托盘子菜单：列出内存占用 Top8，点一项即结束该进程。
+
+        受保护的进程（vmmem 这类虚拟机宿主、系统关键进程）仍然列出来，但做成不可点的
+        一行并标上「受保护」——它们占着榜首，从列表里删掉只会让人以为 MemGuard 没看见；
+        而做成能点的按钮更糟：点了只会得到一句失败（v1.27.0 实测反馈）。
+        """
         items = []
         try:
             rows = top_processes_list(8)
             for nm, rss, pid in rows:
+                label = f"{nm} ({rss / 1024 / 1024:.0f}MB, PID {pid})"
+                if kill_protect_reason(nm):
+                    items.append(pystray.MenuItem(f"{label} · 受保护", None, enabled=False))
+                    continue
                 items.append(pystray.MenuItem(
-                    f"{nm} ({rss / 1024 / 1024:.0f}MB, PID {pid})",
+                    label,
                     (lambda p=pid, n=nm:
                      lambda icon, item: _on_kill_one(guard, p, n))(),
                     enabled=lambda i: bool(guard.cfg.get("process_kill_enabled", True))))
@@ -522,6 +541,111 @@ def build_menu(guard) -> pystray.Menu:
                              checked=lambda i: guard.cfg.get("clean_level") == "aggressive"),
         )
 
+    # -- v1.27.0 分组收纳：四个新父项，配置键一个不删、默认值一个不改 --
+    # 根菜单原来 56 个根级项，日常只动五六个，其余（8 条自适应 + 4 条进阶 + 4 项更新
+    # + 4 组快捷键）常年不碰却各占一行。这里只改形状：把低频项收进父项，父项本身不挂
+    # 悬停说明（划过只会展开，说明窗无处安放——v1.26.0 定的口径），该说的一句话放在
+    # 父项里第一条不可点的说明行上。
+
+    def line_adapters_guide(_):
+        return "自适应 = MemGuard 自己改配置（会落盘）；下面每条都能单独关掉"
+
+    def line_kill_guide(_):
+        return ("六层保护：总开关 / 确认框 / 工作集下限 / 系统进程 / 自身进程 / 确认真退出；"
+                "「受保护」的行不给点")
+
+    def line_update_guide(_):
+        return "更新 = 后台查 Release + 下载；下面三项决定要不要自动装、装前验不验 sha256"
+
+    def line_trigger_guide(_):
+        return "什么时候动手、动手按什么顺序；动手线在「清理阈值」与「清理冷却」里"
+
+    def trigger_menu():
+        """触发与阶梯：定时 / 低内存 / 启动时三条额外触发线，加上不够狠时的三级阶梯。"""
+        return pystray.Menu(
+            pystray.MenuItem(line_trigger_guide, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("定时清理", scheduled_menu()),
+            pystray.MenuItem("低内存触发", min_avail_menu()),
+            pystray.MenuItem("启动时清理", on_toggle_clean_on_start,
+                             checked=lambda i: bool(guard.cfg.get("clean_on_start"))),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("清理未达标自动升档", on_toggle_escalate,
+                             checked=lambda i: bool(guard.cfg.get("escalate_clean", True))),
+            pystray.MenuItem("定向清理内存大户", on_toggle_target_clean,
+                             checked=lambda i: bool(guard.cfg.get("target_clean", True))),
+            pystray.MenuItem("后台进程工作集清理", on_toggle_bg_trim,
+                             checked=lambda i: bool(guard.cfg.get("bg_trim", True))),
+        )
+
+    def adapters_menu():
+        """自适应与进阶：8 条自适应 + 复位闩 + 4 个进阶手段。"""
+        return pystray.Menu(
+            pystray.MenuItem(line_adapters_guide, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            *adapter_menu_items(),
+            pystray.MenuItem(
+                lambda i: "复位自适应闩（" + adapters.reset_status(guard.cfg) + "）",
+                on_reset_adapters),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("持续高压粘滞激进", on_toggle_sticky,
+                             checked=lambda i: bool(guard.cfg.get("sticky_aggressive", True))),
+            pystray.MenuItem("阶段自学习(跳过无效阶段)", on_toggle_stage_learn,
+                             checked=lambda i: bool(guard.cfg.get("stage_learn", True))),
+            pystray.MenuItem("定向清理加深(不达标前再撒宽一轮)", on_toggle_stage_deepen,
+                             checked=lambda i: bool(guard.cfg.get("stage_deepen", True))),
+            pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
+                             checked=lambda i: bool(guard.cfg.get("predict_clean", True))),
+        )
+
+    def hotkey_fg_menu():
+        """热键与前台：全局热键、键位选择、当前键位摘要，加上全屏让路与前台保护。"""
+        return pystray.Menu(
+            pystray.MenuItem("全局热键（一键清理/概览/自动清理）", on_toggle_hotkeys,
+                             checked=lambda i: bool(guard.cfg.get("hotkey_enabled", True))),
+            pystray.MenuItem("快捷键设置", hotkey_menu()),
+            pystray.MenuItem(
+                lambda i: hotkeys.summary(
+                    guard.cfg,
+                    guard.hotkey_failures() if hasattr(guard, "hotkey_failures") else ()),
+                None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("全屏应用时暂停自动清理", on_toggle_fs_pause,
+                             checked=lambda i: bool(guard.cfg.get("fs_pause", True))),
+            pystray.MenuItem("保护前台进程（不清空工作集）", on_toggle_fs_protect,
+                             checked=lambda i: bool(guard.cfg.get("fs_protect", True))),
+            pystray.MenuItem("鼠标悬停显示说明", on_toggle_menu_tips,
+                             checked=lambda i: bool(guard.cfg.get("menu_tips", True))),
+        )
+
+    def kill_menu():
+        """结束进程：两个开关 + Top8 列表。总开关关掉时列表里每项照常置灰。"""
+        return pystray.Menu(
+            pystray.MenuItem(line_kill_guide, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("关闭进程功能", on_toggle_process_kill,
+                             checked=lambda i: bool(guard.cfg.get("process_kill_enabled", True))),
+            pystray.MenuItem("结束进程前弹确认框", on_toggle_process_kill_confirm,
+                             checked=lambda i: bool(guard.cfg.get("process_kill_confirm", True))),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("结束进程（内存占用 Top8）", _kill_submenu(guard)),
+        )
+
+    def update_menu():
+        """更新设置：立即更新 + 三个更新相关开关（「检查更新」留在根菜单）。"""
+        return pystray.Menu(
+            pystray.MenuItem(line_update_guide, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("立即更新到最新版", on_update_now),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("自动更新（后台检查）", on_toggle_auto_update,
+                             checked=lambda i: bool(guard.cfg.get("auto_update", True))),
+            pystray.MenuItem("下载后自动安装", on_toggle_auto_install,
+                             checked=lambda i: bool(guard.cfg.get("auto_install", False))),
+            pystray.MenuItem("更新包 sha256 校验", on_toggle_verify_sha256,
+                             checked=lambda i: bool(guard.cfg.get("verify_update_sha256", True))),
+        )
+
     return pystray.Menu(
         pystray.MenuItem(line_phys, None, enabled=False),
         pystray.MenuItem(line_commit, None, enabled=False),
@@ -543,45 +667,10 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("清理力度", level_menu()),
         pystray.MenuItem("清理冷却", cooldown_menu()),
         pystray.MenuItem("清理区域", areas_menu()),
-        pystray.MenuItem("定时清理", scheduled_menu()),
-        pystray.MenuItem("低内存触发", min_avail_menu()),
-        pystray.MenuItem("启动时清理", on_toggle_clean_on_start,
-                         checked=lambda i: bool(guard.cfg.get("clean_on_start"))),
-        pystray.MenuItem("清理未达标自动升档", on_toggle_escalate,
-                         checked=lambda i: bool(guard.cfg.get("escalate_clean", True))),
-        pystray.MenuItem("定向清理内存大户", on_toggle_target_clean,
-                         checked=lambda i: bool(guard.cfg.get("target_clean", True))),
-        pystray.MenuItem("后台进程工作集清理", on_toggle_bg_trim,
-                         checked=lambda i: bool(guard.cfg.get("bg_trim", True))),
-        pystray.MenuItem("全局热键（一键清理/概览/自动清理）", on_toggle_hotkeys,
-                         checked=lambda i: bool(guard.cfg.get("hotkey_enabled", True))),
-        pystray.MenuItem("快捷键设置", hotkey_menu()),
-        pystray.MenuItem(
-            lambda i: hotkeys.summary(
-                guard.cfg,
-                guard.hotkey_failures() if hasattr(guard, "hotkey_failures") else ()),
-            None, enabled=False),
-        pystray.MenuItem("全屏应用时暂停自动清理", on_toggle_fs_pause,
-                         checked=lambda i: bool(guard.cfg.get("fs_pause", True))),
-        pystray.MenuItem("保护前台进程（不清空工作集）", on_toggle_fs_protect,
-                         checked=lambda i: bool(guard.cfg.get("fs_protect", True))),
-        pystray.MenuItem("关闭进程功能", on_toggle_process_kill,
-                         checked=lambda i: bool(guard.cfg.get("process_kill_enabled", True))),
-        pystray.MenuItem("结束进程前弹确认框", on_toggle_process_kill_confirm,
-                         checked=lambda i: bool(guard.cfg.get("process_kill_confirm", True))),
-        pystray.MenuItem("结束进程（内存占用 Top8）", _kill_submenu(guard)),
-        *adapter_menu_items(),
-        pystray.MenuItem(
-            lambda i: "复位自适应闩（" + adapters.reset_status(guard.cfg) + "）",
-            on_reset_adapters),
-        pystray.MenuItem("持续高压粘滞激进", on_toggle_sticky,
-                         checked=lambda i: bool(guard.cfg.get("sticky_aggressive", True))),
-        pystray.MenuItem("阶段自学习(跳过无效阶段)", on_toggle_stage_learn,
-                         checked=lambda i: bool(guard.cfg.get("stage_learn", True))),
-        pystray.MenuItem("定向清理加深(不达标前再撒宽一轮)", on_toggle_stage_deepen,
-                         checked=lambda i: bool(guard.cfg.get("stage_deepen", True))),
-        pystray.MenuItem("趋势预防式清理", on_toggle_predict_clean,
-                         checked=lambda i: bool(guard.cfg.get("predict_clean", True))),
+        pystray.MenuItem("触发与阶梯", trigger_menu()),
+        pystray.MenuItem("自适应与进阶", adapters_menu()),
+        pystray.MenuItem("热键与前台", hotkey_fg_menu()),
+        pystray.MenuItem("结束进程", kill_menu()),
         pystray.MenuItem("开机自启", on_toggle_autostart,
                          checked=lambda i: autostart_enabled()),
         pystray.MenuItem(
@@ -592,12 +681,6 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("打开日志", on_open_log),
         pystray.MenuItem("导出诊断", on_export),
         pystray.MenuItem(f"检查更新（v{__version__}）", on_check_update),
-        pystray.MenuItem("立即更新到最新版", on_update_now),
-        pystray.MenuItem("自动更新（后台检查）", on_toggle_auto_update,
-                         checked=lambda i: bool(guard.cfg.get("auto_update", True))),
-        pystray.MenuItem("下载后自动安装", on_toggle_auto_install,
-                         checked=lambda i: bool(guard.cfg.get("auto_install", False))),
-        pystray.MenuItem("更新包 sha256 校验", on_toggle_verify_sha256,
-                         checked=lambda i: bool(guard.cfg.get("verify_update_sha256", True))),
+        pystray.MenuItem("更新设置", update_menu()),
         pystray.MenuItem("退出", on_quit),
     )
