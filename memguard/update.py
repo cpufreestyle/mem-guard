@@ -379,21 +379,12 @@ def _set_notified(tag: str) -> None:
         pass
 
 
-def _open_url(url: str) -> None:
-    try:
-        import webbrowser
-        webbrowser.open(url)
-    except Exception:
-        pass
-
-
-def check_and_notify(cfg: dict, notify=None, open_page: bool = False,
-                     on_ready=None, now=None) -> dict:
+def check_and_notify(cfg: dict, notify=None, on_ready=None, now=None) -> dict:
     """检查一次更新并按结果安静处理，返回摘要 dict（供 CLI 与测试断言）。
 
     - 失败 / 已最新：只写日志，不打扰；
     - 有新版本：发一条气泡（每版本一次）；配了「下载后自动安装」则直接走安装；
-    - open_page：仅用户显式点「检查更新」时才附赠打开发布页。
+    - 不打开浏览器：更新一律在程序内下载安装（v1.29.3 起），跳转网页留给用户自己。
     """
     record_check(now)
     r = fetch_latest_release()
@@ -423,8 +414,6 @@ def check_and_notify(cfg: dict, notify=None, open_page: bool = False,
                        f"右键托盘 → 立即更新到最新版", "MemGuard 更新")
             except Exception:
                 pass
-        if open_page:
-            _open_url(r["url"])
     return {"ok": True, "tag": tag, "newer": True, "action": "notify",
             "msg": f"发现新版本 {tag}"}
 
@@ -457,9 +446,8 @@ def install_latest(cfg: dict, on_ready=None, release: dict = None) -> dict:
     """
     exe = _frozen_exe()
     if not exe:
-        _open_url(f"https://github.com/{REPO_SLUG}/releases/latest")
-        return {"ok": False, "action": "open_page",
-                "msg": "源码运行模式无法自更新，已打开发布页"}
+        return {"ok": False, "action": "none",
+                "msg": "源码运行模式无法自更新：没有可替换的 exe，请 git pull 后重新打包"}
     r = release or fetch_latest_release()
     if not r.get("ok"):
         return {"ok": False, "action": "none", "msg": r.get("msg", "检查更新失败")}
@@ -468,9 +456,8 @@ def install_latest(cfg: dict, on_ready=None, release: dict = None) -> dict:
                 "msg": f"已是最新版本（v{__version__}）"}
     asset = pick_asset(r.get("assets"))
     if not asset:
-        _open_url(r["url"])
-        return {"ok": False, "action": "open_page",
-                "msg": "Release 里没有可用安装包，已打开发布页"}
+        return {"ok": False, "action": "none",
+                "msg": "Release 里没有可用安装包（需要 mem_guard.exe 或 MemGuard-Setup-x.y.z.exe），已取消更新"}
 
     tag = str(r["tag"])
     safe_tag = re.sub(r"[^0-9A-Za-z._-]", "_", tag)

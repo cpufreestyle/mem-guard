@@ -1000,3 +1000,47 @@ def test_daily_controls_stay_at_root():
     for label in DAILY_AT_ROOT:
         assert label in roots, f"「{label}」被收进了父项，日常操作要多点一层"
         assert _parent_of(tree, label) is None, f"「{label}」不再是根级项"
+
+
+# ----------------------------------------------------------- 检查更新
+
+def test_check_update_installs_directly_and_never_opens_a_browser(monkeypatch):
+    """用户点「检查更新」就是要更新：发现新版直接下载安装，不打开 GitHub 下载页。"""
+    import inspect
+    assert "webbrowser" not in inspect.getsource(menu), \
+        "菜单里不该再留打开浏览器的口子"
+
+    monkeypatch.setattr(menu, "threading", _InlineThreading())
+    guard = _FakeGuard()
+    guard.icon = _RecordingIcon()
+    monkeypatch.setattr(menu, "fetch_latest_release", lambda timeout=8: {
+        "ok": True, "tag": "v9.9.9", "url": "https://example/release",
+        "newer": True, "assets": []})
+    calls = []
+    monkeypatch.setattr(
+        menu, "install_latest",
+        lambda cfg, on_ready=None, release=None:
+        calls.append(release["tag"]) or {"ok": False, "msg": "下载失败"})
+
+    item = _find_item(build_menu(guard), "检查更新（v" + config.__version__ + "）")
+    item(guard.icon)
+    assert calls == ["v9.9.9"], "检查到新版必须直接走下载安装"
+    assert any("正在后台下载并安装" in n for n in guard.icon.notes)
+    assert any("下载失败" in n for n in guard.icon.notes), "失败原因要回到用户眼前"
+
+
+def test_check_update_already_latest_stays_quiet(monkeypatch):
+    """已是最新版本时不下载、不安装，只回一句状态。"""
+    monkeypatch.setattr(menu, "threading", _InlineThreading())
+    guard = _FakeGuard()
+    guard.icon = _RecordingIcon()
+    monkeypatch.setattr(menu, "fetch_latest_release", lambda timeout=8: {
+        "ok": True, "tag": "v1.0.0", "url": "https://example/release",
+        "newer": False, "assets": []})
+    calls = []
+    monkeypatch.setattr(menu, "install_latest",
+                        lambda *a, **k: calls.append(1) or {"ok": True})
+    item = _find_item(build_menu(guard), "检查更新（v" + config.__version__ + "）")
+    item(guard.icon)
+    assert calls == []
+    assert any("已是最新版本" in n for n in guard.icon.notes)

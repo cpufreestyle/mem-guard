@@ -275,6 +275,26 @@ def test_install_latest_can_skip_verification_when_configured(monkeypatch, tmp_p
     assert it.state["popen"] == 1 and it.state["exit"] == 0
 
 
+def test_install_latest_source_mode_explains_instead_of_opening_browser(monkeypatch):
+    """源码态没有可替换的 exe：说清楚为什么，别把人甩到 GitHub 网页上。"""
+    monkeypatch.setattr(update_mod, "_frozen_exe", lambda: None)
+    r = update_mod.install_latest({})
+    assert r["ok"] is False and r["action"] == "none"
+    assert "源码运行" in r["msg"]
+
+
+def test_install_latest_reports_missing_asset_without_page_jump(monkeypatch, tmp_path):
+    """Release 里没有可用安装包：给一句人话，同样不跳网页。"""
+    monkeypatch.setattr(update_mod, "_frozen_exe", lambda: str(tmp_path))
+    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8: {
+        "ok": True, "tag": "v9.9.9", "url": "https://example/release",
+        "newer": True,
+        "assets": [{"name": "README.md", "browser_download_url": "https://x/r"}]})
+    r = update_mod.install_latest({})
+    assert r["ok"] is False and r["action"] == "none"
+    assert "没有可用安装包" in r["msg"]
+
+
 def test_purge_stale_backup_removes_only_the_bak(monkeypatch, tmp_path):
     exe = tmp_path / "mem_guard.exe"
     exe.write_bytes(b"me")
@@ -350,15 +370,13 @@ def test_check_and_notify_auto_install_takes_over(monkeypatch):
     assert bubbles and "正在下载并安装" in bubbles[0]
 
 
-def test_check_and_notify_open_page_only_when_asked(monkeypatch):
-    opened = []
+def test_check_and_notify_never_opens_a_browser(monkeypatch):
+    """后台检查只提醒，不抢浏览器焦点；v1.29.3 起连「点了检查更新」也不跳网页。"""
+    assert not hasattr(update_mod, "_open_url"), "更新链路里不该再留开浏览器的口子"
     monkeypatch.setattr(update_mod, "update_config", lambda changes: None)
     monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8: {
         "ok": True, "tag": "v9.9.9", "url": "https://example/release",
         "newer": True, "assets": _ASSETS})
-    monkeypatch.setattr(update_mod, "_open_url", lambda url: opened.append(url))
 
-    check_and_notify(_cfg(), notify=lambda m, t: None)
-    assert opened == [], "后台静默检查不该抢浏览器焦点"
-    check_and_notify(_cfg(), notify=None, open_page=True)
-    assert opened == ["https://example/release"]
+    r = check_and_notify(_cfg(), notify=lambda m, t: None)
+    assert r["action"] == "notify"

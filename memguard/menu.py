@@ -126,6 +126,53 @@ def _slot_action(slots: "_KillSlots", idx: int):
     return act
 
 
+def _notify_guard(guard, msg: str, title: str) -> None:
+    """托盘气泡；没有图标（启动中 / 已收尾）就只落日志，绝不向外抛。"""
+    icon = getattr(guard, "icon", None)
+    if icon is not None:
+        try:
+            icon.notify(msg, title)
+            return
+        except Exception:
+            pass
+    log(msg)
+
+
+def run_check_update(guard) -> dict:
+    """「检查更新」= 检查 + 直接下载安装，不跳浏览器（v1.29.3）。
+
+    用户点这一项就是要更新，别让他「发现新版本 → 打开 GitHub 下载页 → 自己再
+    下一个 exe → 双击安装」。下载与安装复用 install_latest 的同一条链路（sha256
+    校验、便携覆盖 / Setup 静默升级、失败带原因）；成功时进程交给引导批处理，
+    本进程不再返回。
+    """
+    r = fetch_latest_release()
+    if not r.get("ok"):
+        msg = r.get("msg", "检查更新失败")
+        log(msg)
+        _notify_guard(guard, msg, "MemGuard 更新")
+        return {"ok": False, "action": "none", "msg": msg}
+    if not r.get("newer"):
+        msg = f"已是最新版本（v{__version__}）"
+        log(msg)
+        _notify_guard(guard, msg, "MemGuard 更新")
+        return {"ok": True, "action": "none", "msg": msg}
+    log(f"发现新版本 {r['tag']}（当前 v{__version__}）")
+    _notify_guard(
+        guard,
+        f"发现新版本 {r['tag']}（当前 v{__version__}）\n"
+        f"正在后台下载并安装，完成后自动重启…",
+        "MemGuard 更新")
+    res = install_latest(guard.cfg,
+                         on_ready=getattr(guard, "_stop_for_update", None),
+                         release=r)
+    if not res.get("ok"):
+        msg = res.get("msg", "更新失败")
+        log(f"检查更新后自动安装失败: {msg}")
+        _notify_guard(guard, msg, "MemGuard 更新")
+    return res
+
+
 def build_menu(guard) -> pystray.Menu:
     """构建托盘右键菜单。
 
@@ -421,41 +468,11 @@ def build_menu(guard) -> pystray.Menu:
             icon.notify("诊断已导出：\n" + path, "MemGuard 诊断")
 
     def on_check_update(icon=None, item=None) -> None:
-        """后台线程查询 GitHub Release，避免联网阻塞托盘菜单。"""
-        def worker() -> None:
-            r = fetch_latest_release()
-            if not r.get("ok"):
-                log(r.get("msg", "检查更新失败"))
-                if guard.icon:
-                    try:
-                        guard.icon.notify(r.get("msg", "检查更新失败"), "MemGuard 更新")
-                    except Exception:
-                        pass
-                return
-            if r["newer"]:
-                log(f"发现新版本 {r['tag']}（当前 v{__version__}）")
-                if guard.icon:
-                    try:
-                        guard.icon.notify(
-                            f"发现新版本 {r['tag']}（当前 v{__version__}）\n正在打开下载页…",
-                            "MemGuard 更新",
-                        )
-                    except Exception:
-                        pass
-                try:
-                    import webbrowser
-                    webbrowser.open(r["url"])
-                except Exception:
-                    pass
-            else:
-                log(f"已是最新版本 v{__version__}")
-                if guard.icon:
-                    try:
-                        guard.icon.notify(f"已是最新版本（v{__version__}）", "MemGuard 更新")
-                    except Exception:
-                        pass
+        """检查更新：用户点它就是要更新，发现有新版直接后台下载安装。
 
-        threading.Thread(target=worker, daemon=True).start()
+        全程不打开浏览器（v1.29.3）；本项在独立线程里跑，联网 / 下载都不阻塞托盘。
+        """
+        threading.Thread(target=lambda: run_check_update(guard), daemon=True).start()
 
     def on_update_now(icon=None, item=None) -> None:
         """立即更新：后台下载并静默安装，成功则不返回（自动重启到新版本）。"""
