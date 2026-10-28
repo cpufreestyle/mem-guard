@@ -111,7 +111,7 @@ def portable_boot_cmd(pid: int, new_path: str, target_path: str) -> str:
         'if exist "%target%" copy /y "%target%" "%bak%" >nul\r\n'
         'move /y "%new%" "%target%" >nul\r\n'
         'start "" "%target%"\r\n'
-        ":: 等新版本起来；起不来就把旧版本还原回去\r\n"
+        ":: wait for the new build; roll back when it does not come up\r\n"
         "timeout /t 6 /nobreak >nul\r\n"
         'tasklist /fi "IMAGENAME eq %image%" 2>nul | find /i "%image%" >nul\r\n'
         "if errorlevel 1 (\r\n"
@@ -142,6 +142,24 @@ def setup_boot_cmd(pid: int, setup_path: str, app_dir: str) -> str:
         'start "" "{1}"\r\n'
         'del "%~f0"\r\n'
     ).format(setup_path, exe, pid, image)
+
+
+# cmd.exe 按 ANSI 代码页读批处理。非中文 Windows（如 en-US 的 CI runner）的
+# mbcs 是 cp1252，写不进中文；写失败就是整条更新链路在「准备切换版本」之后
+# 静默中止——所以先按 mbcs 写，失败再退 UTF-8。
+_BOOT_ENCODING = "mbcs"
+
+
+def _write_boot_cmd(path: str, text: str) -> None:
+    """把引导批处理写盘：mbcs 优先（与 cmd 的读取口径一致），失败退 UTF-8。"""
+    try:
+        with open(path, "w", encoding=_BOOT_ENCODING, newline="") as f:
+            f.write(text)
+        return
+    except (LookupError, OSError, UnicodeEncodeError):
+        pass
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
 
 
 def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> dict:
@@ -486,13 +504,7 @@ def install_latest(cfg: dict, on_ready=None, release: dict = None) -> dict:
         boot_cmd = portable_boot_cmd(pid, new_path, exe)
     boot_path = os.path.join(tmp_dir, f"mem_guard_update_boot_{pid}.cmd")
     try:
-        # cmd.exe 按 ANSI 代码页读批处理，mbcs 才能与中文路径兼容；非 Windows 退回 utf-8
-        try:
-            with open(boot_path, "w", encoding="mbcs", newline="") as f:
-                f.write(boot_cmd)
-        except (LookupError, OSError):
-            with open(boot_path, "w", encoding="utf-8", newline="") as f:
-                f.write(boot_cmd)
+        _write_boot_cmd(boot_path, boot_cmd)
     except Exception as e:
         return {"ok": False, "action": "none", "msg": f"写入更新脚本失败：{e}"}
 

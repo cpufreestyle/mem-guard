@@ -139,6 +139,10 @@ _STATIC_TIPS = {
                     "所以这一栏是灰的：监控与概览照常，清理一律不动手。\n"
                     "修复：退出后右键 MemGuard 选「以管理员身份运行」；"
                     "开机自启注册的是最高权限计划任务，走它就不必每次手动提权。",
+    "权限：管理员（可清理）": "当前以管理员权限运行：清理系统缓存与进程工作集所需的提升权限就绪，"
+                      "这一栏只是状态显示，点不动。\n"
+                      "若这里显示「⚠ 非管理员，无法清理」，说明托盘是普通权限启动的，"
+                      "清理会被跳过——退出后右键选「以管理员身份运行」即可。",
     # ---- 更新 ----
     "自动更新（后台检查）": "后台按 update_check_hours 的间隔静默查询 GitHub Release。"
                     "关掉后只剩手动「检查更新」。",
@@ -153,6 +157,18 @@ _STATIC_TIPS = {
 # 动态标签（带计数）按前缀匹配
 _PREFIX_TIPS = {k: v for k, v in _STATIC_TIPS.items() if k.endswith("（")}
 _STATIC_TIPS = {k: v for k, v in _STATIC_TIPS.items() if not k.endswith("（")}
+
+# 同一个菜单项在不同状态下有两条文案（管理员 / 非管理员）。说明表两条都收，
+# 对账时只要求「其中一条划得到」——否则自检每次换身份跑就假红一次。
+LABEL_VARIANTS = (
+    ("⚠ 非管理员，无法清理", "权限：管理员（可清理）"),
+)
+
+
+def reachable(key, labels) -> bool:
+    """key（或它的同义文案）是否出现在 labels 里；带「（」的动态前缀按前缀认。"""
+    group = next((g for g in LABEL_VARIANTS if key in g), (key,))
+    return any(l in labels or l.startswith(key) for l in group)
 
 # 8 条自适应的说明来自注册表本身：新增一条自适应只在 ADAPTERS 里写 tip，
 # 菜单文案与悬停说明永远不会各说一套。

@@ -100,6 +100,22 @@ def test_setup_boot_cmd_silent_install_and_restart():
     assert "del \"%~f0\"" in cmd
 
 
+def test_boot_cmds_stay_ascii_so_ansi_codepages_can_write_them():
+    """批处理按 ANSI 代码页写盘：正文里混进中文，en-US 机器（cp1252）会抛
+    UnicodeEncodeError，更新在「准备切换版本」之后静默中止——CI 上真实踩过。"""
+    for text in (portable_boot_cmd(1, "C:\\T\\new.exe", "C:\\App\\mem_guard.exe"),
+                 setup_boot_cmd(1, "C:\\T\\Setup.exe", "C:\\App")):
+        text.encode("ascii")  # 不是 ASCII 就抛 UnicodeEncodeError
+
+
+def test_write_boot_cmd_falls_back_to_utf8_when_mbcs_cannot_encode(monkeypatch, tmp_path):
+    """路径带非 ANSI 字符时不能整个更新链路失败：退一步用 UTF-8 写出来。"""
+    monkeypatch.setattr(update_mod, "_BOOT_ENCODING", "ascii")
+    path = tmp_path / "boot.cmd"
+    update_mod._write_boot_cmd(str(path), "echo 中文路径")
+    assert path.read_text(encoding="utf-8") == "echo 中文路径"
+
+
 def test_find_checksums_asset_picks_manifest_only():
     with_ck = _ASSETS + [{"name": "checksums.txt",
                           "browser_download_url": "https://x/checksums"}]

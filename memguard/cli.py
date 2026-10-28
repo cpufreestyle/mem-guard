@@ -175,7 +175,7 @@ def selftest() -> int:
 
         walk(tree.items)
         dead = sorted(k for k in menutips.tip_keys()
-                      if k not in leaf and not any(l.startswith(k) for l in leaf))
+                      if not menutips.reachable(k, leaf))
         assert not dead, f"说明键在菜单里划不到: {dead}"
         on_parent = sorted(k for k in menutips.tip_keys()
                           if k in popup and k not in leaf)

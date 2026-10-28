@@ -97,10 +97,21 @@ def test_no_tip_key_is_unreachable_or_named_wrong():
     菜单项改了名、或者说明写在了父项上，都会在这一行红掉。
     """
     leaf, popup = _menu_labels()
-    dead = sorted(k for k in menutips.TIPS if k not in leaf)
+    dead = sorted(k for k in menutips.TIPS if not menutips.reachable(k, leaf))
     assert not dead, (f"这些说明在菜单里划不到（改名了？还是写在带子菜单的父项上了？）: "
                       f"{dead}；其中只出现在父项上的: "
                       f"{sorted(k for k in dead if k in popup)}")
+
+
+def test_admin_status_line_switches_with_privilege(monkeypatch):
+    """「管理员 / 非管理员」是同一个菜单项的两条文案：两条都得划得到，
+    否则改一边就会有一边永远看不到说明（CI 是管理员身份，本地通常不是）。"""
+    for flag, want in ((True, "权限：管理员（可清理）"),
+                       (False, "⚠ 非管理员，无法清理")):
+        monkeypatch.setattr(menu, "is_admin", lambda f=flag: f)
+        leaf, _popup = _menu_labels()
+        assert want in leaf
+        assert menutips.reachable(want, leaf)
 
 
 def test_prefix_tips_match_a_real_dynamic_label():

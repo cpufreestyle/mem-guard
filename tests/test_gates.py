@@ -11,12 +11,23 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 import check_line_endings as eol
 import check_version_sync as vsync
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VS_SCRIPT = os.path.join(ROOT, "check_version_sync.py")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ci_ref_env(monkeypatch):
+    """CI 里（推 tag 触发）这两个变量会真实存在，泄进 main() 就会让「只测文档口径」
+    的用例按当前 tag 判红。每条用例要测 tag 分支时自己 setenv。
+    """
+    monkeypatch.delenv("GITHUB_REF_TYPE", raising=False)
+    monkeypatch.delenv("GITHUB_REF_NAME", raising=False)
 
 
 def _write(path, text):
