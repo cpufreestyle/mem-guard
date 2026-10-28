@@ -295,6 +295,7 @@ class HotkeyListener:
         self._ids = []
         self._by_id = {}
         self.failures = []
+        registered = []
         for hotkey_id, (name, spec, (mods, vk)) in enumerate(self._items, start=1):
             if not self._register(hotkey_id, mods, vk):
                 log(f"全局热键：{format_hotkey(spec)} 注册失败（可能被别的程序占用），已跳过")
@@ -302,15 +303,16 @@ class HotkeyListener:
                 continue
             self._ids.append(hotkey_id)
             self._by_id[hotkey_id] = name
+            registered.append(f"{format_hotkey(spec)} {ACTION_LABELS.get(name, name)}")
         if not self._ids:
             # 一条都没注册上也不退出：占键的程序（输入法 / 远程工具 / QQ）退出后
             # 要能自动恢复，否则用户只能重启 MemGuard。循环里没有可派发的 id，
             # 空转成本只是每 poll_sec 一次 PeekMessage。
             log("全局热键：一条都没注册上，稍后自动重试（托盘与监控不受影响）")
         else:
-            log("全局热键已注册：" + "、".join(
-                f"{format_hotkey(spec)} {ACTION_LABELS.get(name, name)}"
-                for name, spec, _ in self._items))
+            # 只列真正注册上的（v1.29.1）：旧实现把 self._items 全量打出来，
+            # 三条里成功一条也会写成「三条都已注册」，排查时反而误导。
+            log("全局热键已注册：" + "、".join(registered))
         next_retry = self._clock() + self._retry_sec
         try:
             while not self._stop.is_set():

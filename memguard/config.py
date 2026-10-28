@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.28.0"
+__version__ = "1.29.1"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -190,6 +190,17 @@ PROCESS_KILL_PROTECT_STEMS = CLEAN_BLACKLIST_STEMS
 # 等于给虚拟机断电。而且这类进程跑在 Session 0、属主是 SYSTEM，普通令牌连
 # OpenProcess(PROCESS_TERMINATE) 都拿不到——点它注定失败，只会在菜单里给个假按钮。
 PROCESS_KILL_VMHOST_STEMS = _blacklist_stems(("*vmmem*", "vmcompute", "vmwp"))
+
+# 只挡「结束进程」的另一批：Windows 核心与安全组件（v1.29.0）。
+# 真机反馈「无法结束任何进程」时，用户点的是内存榜首的 MemCompression 与
+# MsMpEng.exe：两者都跑在 Session 0、属主 SYSTEM，未提权时 OpenProcess 直接
+# ERROR_ACCESS_DENIED；即便提权也不该杀——一个是内核内存压缩，一个是 Defender。
+# 这类行在 Top8 里照常列出（占了榜单就得让人看见），但标「受保护」不给点，
+# 而不是做成一个点十次失败十次的假按钮。
+PROCESS_KILL_CORE_STEMS = _blacklist_stems((
+    "memcompression", "msmpeng", "system", "registry",
+    "smss", "csrss", "wininit", "services", "lsass", "winlogon",
+))
 
 
 def name_in_blacklist(name, stems) -> bool:

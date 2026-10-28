@@ -228,10 +228,11 @@ def selftest() -> int:
     def _kill_probe() -> str:
         """只验证 kill_process 的保护判定，绝不真的结束任何进程。
 
-        四条都是必然被拒绝的输入：PID 0 是系统保留、本进程 PID 触发自杀保护、
+        五条都是必然被拒绝的输入：PID 0 是系统保留、本进程 PID 触发自杀保护、
         不存在的 PID 取不到进程信息（RSS=0）走到 terminate_process 仍失败、
-        名字是 vmmemWSL 时撞虚拟机宿主保护（v1.28.0：这类进程读的是传入的名字，
-        不依赖机器上此刻到底有没有在跑 WSL）。
+        名字是 vmmemWSL 时撞虚拟机宿主保护（v1.28.0）、名字是 MemCompression
+        时撞 Windows 核心组件保护（v1.29.0）。后两条读的是传入的名字，不依赖
+        机器上此刻到底有没有在跑 WSL / 内存压缩。
         任何一条返回 ok=True 就说明保护形同虚设。
         """
         cfg = normalize_config({})
@@ -241,7 +242,8 @@ def selftest() -> int:
         rows = [(0, "probe.exe", "PID 0"),
                 (os.getpid(), "probe.exe", "本进程"),
                 (dead, "probe.exe", "不存在 PID"),
-                (dead, "vmmemWSL", "虚拟机宿主")]
+                (dead, "vmmemWSL", "虚拟机宿主"),
+                (dead, "MemCompression", "核心组件")]
         rejected = []
         for pid, name, _label in rows:
             r = kill_process(pid, name, cfg)

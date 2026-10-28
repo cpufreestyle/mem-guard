@@ -410,6 +410,37 @@ def test_restart_replaces_the_listener(no_real_hotkeys):
     guard._stop_hotkeys()
 
 
+def test_second_start_stops_the_first_listener(no_real_hotkeys):
+    """v1.29.1 真机：启动期热重载与 run() 撞车，第二个监听器把三条键全撞成 1409。
+
+    键位其实被第一个监听器占着——热键能用，菜单却一直显示「未生效」。
+    修法是 _start_hotkeys 先停旧监听器，任何重复调用都不会留下两条。
+    """
+    guard = Guard()
+    guard._start_hotkeys()
+    guard._start_hotkeys()
+    assert len(no_real_hotkeys) == 2
+    assert no_real_hotkeys[0].stopped is True
+    assert no_real_hotkeys[1].started is True
+    assert guard._hotkeys is no_real_hotkeys[1]
+    guard._stop_hotkeys()
+
+
+def test_registered_log_lists_only_the_keys_that_actually_registered(monkeypatch):
+    """三条里只成功一条时，日志不能写成「三条都已注册」（排查会走错方向）。"""
+    logged = []
+    monkeypatch.setattr(hotkeys, "log", lambda m: logged.append(m))
+    listener = _listener(
+        {"clean": "ctrl+alt+m", "overview": "ctrl+alt+o"}, {},
+        register=lambda hid, *a: hid == 1,
+        unregister=lambda *a: None, poll=_Script(None))
+    listener.start()
+    assert _wait_for(lambda: listener.failures)
+    listener.stop()
+    line = next(m for m in logged if "已注册" in m)
+    assert "Ctrl+Alt+M" in line and "Ctrl+Alt+O" not in line, line
+
+
 def test_hotkey_toggles_auto_clean_in_config(monkeypatch, tmp_path):
     cfg_file = tmp_path / "mem_guard.json"
     cfg_file.write_text(json.dumps({"auto_clean": True}), encoding="utf-8")

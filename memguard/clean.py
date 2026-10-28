@@ -29,7 +29,7 @@ from .actions import (
 )
 from .config import (CLEAN_BLACKLIST_STEMS, CLEAN_LEVELS, _CONFIG_LOCK, _norm_proc_name, gb,
                      load_config, log, name_in_blacklist, PROCESS_KILL_PROTECT_STEMS,
-                     PROCESS_KILL_VMHOST_STEMS, save_config)
+                     PROCESS_KILL_CORE_STEMS, PROCESS_KILL_VMHOST_STEMS, save_config)
 from .privileges import clean_privileges
 from .winapi import get_mem, is_admin, process_working_sets, visible_window_pids
 
@@ -970,6 +970,13 @@ def kill_protect_reason(pname: str) -> str | None:
         return ("这是虚拟机宿主进程（vmmem / Hyper-V）：结束它等于给虚拟机断电，"
                 "所有 WSL 发行版和容器会一起中断。要收回它的内存用「立即清理」就够了；"
                 "真要关掉请在命令行执行 wsl --shutdown")
+    # Windows 核心/安全组件（v1.29.0）：真机「无法结束任何进程」点的就是这两类。
+    # MemCompression 是内核内存压缩，MsMpEng 是 Defender——两者都属 SYSTEM，
+    # 未提权开不到句柄，提权了也不该由这里下手。收掉假按钮，话术说清为什么。
+    if name_in_blacklist(pname, PROCESS_KILL_CORE_STEMS):
+        return ("这是 Windows 核心或安全组件（如 MemCompression / Defender）："
+                "它由 SYSTEM 拥有，普通权限结束不了，强行结束也会让系统失去防护或直接蓝屏。"
+                "要收回内存请用「立即清理」")
     if name_in_blacklist(pname, CLEAN_BLACKLIST_STEMS) or name_in_blacklist(
             pname, PROCESS_KILL_PROTECT_STEMS):
         return f"进程 {pname} 在保护黑名单内，已跳过"

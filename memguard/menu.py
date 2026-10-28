@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 import pystray
 
@@ -38,6 +39,92 @@ def _kill_one(guard, pid: int, name: str) -> None:
     r = kill_process(pid, name, cfg)
     message_box("MemGuard - 结束结果", r.get("msg", "已完成"))
     guard.refresh()
+
+
+# 托盘子菜单「结束进程（内存占用 Top8）」的槽位数与快照有效期（v1.29.0）
+_KILL_SLOT_COUNT = 8
+_KILL_SNAPSHOT_TTL = 0.5
+
+
+class _KillSlots:
+    """Top8 子菜单的实时行：菜单展开那一刻现取进程表，而不是建树时定死。
+
+    旧实现把 PID 直接写进 MenuItem，`build_menu` 只在托盘图标创建时跑一次——
+    MemGuard 一开机就是几天，子菜单里全是启动时的旧 PID，点谁都只得到
+    「已经找不到这个进程（可能刚退出）」（真机日志 2026-10-27 20:02 正是如此）。
+    现在固定 8 个槽位，文案 / 是否可点 / 点下去杀谁都在展开时按快照求值。
+
+    快照缓存 0.5 秒：一次展开里 8 个槽位连续求值只扫一遍进程表；点击动作读的是
+    同一份快照（不再重扫），保证「点到的那一行就是刚才显示的那一行」。
+    """
+
+    def __init__(self, guard, count: int = _KILL_SLOT_COUNT):
+        self.guard = guard
+        self.count = count
+        self._rows = []
+        self._at = 0.0
+
+    def rows(self) -> list:
+        """当前快照 [(name, rss, pid), ...]，带 TTL 缓存。"""
+        now = time.monotonic()
+        if now - self._at > _KILL_SNAPSHOT_TTL:
+            try:
+                self._rows = list(top_processes_list(self.count))
+            except Exception:
+                self._rows = []
+            self._at = now
+        return self._rows
+
+    def label(self, idx: int) -> str:
+        rows = self.rows()
+        if idx >= len(rows):
+            return "(无)"
+        name, rss, pid = rows[idx]
+        text = f"{name} ({rss / 1024 / 1024:.0f}MB, PID {pid})"
+        return f"{text} · 受保护" if kill_protect_reason(name) else text
+
+    def enabled(self, idx: int) -> bool:
+        if not bool(self.guard.cfg.get("process_kill_enabled", True)):
+            return False
+        rows = self.rows()
+        if idx >= len(rows):
+            return False
+        return kill_protect_reason(rows[idx][0]) is None
+
+    def kill(self, idx: int) -> None:
+        # 用展开时定下的那份快照：重扫可能让同一个下标换成另一个进程。
+        rows = self._rows or self.rows()
+        if idx >= len(rows):
+            return
+        name, _rss, pid = rows[idx]
+        _kill_one(self.guard, pid, name)
+
+
+def _kill_submenu(guard):
+    """托盘子菜单：列出内存占用 Top8，点一项即结束该进程。
+
+    受保护的进程（vmmem 这类虚拟机宿主、SYSTEM 核心组件）仍然列出来，但做成
+    不可点的一行并标上「受保护」——它们占着榜首，从列表里删掉只会让人以为
+    MemGuard 没看见；而做成能点的按钮更糟：点了只会得到一句失败。
+
+    槽位固定、内容实时（见 _KillSlots），菜单不需要在托盘刷新时重建。
+    """
+    slots = _KillSlots(guard)
+    items = []
+    for i in range(slots.count):
+        items.append(pystray.MenuItem(
+            lambda item, i=i: slots.label(i),
+            _slot_action(slots, i),
+            enabled=lambda item, i=i: slots.enabled(i)))
+    return pystray.Menu(*items)
+
+
+def _slot_action(slots: "_KillSlots", idx: int):
+    """pystray 的动作必须是 (icon, item) 两参数——工厂函数避免闭包下标串掉。"""
+    def act(icon, item):
+        slots.kill(idx)
+    return act
+
 
 def build_menu(guard) -> pystray.Menu:
     """构建托盘右键菜单。
@@ -438,34 +525,6 @@ def build_menu(guard) -> pystray.Menu:
         guard.cfg = update_config(
             {"process_kill_confirm": not bool(guard.cfg.get("process_kill_confirm", True))})
         log(f"结束进程前确认 -> {'开' if guard.cfg['process_kill_confirm'] else '关'}")
-
-    def _kill_submenu(guard):
-        """托盘子菜单：列出内存占用 Top8，点一项即结束该进程。
-
-        受保护的进程（vmmem 这类虚拟机宿主、系统关键进程）仍然列出来，但做成不可点的
-        一行并标上「受保护」——它们占着榜首，从列表里删掉只会让人以为 MemGuard 没看见；
-        而做成能点的按钮更糟：点了只会得到一句失败（v1.27.0 实测反馈）。
-        """
-        items = []
-        try:
-            rows = top_processes_list(8)
-            for nm, rss, pid in rows:
-                label = f"{nm} ({rss / 1024 / 1024:.0f}MB, PID {pid})"
-                if kill_protect_reason(nm):
-                    items.append(pystray.MenuItem(f"{label} · 受保护", None, enabled=False))
-                    continue
-                items.append(pystray.MenuItem(
-                    label,
-                    (lambda p=pid, n=nm:
-                     lambda icon, item: _on_kill_one(guard, p, n))(),
-                    enabled=lambda i: bool(guard.cfg.get("process_kill_enabled", True))))
-        except Exception:
-            items.append(pystray.MenuItem("无法读取进程列表", None, enabled=False))
-        return pystray.Menu(*items) if items else pystray.Menu(
-            pystray.MenuItem("(无)", None, enabled=False))
-
-    def _on_kill_one(guard, pid: int, name: str) -> None:
-        _kill_one(guard, pid, name)
 
     def _set_hotkey(action, spec):
         def setter(icon, item):

@@ -127,8 +127,8 @@ def test_kill_process_foreground_probe_failure_is_not_protection(monkeypatch):
 def test_kill_process_rejects_blacklisted_names(monkeypatch):
     """黑名单（含通配符）里的进程一律拒杀，RSS 再大也不下手。"""
     fake = _patch_kernel(monkeypatch)
-    _patch_proc(monkeypatch, _FakeProc(6000, name="csrss.exe"))
-    r = clean.kill_process(6000, "csrss.exe", {})
+    _patch_proc(monkeypatch, _FakeProc(6000, name="dwm.exe"))
+    r = clean.kill_process(6000, "dwm.exe", {})
     assert r["ok"] is False
     assert "黑名单" in r["msg"]
     assert fake.opened == []
@@ -518,6 +518,7 @@ def test_open_denied_reason_reaches_the_user(monkeypatch):
     """
     fake = _patch_kernel(monkeypatch, open_ok=False, last_error=5)
     _patch_proc(monkeypatch, _FakeProc(29300, name="someproc.exe"))
+    monkeypatch.setattr(actions, "is_admin", lambda: False)
     monkeypatch.setattr(clean, "_wait_process_gone", lambda pid, timeout=None: True)
     r = clean.kill_process(29300, "someproc.exe", {})
     assert r["ok"] is False
@@ -633,3 +634,134 @@ def test_menu_lists_vm_host_as_unprotected_free_but_unkillable(monkeypatch):
     assert found[vic]._enabled(None) is True
     # 只有能安全结束的行才点得动
     assert [t for t in found if found[t]._enabled(None)] == [vic]
+
+
+# ------------------------------------------------ v1.29.0 真机「无法结束任何进程」
+
+
+def test_core_system_names_are_kill_protected():
+    """MemCompression / MsMpEng 这类 SYSTEM 组件不给假按钮，普通进程照旧放行。"""
+    for nm in ("MemCompression", "msmpeng.exe", "MsMpEng.exe", "lsass.exe",
+               "services.exe", "winlogon.exe"):
+        assert clean.can_kill(nm) is False, nm
+        why = clean.kill_protect_reason(nm)
+        assert "核心或安全组件" in why, (nm, why)
+    for nm in ("chrome.exe", "ChatGPT.exe", "python.exe"):
+        assert clean.can_kill(nm) is True, nm
+
+
+def test_kill_process_rejects_core_before_touching_handles(monkeypatch):
+    """真机日志里的 MemCompression(PID 3808) 在开句柄之前就被劝退。"""
+    fake = _patch_kernel(monkeypatch, open_ok=False, last_error=5)
+    _patch_proc(monkeypatch, _FakeProc(3808, name="MemCompression"))
+    r = clean.kill_process(3808, "MemCompression", {})
+    assert r["ok"] is False
+    assert fake.opened == []
+    assert "核心或安全组件" in r["msg"]
+
+
+def test_memory_compression_spelling_is_covered():
+    """清理黑名单里写的是带空格的 "memory compression"，psutil 报的是 MemCompression。"""
+    assert config.name_in_blacklist("MemCompression", config.PROCESS_KILL_CORE_STEMS)
+    assert config.name_in_blacklist("MemCompression", config.CLEAN_BLACKLIST_STEMS) is False
+
+
+def test_denied_reason_says_elevate_when_not_admin(monkeypatch):
+    """非管理员：话术要点名「以管理员身份运行」，用户才知道下一步做什么。"""
+    monkeypatch.setattr(actions, "is_admin", lambda: False)
+    _patch_kernel(monkeypatch, open_ok=False, last_error=5)
+    _patch_proc(monkeypatch, _FakeProc(6000))
+    r = clean.kill_process(6000, "victim.exe", {})
+    assert "管理员身份运行" in r["msg"], r["msg"]
+
+
+def test_denied_reason_is_honest_when_already_admin(monkeypatch):
+    """管理员下仍被拒：不能说「请以管理员运行」，要说进程受更高级别保护。"""
+    monkeypatch.setattr(actions, "is_admin", lambda: True)
+    _patch_kernel(monkeypatch, open_ok=False, last_error=5)
+    _patch_proc(monkeypatch, _FakeProc(6000))
+    r = clean.kill_process(6000, "victim.exe", {})
+    assert "请右键" not in r["msg"], r["msg"]
+    assert "受更高级别的保护" in r["msg"], r["msg"]
+
+
+def test_kill_privilege_enables_and_restores(monkeypatch):
+    """SeDebugPrivilege 只在这几毫秒开着：进去启用，出来恢复成原来的禁用态。"""
+    from memguard import privileges
+
+    calls = []
+    monkeypatch.setattr(privileges, "privilege_state", lambda name: 0)
+    monkeypatch.setattr(privileges, "enable_privilege",
+                        lambda name: calls.append(("enable", name)) or True)
+    monkeypatch.setattr(privileges, "disable_privilege",
+                        lambda name: calls.append(("disable", name)) or True)
+    with privileges.kill_privilege() as enabled:
+        assert enabled is True
+    assert calls == [("enable", "SeDebugPrivilege"),
+                     ("disable", "SeDebugPrivilege")]
+
+
+def test_kill_privilege_keeps_already_enabled_privilege(monkeypatch):
+    """本来就开着的特权不能被我们关掉。"""
+    from memguard import privileges
+
+    calls = []
+    monkeypatch.setattr(privileges, "privilege_state", lambda name: 0x2)
+    monkeypatch.setattr(privileges, "enable_privilege", lambda name: True)
+    monkeypatch.setattr(privileges, "disable_privilege",
+                        lambda name: calls.append(name))
+    with privileges.kill_privilege():
+        pass
+    assert calls == []
+
+
+def test_menu_submenu_text_refreshes_between_opens(monkeypatch):
+    """子菜单不再是开机时的死快照：隔一次展开能看到新上榜的进程。"""
+    rows = [("first.exe", 256 * 1024 * 1024, 5000)]
+    monkeypatch.setattr(menu, "top_processes_list", lambda n: rows)
+    monkeypatch.setattr(menu, "_KILL_SNAPSHOT_TTL", 0.0)
+    guard, m = _build_menu(monkeypatch, {"process_kill_enabled": True})
+    sub = _find_submenu(m, "结束进程（内存占用 Top8）")
+    assert str(sub.items[0].text).startswith("first.exe")
+
+    rows[:] = [("second.exe", 300 * 1024 * 1024, 6000)]
+    assert str(sub.items[0].text).startswith("second.exe")
+
+
+def test_menu_submenu_click_kills_the_row_that_was_shown(monkeypatch):
+    """展开后进程表变了也不许串位：点第 0 行杀的必须是刚才显示的那个 PID。"""
+    rows = [("first.exe", 256 * 1024 * 1024, 5000)]
+    monkeypatch.setattr(menu, "top_processes_list", lambda n: rows)
+    monkeypatch.setattr(menu, "_KILL_SNAPSHOT_TTL", 0.0)
+    monkeypatch.setattr(menu, "confirm_box", lambda t, p: True)
+    killed = []
+    monkeypatch.setattr(menu, "kill_process",
+                        lambda pid, nm, cfg: killed.append((pid, nm))
+                        or {"ok": True, "msg": ""})
+    monkeypatch.setattr(menu, "message_box", lambda t, p: None)
+    guard, m = _build_menu(monkeypatch, {"process_kill_enabled": True,
+                                         "process_kill_confirm": True})
+    sub = _find_submenu(m, "结束进程（内存占用 Top8）")
+    shown = str(sub.items[0].text)          # 展开：快照 = first.exe / 5000
+    rows[:] = [("second.exe", 300 * 1024 * 1024, 6000)]
+    sub.items[0](None)                       # 点击
+    assert "first.exe" in shown
+    assert killed == [(5000, "first.exe")]
+
+
+def _find_submenu(m, label):
+    """深度优先找到指定文案的父项，返回其子菜单。"""
+    def walk(node):
+        for it in node.items:
+            sub = getattr(it, "submenu", None)
+            if sub is not None:
+                if str(getattr(it, "text", "")) == label:
+                    return sub
+                got = walk(sub)
+                if got is not None:
+                    return got
+        return None
+
+    got = walk(m)
+    assert got is not None, f"菜单里没有「{label}」"
+    return got

@@ -382,11 +382,14 @@ def _boom_photo():
 
 
 class _RaiseRoot:
-    """记录 deiconify / lift / focus_force 的假窗口：验证唤窗真的会亮出来。"""
+    """记录窗口显示动作的假窗口：验证唤窗真的会亮出来。"""
 
     def __init__(self, exists=True):
         self.calls = []
         self._exists = exists
+
+    def withdraw(self):
+        self.calls.append("withdraw")
 
     def deiconify(self):
         self.calls.append("deiconify")
@@ -408,6 +411,20 @@ def test_raise_window_restores_and_focuses():
     """最小化、被压住的窗口要三件套救回来：deiconify + lift + focus_force。"""
     root = _RaiseRoot()
     ui._raise_window(root)
+    assert root.calls == ["deiconify", "update_idletasks", "lift", "focus_force"]
+
+
+def test_prepare_window_withdraws_before_layout():
+    """新窗口先藏起来，避免继承隐藏/最小化启动方式。"""
+    root = _RaiseRoot()
+    ui._prepare_window(root)
+    assert root.calls == ["withdraw"]
+
+
+def test_present_window_restores_and_focuses():
+    """布局完成后把新窗口显示成正常状态并压到最前。"""
+    root = _RaiseRoot()
+    ui._present_window(root)
     assert root.calls == ["deiconify", "update_idletasks", "lift", "focus_force"]
 
 

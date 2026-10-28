@@ -15,12 +15,14 @@ import os
 import psutil
 
 from .config import CLEAN_BLACKLIST_STEMS, _blacklist_stems, _norm_proc_name, log, name_in_blacklist
+from .privileges import kill_privilege
 from .winapi import (
     MemoryEmptyWorkingSets,
     MemoryFlushModifiedList,
     MemoryPurgeLowPriorityStandbyList,
     MemoryPurgeStandbyList,
     clear_file_cache,
+    is_admin,
     kernel32,
     psapi,
     _PROCESS_TERMINATE,
@@ -100,9 +102,8 @@ _PROCESS_ACCESS = 0x0400 | 0x0100      # PROCESS_QUERY_INFORMATION | PROCESS_SET
 _TERMINATE_ERROR_REASONS = {
     2: "进程已经不存在（可能刚自己退出了）",
     3: "进程路径无效或已经被回收",
-    5: "权限不足：这个进程由 SYSTEM 或别的账户拥有，当前令牌拿不到终止句柄。"
-       "以管理员运行也常常不够——清理时临时启用的 SeDebugPrivilege 只在清理那几秒开着，"
-       "结束进程不走那条路",
+    5: "权限不足：当前已是管理员身份，系统仍拒绝打开这个进程的终止句柄——"
+       "它受更高级别的保护（PPL / 受保护进程）",
     87: "参数无效（PID 不存在或已被回收）",
     1168: "该进程受系统保护，拒绝打开句柄",
 }
@@ -118,6 +119,11 @@ def _last_error() -> int | None:
 
 def _error_reason(code: int | None, fallback: str) -> str:
     why = _TERMINATE_ERROR_REASONS.get(code)
+    if code == 5 and not is_admin():
+        # v1.29.0：非管理员是最常见的「为什么结束不了」，得在话术里点名，
+        # 而不是让用户看到一句「权限不足」自己去猜要不要提权。
+        return ("权限不足：MemGuard 当前不是管理员身份，结束不了 SYSTEM 或其他账户的进程。"
+                "请右键 MemGuard → 以管理员身份运行后重试")
     if why:
         return why
     return f"{fallback}（错误码 {code}）" if code is not None else fallback
@@ -153,7 +159,11 @@ def terminate_process_with_reason(pid: int,
             return False, f"PID {pid} 上现在是另一个进程（{actual}），为防止杀错已停手"
     handle = None
     try:
-        handle = kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
+        # SeDebugPrivilege 只在开终止句柄这几毫秒里开着（v1.29.0）：
+        # 管理员令牌下这是「能结束 SYSTEM 进程」的关键，非管理员下启用会失败，
+        # 静默降级并由 OpenProcess 的错误码走到上面的人话原因。
+        with kill_privilege():
+            handle = kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
         if not handle:
             code = _last_error()
             why = _error_reason(code, "系统拒绝打开该进程的终止句柄")

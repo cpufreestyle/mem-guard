@@ -243,6 +243,32 @@ def _raise_window(root) -> None:
     except Exception:
         pass
 
+
+def _prepare_window(root) -> None:
+    """新建窗口先藏起来，等布局完成由 _present 亮出来（v1.29.0）。
+
+    Tk 建窗时沿用进程启动信息里的显示方式（STARTUPINFO.wShowWindow）：进程若由
+    计划任务 / 快捷方式以「最小化」或「隐藏」方式拉起，每个新窗口都会直接是最小化
+    状态——用户点了「趋势」，任务栏确实多出一个最小化按钮，屏幕上却什么都没变，
+    看起来就是按钮无效。先 withdraw，再用 deiconify 显示，就不会继承那个状态。
+    """
+    try:
+        root.withdraw()
+    except Exception:
+        pass
+
+
+def _present_window(root) -> None:
+    """把新窗口亮成正常大小并压到最前。"""
+    try:
+        root.deiconify()
+        root.update_idletasks()
+        root.lift()
+        root.focus_force()
+    except Exception:
+        pass
+
+
 # 各窗口的单实例开关：同一种窗口同时只开一个（tkinter 多 Tk 实例容易出怪问题）
 _overview_window_open = False
 
@@ -376,6 +402,7 @@ def show_overview_window(hooks: dict) -> None:
         try:
             _build_overview(tk, ttk, hooks)
         except Exception as e:
+            log(f"概览窗口打开失败：{e!r}")
             message_box("MemGuard - 内存概览", f"窗口打开失败：{e!r}\n\n" + _overview_text(hooks=hooks))
         finally:
             _overview_window_open = False
@@ -385,6 +412,7 @@ def show_overview_window(hooks: dict) -> None:
 
 def _build_overview(tk, ttk, hooks: dict) -> None:
     root = tk.Tk()
+    _prepare_window(root)
     root.title("MemGuard - 内存概览")
     root.geometry("560x470")
     apply_window_icon(root)
@@ -525,6 +553,7 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
             pass
 
     root.after(1000, tick)
+    root.after(0, lambda: _present_window(root))
     root.mainloop()
 
 
@@ -565,6 +594,10 @@ def show_top_window() -> None:
             return
         try:
             _build_top(tk, ttk)
+        except Exception as e:
+            # 窗口建不起来时不能静默：否则用户点「Top10」只会看到什么都没发生
+            log(f"Top10 窗口打开失败：{e!r}")
+            message_box("MemGuard - 内存占用 Top10", f"窗口打开失败：{e!r}")
         finally:
             _top_window_open = False
 
@@ -604,6 +637,7 @@ def run_kill(procs, refresh=None) -> None:
 
 def _build_top(tk, ttk) -> None:
     root = tk.Tk()
+    _prepare_window(root)
     root.title("MemGuard - 内存占用 Top10")
     root.geometry("620x470")
     apply_window_icon(root)
@@ -664,6 +698,7 @@ def _build_top(tk, ttk) -> None:
 
     ttk.Button(root, text="刷新", command=refresh).pack(pady=8)
     refresh()
+    root.after(0, lambda: _present_window(root))
     root.mainloop()
 
 
@@ -683,6 +718,9 @@ def show_trend_window(history_getter) -> None:
             return
         try:
             _build_trend(tk, history_getter)
+        except Exception as e:
+            log(f"趋势窗口打开失败：{e!r}")
+            message_box("MemGuard - 内存趋势", f"窗口打开失败：{e!r}")
         finally:
             _trend_window_open = False
 
@@ -691,6 +729,7 @@ def show_trend_window(history_getter) -> None:
 
 def _build_trend(tk, history_getter) -> None:
     root = tk.Tk()
+    _prepare_window(root)
     root.title("MemGuard - 内存趋势")
     root.geometry("680x460")
     apply_window_icon(root)
@@ -757,6 +796,7 @@ def _build_trend(tk, history_getter) -> None:
     canvas.bind("<Configure>", lambda _e: draw())
     root.after(100, draw)
     root.after(1000, tick)
+    root.after(0, lambda: _present_window(root))
     root.mainloop()
 
 
@@ -813,6 +853,7 @@ def show_advice_window(cfg, history=None) -> None:
             return
         try:
             root = tk.Tk()
+            _prepare_window(root)
             root.title("MemGuard - 优化建议")
             root.geometry("640x470")
             apply_window_icon(root)
@@ -876,7 +917,11 @@ def show_advice_window(cfg, history=None) -> None:
 
             tk.Button(root, text="刷新", width=12, command=refresh).pack(pady=8)
             refresh()
+            root.after(0, lambda: _present_window(root))
             root.mainloop()
+        except Exception as e:
+            log(f"优化建议窗口打开失败：{e!r}")
+            message_box("MemGuard - 优化建议", f"窗口打开失败：{e!r}")
         finally:
             _advice_window_open = False
 

@@ -1157,6 +1157,11 @@ class Guard:
         """注册全局热键。一条都没注册上也不影响托盘与监控——最坏情况就是没热键。"""
         if not self.cfg.get("hotkey_enabled", True):
             return
+        # v1.29.1：先停掉已有监听器。启动期监控线程可能先触发一次配置热重载并
+        # 走到 restart_hotkeys()，随后 run() 又调一次本函数——旧实现不查重，
+        # 第二个监听器必然全部 1409 失败，而键位其实被第一个监听器占着。
+        # 结果是热键能用、菜单却一直显示「未生效」。
+        self._stop_hotkeys()
         specs = action_specs(self.cfg)
         if not specs:
             return
@@ -1247,9 +1252,11 @@ class Guard:
             f"提交 {s['commit_pct']:.0f}% | 档位={self.cfg.get('clean_level')}")
         if not is_admin():
             log("提示：非管理员运行，自动清理不会生效，请右键以管理员身份运行")
+        # 热键必须先起：监控线程一启动就会查配置 mtime，热重载可能走到
+        # restart_hotkeys()，与这里的首次注册撞车（见 _start_hotkeys 注释）。
+        self._start_hotkeys()
         # 监控线程只启动一次；托盘图标在循环内可被重建，实现"托盘自愈"
         threading.Thread(target=self.monitor, daemon=True).start()
-        self._start_hotkeys()
 
         self._start_show_waiter()
         while not self.stop.is_set():

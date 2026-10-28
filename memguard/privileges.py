@@ -19,6 +19,10 @@ CLEAN_PRIVILEGES = (
     "SeIncreaseBasePriorityPrivilege",
 )
 
+# 结束进程只需要这一条（v1.29.0）：管理员令牌下它能打开 SYSTEM / 其他账户进程
+# 的终止句柄，和任务管理器同一个口径。
+KILL_PRIVILEGE = "SeDebugPrivilege"
+
 
 @contextmanager
 def clean_privileges():
@@ -35,3 +39,21 @@ def clean_privileges():
         for p, st in prior.items():
             if st is not None and not (st & 0x2):
                 disable_privilege(p)
+
+
+@contextmanager
+def kill_privilege():
+    """结束进程时临时启用 SeDebugPrivilege，退出时恢复原状态。
+
+    与 clean_privileges 的差别只在范围：只碰这一条特权，不把另外三条清理特权
+    带进「结束进程」这条用户随时会点的路径。非管理员令牌下启用必然失败，此时
+    静默降级——调用方仍会拿到 OpenProcess 的 ERROR_ACCESS_DENIED，并在话术里
+    告诉用户需要管理员身份。
+    """
+    prior = privilege_state(KILL_PRIVILEGE)
+    enabled = enable_privilege(KILL_PRIVILEGE)
+    try:
+        yield enabled
+    finally:
+        if enabled and prior is not None and not (prior & 0x2):
+            disable_privilege(KILL_PRIVILEGE)
