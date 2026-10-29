@@ -900,7 +900,7 @@ def test_v24_menu_shows_effective_hotkey_bindings():
     assert "全局热键：已关闭" in [str(i.text) for i in _walk_items(build_menu(off))]
 
 
-# -- v1.27.0 分组收纳：菜单只改形状，一个配置键都没删 --
+# -- v1.27.0 分组收纳 / v1.29.6 初级·高级两档：菜单只改形状，一个配置键都没删 --
 # 断言的是「形状」而不是「条数」：低频项必须待在指定父项里、日常项必须留在根菜单。
 # 谁哪天把这些项挪回根菜单（或者挪错父项、删掉某项），这里立刻红。
 
@@ -920,7 +920,14 @@ GROUPED = {
                  "更新包 sha256 校验"],
 }
 
+# v1.29.6 「菜单分初级和高级功能」：调参 / 诊断收进「高级功能」，根菜单只留初级。
+# 这四个父项 + 导出诊断必须待在高级功能里；「结束进程」是日常动作，留在根菜单。
+ADVANCED = ["触发与阶梯", "自适应与进阶", "热键与前台", "更新设置", "导出诊断"]
+ADVANCED_PARENTS = ["触发与阶梯", "自适应与进阶", "热键与前台", "更新设置"]
+
 GUIDES = {
+    "高级功能": "调参才用得上：触发 / 自适应 / 热键 / 更新 / 诊断；"
+              "日常清理在根菜单就够了",
     "触发与阶梯": "什么时候动手、动手按什么顺序；动手线在「清理阈值」与「清理冷却」里",
     "自适应与进阶": "自适应 = MemGuard 自己改配置（会落盘）；下面每条都能单独关掉",
     "结束进程": "六层保护：总开关 / 确认框 / 工作集下限 / 系统进程 / 自身进程 / 确认真退出；"
@@ -930,7 +937,7 @@ GUIDES = {
 
 DAILY_AT_ROOT = ["内存概览（左键）", "立即清理", "内存占用 Top10", "内存趋势",
                  "自动清理", "清理阈值", "清理力度", "清理冷却", "清理区域",
-                 "开机自启", "打开日志", "导出诊断", "退出"]
+                 "结束进程", "高级功能", "开机自启", "打开日志", "退出"]
 
 
 def _root_labels(menu_tree):
@@ -968,13 +975,31 @@ def _parent_of(menu_tree, label):
 
 
 def test_root_menu_is_short_after_grouping():
-    """整合的目标是根菜单别再一屏滚不到底：收进父项后根级项不超过 30 个。"""
-    roots = _root_labels(build_menu(_FakeGuard()))
-    assert len(roots) <= 30, f"根菜单 {len(roots)} 项：{roots}"
+    """根菜单 = 初级功能：只放日常项 + 「结束进程」+「高级功能」，不超过 24 项。"""
+    tree = build_menu(_FakeGuard())
+    roots = _root_labels(tree)
+    assert len(roots) <= 24, f"根菜单 {len(roots)} 项：{roots}"
+    assert "高级功能" in roots, "调参入口丢了，高级项就没地方去了"
     for parent, members in GROUPED.items():
-        assert parent in roots, f"父项「{parent}」没在根菜单里"
         leaked = [m for m in members if m in roots]
         assert not leaked, f"这些项还占着根菜单：{leaked}"
+    for parent in ADVANCED_PARENTS:
+        assert parent not in roots, f"「{parent}」属于高级功能，不该占着根菜单"
+        assert _parent_of(tree, parent) == "高级功能", \
+            f"「{parent}」应在「高级功能」里，实际在「{_parent_of(tree, parent)}」"
+    assert _parent_of(tree, "结束进程") is None, "结束进程是日常动作，要留在根菜单"
+
+
+def test_advanced_parent_collects_tuning_and_diagnostics():
+    """「高级功能」只收调参四组 + 导出诊断：多收一项日常项就是给日常操作加一层。"""
+    tree = build_menu(_FakeGuard())
+    subs = [str(i.text) for i in _find_item(tree, "高级功能").submenu.items
+            if str(i.text) != SEPARATOR]
+    assert subs[0] == GUIDES["高级功能"], "高级功能首行是引导行，不是可点项"
+    for label in ADVANCED:
+        assert label in subs, f"「{label}」没在高级功能里：{subs}"
+    assert _parent_of(tree, "导出诊断") == "高级功能"
+    assert "导出诊断" not in _root_labels(tree)
 
 
 def test_grouped_items_sit_under_their_parent():

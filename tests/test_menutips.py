@@ -131,7 +131,7 @@ def test_group_parents_and_guide_lines_stay_untipped():
     不是补个键就能了事。
     """
     _leaf, popup = _menu_labels()
-    for parent in ("清理阈值", "清理力度", "清理冷却", "清理区域", "定时清理",
+    for parent in ("高级功能", "清理阈值", "清理力度", "清理冷却", "清理区域", "定时清理",
                    "低内存触发", "触发与阶梯", "自适应与进阶", "热键与前台",
                    "快捷键设置", "结束进程", "结束进程（内存占用 Top8）", "更新设置"):
         assert parent in popup, f"「{parent}」已不再是父项，这条对账要跟着菜单改"
@@ -139,8 +139,8 @@ def test_group_parents_and_guide_lines_stay_untipped():
 
     leaf, _ = _menu_labels()
     guides = [l for l in leaf if "下面每条" in l or "动手线在" in l
-              or "六层保护：" in l or "下面三项" in l]
-    assert len(guides) == 4, f"分组引导行数量变了: {guides}"
+              or "六层保护：" in l or "下面三项" in l or "调参才用得上" in l]
+    assert len(guides) == 5, f"分组引导行数量变了: {guides}"
     for g in guides:
         assert menutips.tip_for(g) is None, "引导行自己就是说明，不该再挂悬浮窗"
 
@@ -237,6 +237,55 @@ def test_enabled_reads_config_live():
 
 
 # ---------------------------------------------------------------- 摆放与量算
+
+
+# ---------------------------------------------------------------- 排版（v1.29.6）
+
+def test_paragraphs_split_on_newlines_and_drop_blank_lines():
+    """换行是段落边界：空段丢掉，短段原样保留（顺序不能乱）。"""
+    assert menutips._paragraphs("判据一段。\n\n动作一段。\n") == ["判据一段。", "动作一段。"]
+    assert menutips._paragraphs("") == []
+    assert menutips._paragraphs(None) == []
+    # 老配置 / 手写文案里混进来的 CRLF 也要当成换行，不能画成一个方块
+    assert menutips._paragraphs("甲。\r\n乙。") == ["甲。", "乙。"]
+
+
+def test_long_paragraph_splits_at_sentence_end():
+    """三百字的整段会画成一面墙：超过阈值的段按句末标点切成几截，一句一条。"""
+    sentence = "这一句刚好够长，用来把段落撑过拆分的阈值，让渲染层把它切成几条。"   # ~30 字
+    text = sentence * 4
+    paras = menutips._paragraphs(text)
+    assert len(paras) > 1, "长段落没被拆开，悬停窗还是一条大块文字"
+    assert paras == [sentence.strip()] * 4, "一句一条，顺序与内容都不能变"
+    assert "".join(paras) == text, "拆分只许切分，不许丢字或改字"
+    for p in paras:
+        assert p.endswith("。"), f"切开的段应当停在句号上: {p!r}"
+
+    # 「；」是说明里在列举（阈值 = …；冷却 = …）：同一段里也要切开，别又合成散文
+    enum = "阈值 = 占用到多少个百分点才动手；冷却 = 两次自动清理的最小间隔；"\
+           "低内存触发 = 可用物理内存低于该绝对值也清一次；"\
+           "定时 = 不看占用、到点就清；这一串加起来早就超过拆分阈值了。"
+    parts = menutips._paragraphs(enum)
+    assert len(parts) == 5, parts
+    assert parts[0].endswith("；") and parts[-1].endswith("。")
+
+
+def test_real_tips_get_more_than_one_paragraph():
+    """说明表本身就是「判据。动作。代价。」：绝大多数条目应当能被拆成清单。"""
+    multi = [k for k, v in menutips.TIPS.items() if len(menutips._paragraphs(v)) > 1]
+    assert len(multi) >= 10, f"只有 {len(multi)} 条说明会被画成清单，排版等于没生效"
+
+
+def test_layout_parameters_stay_readable():
+    """排版参数是「更易读」这条需求的落地处：字号、行距、段距、边距一起钉住。"""
+    assert menutips._TIP_FONT_PX <= -15, "字号又退回 14px 以下了"
+    assert menutips._TIP_MAX_W <= 400, "折行宽度太宽，一行读下来会串行"
+    assert menutips._TIP_PARA_GAP >= 4, "段间距太小，分段看不出层次"
+    assert menutips._TIP_PAD_X >= 10 and menutips._TIP_PAD_Y >= 8, "内边距太挤，字贴边"
+    assert menutips._TIP_HANG > 0 and menutips._TIP_BULLET.strip(), "项目符号与悬挂缩进要配套"
+    # 折行 / 额外行距 / 不解释 & 前缀，三个都得在：行距为零正是旧版难读的主因之一
+    for flag in ("DT_WORDBREAK", "DT_EXTERNALLEADING", "DT_NOPREFIX"):
+        assert getattr(menutips, flag) & menutips._DT_TEXT, f"绘制标志缺 {flag}"
 
 def test_window_size_leaves_room_for_the_frame():
     """客户区尺寸必须经 AdjustWindowRectEx 换算成窗口尺寸。

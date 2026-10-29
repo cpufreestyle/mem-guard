@@ -58,27 +58,32 @@ MemGuard 同时监控这两个指标，并把 commit 放在最显眼的位置。
 - **全屏应用让路**（`fs_pause`，默认开）+ **前台进程保护**（`fs_protect`，默认开）：游戏 / 全屏播放器运行期间自动清理整轮暂停（手动清理、热键、菜单一概不受限；进全屏时只弹一条气泡，恢复静默），激进档也不会清空你正在用的前台进程的页。按「前台窗口是否铺满整块显示器」判定，与进程名无关——换任何游戏都自动被保护，不必为每个游戏维护白名单
 - **左键点托盘图标**打开「内存概览」主窗口（对标 WinMemoryCleaner / Mem Reduct）：物理 / 提交两条
   进度条 + 当前占用 Top5（同名多开自动合并为一行，右键可直接「结束选中的进程」；v1.28.0 起结束失败会把系统拒绝的原因一起写进结果框，不再只回一句「失败」）+ 立即清理 / 刷新 / Top10 / 趋势 / 优化建议 快捷按钮
-- 右键菜单（v1.27.0 起分组收纳：根菜单 56 项 → 26 项，配置键一个不删、默认值一个不改）：
+- 右键菜单（v1.27.0 分组收纳、v1.29.6 起分「初级 / 高级」两档：根菜单 22 项，配置键一个不删、默认值一个不改）：
   内存概览（左键）/ 立即清理 / 内存占用 Top10（可刷新窗口）/ 内存趋势 / 优化建议 / 一键应用优化建议 /
   自动清理开关 / 清理阈值 / 清理力度 / 清理冷却 / 清理区域 /
+  **结束进程**（关闭进程功能 / 结束进程前弹确认框 / 结束进程（内存占用 Top8）；v1.28.0 起 vmmem 这类虚拟机宿主
+  仍在列表里、但结尾标「· 受保护」且点不动，因为系统那侧根本不给终止句柄）/
+  **高级功能** ▸（触发与阶梯 / 自适应与进阶 / 热键与前台 / 更新设置 / 导出诊断）/
+  开机自启开关 / 打开日志 / 检查更新 / 退出
+  根菜单只留「日常会动」的项（初级），调参与诊断统一收进 **高级功能**（高级）：
   **触发与阶梯**（定时清理 / 低内存触发 / 启动时清理 / 清理未达标自动升档 / 定向清理内存大户 / 后台进程工作集清理）/
   **自适应与进阶**（8 条自适应开关 / 复位自适应闩 / 持续高压粘滞激进 / 阶段自学习 / 定向清理加深 / 趋势预防式清理）/
   **热键与前台**（全局热键 / 快捷键设置（三个动作各一组可选组合）/ 全屏应用时暂停自动清理 / 保护前台进程（不清空工作集）/ 鼠标悬停显示说明）/
-  **结束进程**（关闭进程功能 / 结束进程前弹确认框 / 结束进程（内存占用 Top8）；v1.28.0 起 vmmem 这类虚拟机宿主
-  仍在列表里、但结尾标「· 受保护」且点不动，因为系统那侧根本不给终止句柄）/
-  开机自启开关 / 打开日志 / 导出诊断 / 检查更新 /
-  **更新设置**（立即更新到最新版 / 自动更新（后台检查）/ 下载后自动安装 / 更新包 sha256 校验）/ 退出
-  日常要动的项一概留在根菜单，收进去的都是常年不碰的；带子菜单的父项划不出悬停说明，所以每个新组里
-  第一条不可点的那一行就是这一组的解释（「自适应 = MemGuard 自己改配置（会落盘）；下面每条都能单独关掉」）。
-  本文其他地方提到的右键项，v1.27.0 起按这五个组收纳：8 条自适应开关与「复位自适应闩」在 **自适应与进阶**，
-  定时 / 低内存 / 启动时与三级阶梯在 **触发与阶梯**，全局热键 / 快捷键设置 / 全屏让路 / 前台保护在
-  **热键与前台**，两个结束进程开关与 Top8 列表在 **结束进程**，「立即更新到最新版」与三个更新开关在
-  **更新设置**——只是换了位置，配置键名与默认值一个没改，直接改 `mem_guard.json` 的写法照旧有效
+  **更新设置**（立即更新到最新版 / 自动更新（后台检查）/ 下载后自动安装 / 更新包 sha256 校验）与「导出诊断」。
+  带子菜单的父项划不出悬停说明，所以每个组里第一条不可点的那一行就是这一组的解释
+  （「自适应 = MemGuard 自己改配置（会落盘）；下面每条都能单独关掉」）。
+  本文其他地方提到的右键项，v1.29.6 起按这套形状找：8 条自适应开关与「复位自适应闩」在 **高级功能 → 自适应与进阶**，
+  定时 / 低内存 / 启动时与三级阶梯在 **高级功能 → 触发与阶梯**，全局热键 / 快捷键设置 / 全屏让路 / 前台保护在
+  **高级功能 → 热键与前台**，两个结束进程开关与 Top8 列表留在根菜单的 **结束进程**，
+  「立即更新到最新版」与三个更新开关在 **高级功能 → 更新设置**——只是换了位置，
+  配置键名与默认值一个没改，直接改 `mem_guard.json` 的写法照旧有效
  - **菜单项看得懂了**（`menu_tips`，默认开）：鼠标划过菜单项，旁边就浮出一句这项「干什么、凭什么动、
    代价是什么」——像「触发线自适应」这种，会写清判据（什么时候才动手）、动作（最多改几次、改到什么程度）、
    关掉会怎样。共 44 条，只覆盖看字面猜不出来的项；带子菜单的项（清理阈值 / 清理力度 / 清理区域 / 触发与阶梯 …）划过
    只会展开子菜单，它们的总说明折在「自动清理」那一条里，各档位的取舍写在展开后的子项上。
-   不想要就在菜单「热键与前台」里取消「鼠标悬停显示说明」
+   v1.29.6 起排版改成「一句结论 + 项目符号清单」：字号 15px、加了行距与段距、长段落按句号与分号拆成一条一条，
+   左右留白从 9px 加到 12px、外面补一圈浅灰边框——同一段说明以前是一面墙，现在扫一眼就能分段读完。
+   不想要就在「高级功能 → 热键与前台」里取消「鼠标悬停显示说明」
 - 日志自动轮转（超过 1MB 归档为 `mem_guard.log.1`）
 - 单实例运行（命名互斥体）
 - 清理所需特权**用完即关**（不常驻 `SeDebugPrivilege` 等高危特权）
@@ -467,7 +472,9 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
   时把最小间隔压到 `max(cooldown * 0.5, 30)`，连续 2 次间隔达标再恢复完整 `cooldown`。只想固定节奏可在 `mem_guard.json` 里
   把 `adaptive_cooldown` 改为 `false`。
 
-当前版本 `1.29.5`。一个方向：**弱网下更新得能续上**。真机装 1.29.4 时这台机器的 GitHub CDN 只跑到 11–40 KB/s，22MB 的安装包连续断流好几次；旧实现一断就把已下载的部分删掉、整包重来，于是弱网用户永远等不到一次完整的自动更新。本版给 `download_asset` 加上断点续传：按已落盘字节带 `Range` 续，最多 3 次；服务端回 200（不认 Range）就退回整包重写，不会把内容追加成两份；连接被对端提前关掉时 `read` 并不抛异常，所以再用 `Content-Length` 对账发现缺口并接着续。全部尝试失败才删半成品——未校验的 exe 不留在临时目录里。新增 4 条用例钉住这四种情形。全量 794 passed / 1 skipped。
+当前版本 `1.29.6`。一个方向：**菜单要一眼分得清初级和高级，说明要一眼读得下去**。用户原话「悬停注释 文字显示优化更加容易读，菜单分初级和高级功能」，本版就这两件事。其一，**根菜单 = 初级**：日常会动的项（概览 / 立即清理 / Top10 / 趋势 / 优化建议 / 自动清理 / 阈值·力度·冷却·区域 / 结束进程 / 开机自启 / 日志 / 检查更新 / 退出）留在根级，调参与诊断统一收进新的父项 **高级功能**（触发与阶梯 / 自适应与进阶 / 热键与前台 / 更新设置 / 导出诊断），根菜单 26 → 22 项；配置键一个不删、默认值一个不改，`mem_guard.json` 不需要迁移。其二，**悬停说明改成「一句结论 + 项目符号清单」**：字号 14 → 15px、补 `DT_EXTERNALLEADING` 行距、段间距 5px、左右留白 9 → 12px、外面加一圈浅灰边框；长段落按句末标点（。；）拆成一条一条并加悬挂缩进的项目符号——「阈值 = …；冷却 = …；定时 = …」这种列举以前挤成一段散文，现在是一行一条。量字与绘制共用同一套分段 / 缩进 / 行距（任何一处不一致，最后一段就会被切掉），新增 4 条用例钉住拆段、长段切句与排版参数。全量 799 passed / 1 skipped。
+
+上一版 `1.29.5`。一个方向：**弱网下更新得能续上**。真机装 1.29.4 时这台机器的 GitHub CDN 只跑到 11–40 KB/s，22MB 的安装包连续断流好几次；旧实现一断就把已下载的部分删掉、整包重来，于是弱网用户永远等不到一次完整的自动更新。本版给 `download_asset` 加上断点续传：按已落盘字节带 `Range` 续，最多 3 次；服务端回 200（不认 Range）就退回整包重写，不会把内容追加成两份；连接被对端提前关掉时 `read` 并不抛异常，所以再用 `Content-Length` 对账发现缺口并接着续。全部尝试失败才删半成品——未校验的 exe 不留在临时目录里。新增 4 条用例钉住这四种情形。全量 794 passed / 1 skipped。
 
 上一版 `1.29.4`。一个方向：**自动更新其实从来没成功过**。本机按上一版的说明做真机升级（装 1.29.2 安装版 → 用它的 `--update` 升级到 1.29.3），结果秒退并打印「Release 里没有可用安装包」。查因：`fetch_latest_release()` 把资产归一化成 `{"name", "url"}`，而 `pick_asset()` 只读 `browser_download_url`——真实链路永远拿不到下载地址，于是每个版本都判定「没有可用安装包」；`find_checksums_asset()` 同病，就算挑到了包也会因为「找不到清单」中止。**这就是「本地一堆单测全绿、线上功能从没跑通过」的经典缺口**：用例喂的是 API 原始形状，喂不到真实链路那一份。本版把两个函数改成两种键名都认（`browser_download_url` 优先、`url` 兜底），并新增回归用例 `test_pick_asset_accepts_normalized_release_shape`。教训也写进 HANDOFF：发版前必须用上一版的真实产物跑一次 `--update`，别只测纯函数。全量 790 passed / 1 skipped。
 
@@ -508,17 +515,11 @@ Windows 会把「出现过一次就不再回来」的托盘图标收进折叠区
 | `memguard/clean.py` | 清理编排（`do_clean`）、进程工作集清空（`empty_process_working_sets` / `empty_selected_working_sets`）、定向大户挑选与清理（`_target_clean_candidates` / `_run_target_clean`）、趋势斜率拟合与预防判定（`_slope_per_sec` / `predictive_due`）、进程 RSS 增长感知（`growth_slopes` / `leak_candidates`）、后台进程工作集清理（`_run_bg_trim`）、Top 进程统计、粘滞激进与阶段跳过（`do_clean(sticky=, skip=)`）、分阶段释放量（`targeted_freed` / `bg_freed` / `escalated_freed`）、定向加深（v1.13.0 起，v1.14.0 起可多轮）与降压余量（`_deepen_rounds` / `_headroom_pct` / `_effective_threshold`）、大户榜集中度（`top_focus_ratio`）与加深收益衰减收尾（`_deepen_diminish_pct`）、清理提前量步长（`_HEADROOM_STEP`）、低内存下限步长与上限（`_MINAVAIL_STEP` / `_MINAVAIL_MAX`）与低内存触发计数（`do_clean(low_mem=)` 累计 `stats.low_mem`）、定向大户下限自调优取数与步长（v1.19.0：`_long_term_names` 长期在榜圈选（与 `top_focus_ratio` 同源抽出共用）、`focused_top_rss` 取 rss 中位数抗尖峰、`_MINMB_DIV` / `_MINMB_FLOOR_MB` 除数与兜底）、加深跑满轮数仍释放且压力未按住时的报回与计数（v1.20.0：`do_clean` 回传 `deepen_capped`）、预防窗口自调优步长与上限（v1.21.0：`_PREDICT_WINDOW_STEP` / `_PREDICT_WINDOW_MAX`）与预防式清理没防住计数（`do_clean(predictive_missed=)` 累计 `stats.preventive_missed`）、触发阈值自调优步长与兜底/次数上限（v1.22.0：`_THRESHOLD_STEP` / `_THRESHOLD_PHYS_FLOOR` / `_THRESHOLD_COMMIT_FLOOR` / `_THRESHOLD_MAX_DROPS`）、结束进程的保护判定与人话原因（v1.28.0：`kill_protect_reason` / `can_kill`，vmmem 这类虚拟机宿主单独一句「用立即清理 / wsl --shutdown」；失败 `msg` 一定带上系统给的原因）  |
 |  `memguard/ui.py` | 界面层：抗锯齿托盘图标绘制（`make_icon`，4× 超采样；v1.24.0 起另含守护状态行 `_guard_lines`，概览窗与无 tkinter 回退文案共用同一份口径）、气泡提示（`message_box`）、内存概览（`show_overview_window`）/ Top10 / 趋势 / 优化建议窗口（`show_advice_window(cfg, history=None)`，三处 analyze 同喂 `proc_history`；`apply_advice_actions` 支持「一键应用」/「全部应用」） |
 | `memguard/idle.py` | 用户空闲判定（v1.24.0 新增）：`GetLastInputInfo` 取最后一次键鼠输入至今的秒数（含 GetTickCount 回绕处理），`is_user_away(阈值)` 供通知静默使用；取不到时返回 None，按「不离开」处理 |
-| `memguard/menutips.py` | 托盘菜单悬停说明（v1.26.0 新增）：按菜单标签查说明（`tip_for`——静态精确表 + 带计数项的前缀表 + 取自 `adapters` 注册表的 8 条自适应说明），子类化 pystray 的菜单宿主窗口收 `WM_MENUSELECT`，说明画在一个自绘的置顶小窗上（它跑在自己的线程与消息泵上，因为托盘线程正卡在菜单的模态循环里）；`MenuTips.attach` 必须在托盘线程调用，带子菜单的项不显示说明。共 44 条，v1.27.0 起对账口径跟着分组后的菜单走：父项与每组第一条不可点的引导行都不配说明（引导行自己就是那一组的解释） |
+| `memguard/menutips.py` | 托盘菜单悬停说明（v1.26.0 新增）：按菜单标签查说明（`tip_for`——静态精确表 + 带计数项的前缀表 + 取自 `adapters` 注册表的 8 条自适应说明），子类化 pystray 的菜单宿主窗口收 `WM_MENUSELECT`，说明画在一个自绘的置顶小窗上（它跑在自己的线程与消息泵上，因为托盘线程正卡在菜单的模态循环里）；`MenuTips.attach` 必须在托盘线程调用，带子菜单的项不显示说明。共 44 条，v1.27.0 起对账口径跟着分组后的菜单走：父项与每组第一条不可点的引导行都不配说明（引导行自己就是那一组的解释）。v1.29.6 起排版改成「一句结论 + 项目符号清单」：`_paragraphs` 按句末标点（。；）拆段、15px 字号、`DT_EXTERNALLEADING` 行距、段间距 5px、左右留白 12px、外圈浅灰边框；量字与绘制共用同一套分段 / 缩进参数，任何一处不一致都会把最后一段切掉 |
 | `memguard/autostart.py` | 开机自启：计划任务注册 / 查询 / 卸载（`autostart_enabled` / `install_autostart` / `remove_autostart`） |
 | `memguard/diag.py` | 诊断导出：内存状态 / 进程 / 日志 / 配置打包为 zip（`export_diagnostics`） ；正文含「自适应决策痕迹」段（adapters.summary_lines） |
 | `memguard/update.py` | 自动更新：查询 GitHub 最新 Release、版本比较、资产挑选、下载与静默安装 / 自替换（`check_and_notify` / `install_latest` / `pick_asset`） ；v1.23.0 起新增 sha256 完整性校验（find_checksums_asset / fetch_checksums / parse_checksums / verify_asset / _verify_download）与便携自替换的备份回滚、purge_stale_backup |
 | `memguard/adapters.py` | 自适应适配器注册表（v1.23.0 新增）：8 条自适应的单一事实来源，`Adapter(key, latch, kind, cap, label)` 一行一条，菜单开关 / 诊断摘要 / 一键复位闩（`reset_patch`）/ 归一化闩区间（`clamp_bounds`）全部从这张表推导 |
 | `memguard/hotkeys.py` | 全局热键（v1.24.0 新增）：键位解析与格式化（`parse_hotkey` / `format_hotkey`，至少一个修饰键、单主键、F1..F24）、从配置取最终键位（`action_specs`）、注册与派发线程 `HotkeyListener`（`RegisterHotKey(hWnd=NULL)` + `PeekMessage` 轮询，不建窗口；注册失败只跳过该条，一条都没上就放弃启用）、菜单可选键位表 `HOTKEY_CHOICES` 及其自检（`choices_are_usable` / `choice_clashes`：每个候选都必须能解析、且同一组合只出现在一个动作下） |
 | `memguard/foreground.py` | 前台窗口判定（v1.24.0 新增）：全屏判定 `covers_rect` / `fullscreen_hwnd`（窗口矩形铺满整块显示器即算全屏，含 2px 容差，与进程名无关）、前台 PID `foreground_pid` / `protected_pid`、暂停理由 `pause_reason`；探测失败一律当成「不在全屏」 |
-| `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（`build_menu(guard)`，含「一键应用优化建议」`on_apply_advice`——现场重新分析（同喂 `proc_history`）后逐条增量写配置；「定向清理内存大户」`on_toggle_target_clean`；「趋势预防式清理」`on_toggle_predict_clean`；「后台进程工作集清理」`on_toggle_bg_trim`；「持续高压粘滞激进」`on_toggle_sticky`；「阶段自学习(跳过无效阶段)」`on_toggle_stage_learn`；v1.23.0 起 8 条自适应开关改由 `adapter_menu_items()` 从 `adapters.ADAPTERS` 生成（工厂 `_toggle_adapter(key)`），另有「复位自适应闩」`on_reset_adapters` 与「更新包 sha256 校验」`on_toggle_verify_sha256`；v1.27.0 起分组收纳：新增 `trigger_menu` / `adapters_menu` / `hotkey_fg_menu` / `kill_menu` / `update_menu` 五个父项，把低频项收进去（根菜单 26 项），配置键一个不删、默认值一个不改，每组第一条是一条不可点的说明行 `line_*_guide`） |
-|  `memguard/tray.py` | 主循环 `Guard`：运行状态、配置热重载、监控循环、趋势预防式清理等触发源的自动清理、托盘图标自愈与常驻声明、持续压力粘滞激进与阶梯阶段自学习（`_post_clean_learn`）、定向覆盖面自调优（`_maybe_adapt_top`）、清理提前量自调优（`_maybe_adapt_headroom`）、低内存下限自调优（`_maybe_adapt_min_avail`，短效归因 `_last_clean_reason`）、定向大户下限自调优（`_maybe_adapt_min_mb`，监控每 tick 调用、排在 `_maybe_adapt_top` 之后）、定向加深轮数自调优（`_maybe_adapt_deepen_rounds`，排在 `_maybe_adapt_min_mb` 之后）、预防窗口自调优（`_maybe_adapt_predict_window`，监控每 tick 调用、排在加深轮数适配之后）、触发阈值自调优（`_maybe_adapt_threshold`，超阈值「自动」触发的短效连发 `_THRESHOLD_STRIKES` 次且温和手段与提前量都已用尽时把两条触发线各降一档；`_headroom_exhausted` 判提前量是否已无路可走，`_threshold_short_streak` 只累计 reason 为「自动」的短效）与阶段自学习重试（`_rearm_skipped_stages`：某阶段连续被跳过 `_STAGE_REARM_ROUNDS` 轮就清零释放计数、再给一次试验机会）；v1.23.0 起自适应的开关门与闩读取改走 adapters 注册表（共 17 处） |
-| `memguard/cli.py` | 入口 `main()`、`--once`、`--selftest`、`--check-update`、`--update`、`--pin-tray`、控制台隐藏等启动流处理 |
-| `memguard/advisor.py` | 优化建议引擎：基于内存状态与配置生成分级建议（`analyze` / `format_advice` / `advice_actions`——把可操作建议映射成可一键应用的配置改动；`frequent_prevention`——预防式清理过半时建议直接改激进；`narrow_top_coverage`——大户榜长期集中在同几个进程时建议把大户数 +1（与托盘覆盖面自调优同源，同一份 `proc_history`）；`recurrent_short_relief`——短效已累计但还没到「该改用激进」时，建议把判定阈值提前几个百分点（与托盘提前量自调优同源同口径）；`recurrent_lowmem_shortfall`——短效多半由绝对下限触发时，建议把可用内存下限抬高一级（与托盘低内存下限自调优同源同口径）；`unreachable_top_threshold`——大户榜长期集中而榜上进程 rss 够不着 `target_clean_min_mb` 时，建议把大户下限减半（与托盘定向大户下限自调优同源，同一份 `proc_history`；命中时 `narrow_top_coverage` 主动让位——先把门槛降下来，加大户数只会把网撒得更宽）；`analyze(..., leaks=...)`——疑似泄漏进程提醒；`deepen_round_saturated`——加深把轮数上限跑满仍在释放且压力未按住时，建议把加深轮数 +1（与托盘加深轮数自调优同源同口径）；`predict_window_saturated`——预防式清理没防住时，建议把预测窗口加宽一档（与托盘预防窗口自调优同源同口径，第 3i 条建议）；`threshold_too_late`——温和阶梯全部用尽（短效 ≥2 次且升档/粘滞 ≥1 次）仍效果偏短时，建议把 phys/commit 两条触发线各降 5 个百分点（与托盘触发阈值自调优同源同口径，第 3j 条建议，命中时三条短效补偿建议让位）） ；v1.23.0 起自适应开关门与闩读取同走 adapters 注册表（共 9 处） |
-|  `mem_guard.py` | 薄启动器，仅 `from memguard.cli import main`，保持 `python mem_guard.py` 入口不变 |
-
-模块依赖为单向无环：`config` ← `winapi` ← `privileges` / `actions` ← `clean` ← `advisor` ← `ui` ← `autostart` ← `diag` ← `menu` / `menutips` ← `tray` ← `cli`（`update` 仅依赖 `config`，`menutips` 依赖 `config` / `adapters` / `winapi`）。
+| `memguard/menu.py` | 托盘菜单：菜单项树构建与全部菜单回调（`build_menu(guard)`，含「一键应用优化建议」`on_apply_advice`——现场重新分析（同喂 `proc_history`）后逐条增量写配置；「定向清理内存大户」`on_toggle_target_clean`；「趋势预防式清理」`on_toggle_predict_clean`；「后台进程工作集清理」`on_toggle_bg_trim`；「持续高压粘滞激进」`on_toggle_sticky`；「阶段自学习(跳过无效阶段)」`on_toggle_stage_learn`；v1.23.0 起 8 条自适应开关改由 `adapter_menu_items()` 从 `adapters.ADAPTERS` 生成（工厂 `_toggle_adapter(key)`），另有「复位自适应闩」`on_reset_adapters` 与「更新包 sha256 校验」`on_toggle_verify_sha256`；v1.27.0 起分组收纳：新增 `trigger_menu` / `adapters_menu` / `hotkey_fg_menu` / `kill_menu` / `update_menu` 五个父项，把低频项收进去（根菜单 26 项），配置键一个不删、默认值一个不改，每组第一条是一条不可点的说明行 `line_*_guide`；v1.29.6 起再分「初级 / 高级」两档：根菜单只留日常项 + 「结束进程」，调参四组与「导出诊断」收进新父项 `advanced_menu`（「高级功能」，根菜单 22 项，引导行 `line_advanced_guide`）） |

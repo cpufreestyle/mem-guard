@@ -636,6 +636,10 @@ def build_menu(guard) -> pystray.Menu:
     def line_trigger_guide(_):
         return "什么时候动手、动手按什么顺序；动手线在「清理阈值」与「清理冷却」里"
 
+    def line_advanced_guide(_):
+        return ("调参才用得上：触发 / 自适应 / 热键 / 更新 / 诊断；"
+                "日常清理在根菜单就够了")
+
     def trigger_menu():
         """触发与阶梯：定时 / 低内存 / 启动时三条额外触发线，加上不够狠时的三级阶梯。"""
         return pystray.Menu(
@@ -722,6 +726,28 @@ def build_menu(guard) -> pystray.Menu:
                              checked=lambda i: bool(guard.cfg.get("verify_update_sha256", True))),
         )
 
+    def advanced_menu():
+        """高级功能：根菜单只留「日常会动」的那几项，调参与诊断收进这里（v1.29.6）。
+
+        用户原话「菜单分初级和高级功能」——v1.27.0 把低频项收进了五个父项，根菜单
+        仍有二十多项，一眼看过去分不清哪些是日常、哪些是调参。现在根菜单 = 初级
+        （清理、阈值、概览、更新、退出），这五个父项 +「导出诊断」统一挂到「高级
+        功能」下面：配置键一个不删、默认值一个不改，只改形状。
+
+        父项照样不挂悬停说明（一展开左右都是子菜单地盘），这组的解释放在第一条
+        不可点的引导行上，与其余分组同一口径。
+        """
+        return pystray.Menu(
+            pystray.MenuItem(line_advanced_guide, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("触发与阶梯", trigger_menu()),
+            pystray.MenuItem("自适应与进阶", adapters_menu()),
+            pystray.MenuItem("热键与前台", hotkey_fg_menu()),
+            pystray.MenuItem("更新设置", update_menu()),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("导出诊断", on_export),
+        )
+
     return pystray.Menu(
         pystray.MenuItem(line_phys, None, enabled=False),
         pystray.MenuItem(line_commit, None, enabled=False),
@@ -743,10 +769,9 @@ def build_menu(guard) -> pystray.Menu:
         pystray.MenuItem("清理力度", level_menu()),
         pystray.MenuItem("清理冷却", cooldown_menu()),
         pystray.MenuItem("清理区域", areas_menu()),
-        pystray.MenuItem("触发与阶梯", trigger_menu()),
-        pystray.MenuItem("自适应与进阶", adapters_menu()),
-        pystray.MenuItem("热键与前台", hotkey_fg_menu()),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("结束进程", kill_menu()),
+        pystray.MenuItem("高级功能", advanced_menu()),
         pystray.MenuItem("开机自启", on_toggle_autostart,
                          checked=lambda i: autostart_enabled()),
         pystray.MenuItem(
@@ -755,8 +780,6 @@ def build_menu(guard) -> pystray.Menu:
         ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("打开日志", on_open_log),
-        pystray.MenuItem("导出诊断", on_export),
         pystray.MenuItem(f"检查更新（v{__version__}）", on_check_update),
-        pystray.MenuItem("更新设置", update_menu()),
         pystray.MenuItem("退出", on_quit),
     )

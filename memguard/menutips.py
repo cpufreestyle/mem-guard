@@ -29,6 +29,7 @@ Windows 的普通菜单项（MFT_STRING）没有提示文本 API；TOOLTIPS_CLAS
 from __future__ import annotations
 
 import ctypes
+import re
 import threading
 from ctypes import wintypes
 
@@ -240,17 +241,31 @@ DT_WORDBREAK = 0x0010
 DT_CALCRECT = 0x0400
 DT_EDITCONTROL = 0x2000
 DT_NOPREFIX = 0x800
+DT_EXTERNALLEADING = 0x0200
+DT_SINGLELINE = 0x0020
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 ERROR_CLASS_ALREADY_EXISTS = 1410
 
 _TIP_CLASS = "MemGuardMenuTip"
-_TIP_MAX_W = 400          # 折行宽度上限（逻辑像素）
-_TIP_PAD_X = 9
-_TIP_PAD_Y = 7
+# 说明窗的排版参数：v1.29.6 起从「一整块散文」改成「一句结论 + 项目符号清单」。
+# 用户原话「悬停注释 文字显示优化更加容易读」——旧版 14px、行距为零、左右 9px，
+# 三百字的说明压成一面墙，划过去根本找不到从哪儿读起。
+_TIP_FONT_PX = -15        # 字号（逻辑像素，负值 = 字符高度）
+_TIP_MAX_W = 380          # 折行宽度上限（逻辑像素）：一行约 22 个汉字，比 400 更好扫
+_TIP_PAD_X = 12
+_TIP_PAD_Y = 10
+_TIP_PARA_GAP = 5         # 段间距（逻辑像素），比行距大一点才看得出分段
+_TIP_HANG = 13            # 项目符号段：符号占的宽度 = 悬挂缩进，字与符号不重叠
+_TIP_BULLET = "· "
+# 长段落按句末标点再拆一次：超过这个长度的段，整段画出来就是一面墙
+_TIP_SENTENCE_SPLIT_MIN = 70
+# 画文字统一用这一组标志：自动折行 + 额外行距 + 不解释 & 前缀
+_DT_TEXT = DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXTERNALLEADING
 _TIP_GAP = 6              # 说明窗与菜单之间的间隙
 _TIP_BG = 0x00E1FFFF      # COLORREF：经典提示黄
 _TIP_FG = 0x00000000
+_TIP_BORDER = 0x00A0A0A0  # 1px 边框：压在白色窗口 / 深色菜单上都有个边界
 _TIP_MIN_W, _TIP_MIN_H = 90, 26
 
 _WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
@@ -297,6 +312,7 @@ for _f, _args, _rest in [
     ("AdjustWindowRectEx", [ctypes.POINTER(RECT), wintypes.DWORD, wintypes.BOOL,
                             wintypes.DWORD], wintypes.BOOL),
     ("FillRect", [wintypes.HDC, ctypes.POINTER(RECT), wintypes.HBRUSH], ctypes.c_int),
+    ("FrameRect", [wintypes.HDC, ctypes.POINTER(RECT), wintypes.HBRUSH], ctypes.c_int),
     ("IsWindow", [wintypes.HWND], wintypes.BOOL),
     ("PostQuitMessage", [ctypes.c_int], None),
     ("ShowWindow", [wintypes.HWND, ctypes.c_int], wintypes.BOOL),
@@ -373,6 +389,31 @@ def _item_rect(owner_hwnd, hmenu, cmd: int):
 # ---------------------------------------------------------------- 悬浮窗
 
 
+def _paragraphs(text: str) -> list:
+    """说明文案 → 逐段要画的行（首段当结论，其余加项目符号）。
+
+    说明是按「判据。动作。关掉会怎样。」一路写下来的，单段动辄两三百字；整块画出来
+    就是一面墙。这里先按换行分段，仍然过长的段再按句末标点（。；）切成不超过
+    ``_TIP_SENTENCE_SPLIT_MIN`` 的几截——渲染层给除首段外的每一段加「· 」与悬挂
+    缩进，读起来是清单，不是散文。
+
+    只影响「怎么画」，不改文案本身：说明表仍是一句完整的人话，测试与自检的对账口径
+    都按原文比对。
+    """
+    out = []
+    for raw in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        para = raw.strip()
+        if not para:
+            continue
+        if len(para) <= _TIP_SENTENCE_SPLIT_MIN:
+            out.append(para)
+            continue
+        # 一句一条：说明里的「；」本来就是在列举（阈值 = …；冷却 = …），
+        # 合并回去又变成一段散文，清单感就没了。
+        out.extend(p.strip() for p in re.split(r"(?<=[。；])", para) if p.strip())
+    return out
+
+
 class _TipWindow:
     """说明窗本体：自己的线程、自己的消息泵。
 
@@ -389,6 +430,7 @@ class _TipWindow:
         self._text = ""
         self._font = 0
         self._bg_brush = 0
+        self._border_brush = 0
 
     # -- 生命周期 --
 
@@ -457,11 +499,12 @@ class _TipWindow:
 
     def _create(self) -> None:
         hinst = kernel32.GetModuleHandleW(None)
-        # -14 逻辑像素、GB2312 字符集、PROOF_QUALITY：进程不是 DPI 感知（与全项目
-        # 一致，坐标与字号都走 96dpi 虚拟空间），高 DPI 屏上由系统整体缩放。
-        self._font = gdi32.CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0,
+        # 字号取 _TIP_FONT_PX、GB2312 字符集、PROOF_QUALITY：进程不是 DPI 感知
+        # （与全项目一致，坐标与字号都走 96dpi 虚拟空间），高 DPI 屏上由系统整体缩放。
+        self._font = gdi32.CreateFontW(_TIP_FONT_PX, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0,
                                        0x0004, 0x0020, "Microsoft YaHei")
         self._bg_brush = gdi32.CreateSolidBrush(_TIP_BG)
+        self._border_brush = gdi32.CreateSolidBrush(_TIP_BORDER)
         wc = WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
         wc.lpfnWndProc = _TIP_PROC_REF
@@ -485,35 +528,60 @@ class _TipWindow:
             rc = RECT()
             user32.GetClientRect(hwnd, ctypes.byref(rc))
             user32.FillRect(hdc, ctypes.byref(rc), self._bg_brush)
+            if self._border_brush:
+                user32.FrameRect(hdc, ctypes.byref(rc), self._border_brush)
             old = gdi32.SelectObject(hdc, self._font)
             gdi32.SetTextColor(hdc, _TIP_FG)
-            box = RECT(_TIP_PAD_X, _TIP_PAD_Y,
-                       rc.right - _TIP_PAD_X, rc.bottom - _TIP_PAD_Y)
-            user32.DrawTextW(hdc, self._text, -1, ctypes.byref(box),
-                             DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX)
+            self._draw_paragraphs(hdc, int(rc.right))
             if old:
                 gdi32.SelectObject(hdc, old)
         finally:
             user32.EndPaint(hwnd, ctypes.byref(ps))
+
+    def _draw_paragraphs(self, hdc, right: int) -> None:
+        """逐段画：首段顶格，其余「· 」+ 悬挂缩进，段间留 _TIP_PARA_GAP。
+
+        段高取 DrawTextW 的返回值（DT_WORDBREAK 下它就是这段文字的实际高度），
+        与 ``_measure`` 用同一套字号 / 宽度 / 标志，量出来多少就画多少。
+        """
+        y = _TIP_PAD_Y
+        for i, para in enumerate(_paragraphs(self._text)):
+            indent = 0 if i == 0 else _TIP_HANG
+            if indent:
+                bullet = RECT(_TIP_PAD_X, y, _TIP_PAD_X + _TIP_HANG, y + 2000)
+                user32.DrawTextW(hdc, _TIP_BULLET, -1, ctypes.byref(bullet),
+                                 DT_NOPREFIX | DT_EXTERNALLEADING | DT_SINGLELINE)
+            box = RECT(_TIP_PAD_X + indent, y,
+                       max(_TIP_PAD_X + indent + 1, right - _TIP_PAD_X), y + 4000)
+            h = int(user32.DrawTextW(hdc, para, -1, ctypes.byref(box), _DT_TEXT) or 0)
+            y += max(0, h) + _TIP_PARA_GAP
 
     def _measure(self, text: str, hwnd) -> tuple:
         """按 _TIP_MAX_W 折行量一次，返回**客户区**该开多大。
 
         量字用的是说明窗自己的 DC，不是屏幕 DC：换成屏幕 DC 时字体映射环境不同，
         量出来的行数会比真正画出来的少一截，底部那行就被切掉。
+
+        分段量与逐段绘制必须同口径：段数、悬挂缩进、行距任何一处不一致，量出来的
+        高度就比画出来的少一截，最后一段照样被切。
         """
         hdc = user32.GetDC(hwnd)
-        box = RECT(0, 0, _TIP_MAX_W - 2 * _TIP_PAD_X, 0)
+        width, height = 0, 0
         try:
             old = gdi32.SelectObject(hdc, self._font)
-            user32.DrawTextW(hdc, text, -1, ctypes.byref(box),
-                             DT_WORDBREAK | DT_CALCRECT | DT_EDITCONTROL | DT_NOPREFIX)
+            for i, para in enumerate(_paragraphs(text)):
+                indent = 0 if i == 0 else _TIP_HANG
+                box = RECT(0, 0, _TIP_MAX_W - 2 * _TIP_PAD_X - indent, 0)
+                user32.DrawTextW(hdc, para, -1, ctypes.byref(box),
+                                 _DT_TEXT | DT_CALCRECT)
+                width = max(width, int(box.right) + indent)
+                height += int(box.bottom) + (_TIP_PARA_GAP if i else 0)
             if old:
                 gdi32.SelectObject(hdc, old)
         finally:
             user32.ReleaseDC(hwnd, hdc)
-        return (max(_TIP_MIN_W, int(box.right) + 2 * _TIP_PAD_X),
-                max(_TIP_MIN_H, int(box.bottom) + 2 * _TIP_PAD_Y))
+        return (max(_TIP_MIN_W, width + 2 * _TIP_PAD_X),
+                max(_TIP_MIN_H, height + 2 * _TIP_PAD_Y))
 
     @staticmethod
     def _window_size(client_w: int, client_h: int) -> tuple:
