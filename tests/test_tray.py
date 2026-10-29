@@ -82,6 +82,20 @@ def test_tooltip_still_tracks_values_without_redraw(monkeypatch):
     assert "3.0GB" in g.icon.title
 
 
+def test_update_progress_shows_in_tooltip_until_cleared(monkeypatch):
+    """v1.29.7：下载进度写进悬停提示；监控线程的例行刷新不能把它抹掉。"""
+    monkeypatch.setattr(tray, "make_icon", lambda pct, thr: object())
+    g = _guard(_state())
+    g._refresh_icon()
+    g._on_update_progress({"done": 1048576, "total": 2097152})
+    assert "正在下载更新 50%" in g.icon.title
+    g._refresh_icon()
+    assert "正在下载更新 50%" in g.icon.title, "例行刷新也要带上进度"
+    g.update_progress = None
+    g._refresh_icon()
+    assert "正在下载更新" not in g.icon.title
+
+
 def test_advice_refresh_is_time_gated(monkeypatch):
     """未过 advice_refresh_sec 就不再扫进程；过期后刷新并复用同一份采样。"""
     scans = []
@@ -352,7 +366,7 @@ def test_update_check_guards_in_flight_and_advances_timestamp(monkeypatch):
     monkeypatch.setattr(tray, "threading", rec)
     monkeypatch.setattr(tray.update, "due_for_check", lambda cfg, now: True)
     monkeypatch.setattr(tray.update, "check_and_notify",
-                        lambda cfg, notify=None, on_ready=None:
+                        lambda cfg, notify=None, on_ready=None, progress=None:
                         checks.append(cfg) or {"ok": True})
     monkeypatch.setattr(tray, "log", lambda m: None)
     guard = Guard()

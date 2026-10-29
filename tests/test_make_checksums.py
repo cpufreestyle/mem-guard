@@ -155,7 +155,7 @@ def test_generated_manifest_verifies_through_the_client(tmp_path, monkeypatch):
         {"name": "checksums.txt", "browser_download_url": "https://x/checksums"},
     ]
     monkeypatch.setattr(update_mod, "fetch_checksums",
-                        lambda url, timeout=30: {"ok": True, "text": manifest})
+                        lambda url, timeout=30, **kw: {"ok": True, "text": manifest})
 
     for name in names:
         r = update_mod._verify_download(

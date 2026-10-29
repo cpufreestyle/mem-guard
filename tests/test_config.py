@@ -661,3 +661,19 @@ def test_normalize_config_threshold_adapt_coercion():
         {"threshold_adapt_done": "x"})["threshold_adapt_done"] == 0
     assert normalize_config(
         {"threshold_adapt_done": None})["threshold_adapt_done"] == 0
+
+
+def test_default_config_v297_update_proxy_present():
+    """v1.29.7：更新下载的代理默认留空（= 自动探测），不写死任何本机端口。"""
+    assert "update_proxy" in DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["update_proxy"] == ""
+    assert normalize_config({})["update_proxy"] == ""
+
+
+def test_normalize_config_update_proxy_only_strips_whitespace():
+    """代理串只去空白：合法性交给 update.resolve_proxy 现判，不在这里猜。"""
+    assert normalize_config(
+        {"update_proxy": "  http://127.0.0.1:7897  "})["update_proxy"] == "http://127.0.0.1:7897"
+    assert normalize_config({"update_proxy": None})["update_proxy"] == ""
+    # 写错的串原样保留：用户改回来即可，程序不静默改成直连
+    assert normalize_config({"update_proxy": "127.0.0.1:7897"})["update_proxy"] == "127.0.0.1:7897"

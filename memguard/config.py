@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.29.6"
+__version__ = "1.29.7"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -114,6 +114,10 @@ DEFAULT_CONFIG = {
     "last_update_check": 0,     # 上次检查时间戳(epoch 秒)，程序维护
     "update_notified_tag": "",  # 已气泡提醒过的版本 tag，去重
     "verify_update_sha256": True,  # 下载更新包后先比对 Release 的 sha256 清单；默认开，关掉就不再校验
+    # ---- 更新下载的代理（v1.29.7）：国内直连 GitHub CDN 常年只有一两百 KB/s ----
+    # 留空 = 自动探测（系统代理 → 本机 7897/7890/10809/10808/8080）；写死则优先用它。
+    # 例："http://127.0.0.1:7897"（Clash Verge / Mihomo 的混合端口）
+    "update_proxy": "",
     # ---- 全局热键（v1.24.0，对标 Mem Reduct / ISLC：一键清理不必点右键菜单）----
     "hotkey_enabled": True,    # 总开关；把某个键位留空即单独关掉那一条
     "hotkey_clean": "ctrl+alt+m",     # 立即清理一次
@@ -323,6 +327,9 @@ def normalize_config(raw) -> dict:
     except (TypeError, ValueError):
         cfg["last_update_check"] = 0.0
     cfg["update_notified_tag"] = str(cfg.get("update_notified_tag") or "")
+    # 更新代理：只去空白，不校验合法性——写错时 update.resolve_proxy 原样交给
+    # urllib，失败原因会回到气泡与日志里，不会把更新悄悄变成「直连失败」
+    cfg["update_proxy"] = str(cfg.get("update_proxy") or "").strip()
     # 累计统计：非负整数
     raw_stats = cfg.get("stats")
     raw_stats = raw_stats if isinstance(raw_stats, dict) else {}

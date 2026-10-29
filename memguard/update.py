@@ -21,11 +21,13 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from .config import REPO_SLUG, __version__, log, update_config
@@ -42,8 +44,111 @@ CHECKSUMS_ASSET_RE = re.compile(
 # 后台静默检查间隔的兜底值（小时）；实际以配置 update_check_hours 为准
 DEFAULT_CHECK_HOURS = 12
 
-# 下载超时（秒）：Release 资产走 GitHub CDN，弱网给宽一点
-DOWNLOAD_TIMEOUT = 300
+# 下载超时（秒）：这是「单次读多久没有字节就判定断流」，不是整包总时长——
+# 慢速但持续的下载不会被它掐断。弱网下对端一声不吭地挂着，旧值 300 秒等于
+# 五分钟零反馈（用户看到的就是「点了没反应」）；30 秒没数据就断开续传，
+# 至少日志里每 30 秒能留下一条证据。
+DOWNLOAD_TIMEOUT = 30
+
+# ---- 更新链路的网络出口（v1.29.7）----------------------------------------
+# 国内直连 GitHub 的 Release CDN 常年只有一两百 KB/s 甚至直接超时（本项目实测
+# 22MB 的 Setup 直连 30 秒只到 146KB，走本机 Clash 3.4 秒下完）。更新必须能找到
+# 本机代理，顺序：配置 update_proxy（用户说了算）→ 系统代理 → 常见本地端口探测。
+PROXY_PROBE_PORTS = (7897, 7890, 10809, 10808, 8080)  # Clash / v2rayN / 通用 http 代理
+PROXY_PROBE_TIMEOUT = 0.2
+# 自动探测结果的缓存秒数：一次更新要发三个请求，不能让探测跑三遍；用户中途
+# 才开代理时，五分钟后重新探测一次就能用上，不必重启程序。
+PROXY_CACHE_SEC = 300.0
+_PROXY_CACHE = {}   # key -> (proxy, 探测时刻 monotonic)
+
+
+def _normalize_proxy(value) -> str:
+    """把配置值归一成 urllib 认识的代理 URL；空串表示不指定。"""
+    p = str(value or "").strip()
+    if not p:
+        return ""
+    if "://" not in p:
+        p = "http://" + p
+    return p
+
+
+def _proxy_label(proxy: str) -> str:
+    """日志里只写 host:port：代理 URL 可能带用户名密码，凭据绝不落日志。"""
+    try:
+        parts = urllib.parse.urlsplit(proxy)
+        return f"{parts.hostname or ''}:{parts.port}" if parts.port else (parts.hostname or "")
+    except ValueError:
+        return "（无法解析）"
+
+
+def _detected_proxy() -> str:
+    """系统里已经配好的代理：环境变量或 WinINET（urllib.getproxies 两处都读）。"""
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:
+        return ""
+    for scheme in ("https", "http"):
+        val = str(proxies.get(scheme) or "").strip()
+        if val and val.lower() != "no":
+            return _normalize_proxy(val)
+    return ""
+
+
+def _probe_local_proxy() -> str:
+    """按常见本地端口做 TCP 探测：0.2 秒连不上就试下一个，绝不长时间阻塞。
+
+    只认 http 代理端口：urllib 不支持 socks，探测 v2rayN 时取的是它的 http 入站
+    端口（10809），不是 socks 端口（10808 也一并试，连上后再由 urllib 报协议错）。
+    """
+    for port in PROXY_PROBE_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=PROXY_PROBE_TIMEOUT):
+                return f"http://127.0.0.1:{port}"
+        except OSError:
+            continue
+    return ""
+
+
+def resolve_proxy(cfg: dict = None) -> str:
+    """决定这次更新走哪个代理；返回 '' 表示直连。结果进程内缓存。
+
+    显式配置写错也不猜：原样交给 urllib，失败原因会回到气泡与日志里。自动探测
+    只碰 127.0.0.1，连不上是毫秒级的 ECONNREFUSED，不会拖慢托盘。
+    """
+    explicit = _normalize_proxy((cfg or {}).get("update_proxy"))
+    key = explicit or "\x00auto"
+    now = time.monotonic()
+    hit = _PROXY_CACHE.get(key)
+    if hit and (explicit or now - hit[1] < PROXY_CACHE_SEC):
+        return hit[0]
+    proxy = explicit or _detected_proxy() or _probe_local_proxy()
+    _PROXY_CACHE[key] = (proxy, now)
+    if proxy:
+        log(f"更新链路走代理 {_proxy_label(proxy)}")
+    else:
+        log("更新链路直连（未发现可用代理）")
+    return proxy
+
+
+def _opener(proxy: str):
+    """构造带代理的 opener。不 install_opener：绝不改全局状态影响别的模块。"""
+    if proxy:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    # 直连时显式清空：环境变量里上一次会话残留的 http_proxy 不该偷偷生效
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _open(req, timeout: float, cfg: dict = None):
+    """更新链路的唯一网络出口：三处请求全部走这里，代理只在这里决定。"""
+    return _opener(resolve_proxy(cfg)).open(req, timeout=timeout)
+
+
+def _proxy_hint(cfg: dict = None) -> str:
+    """直连时给一句怎么配代理；已经走代理就别再劝人配代理。"""
+    if resolve_proxy(cfg):
+        return ""
+    return '（可设置 update_proxy，如 "http://127.0.0.1:7897"）'
 
 
 def _parse_version(v: str) -> tuple:
@@ -166,17 +271,60 @@ def _write_boot_cmd(path: str, text: str) -> None:
 
 DOWNLOAD_ATTEMPTS = 3
 
+# 进度日志间隔（秒）：弱网时一行一行看得出它其实在动，而不是「点了没反应」
+PROGRESS_LOG_SEC = 5.0
+
+_MB = 1024.0 * 1024.0
+
+
+def _mb(n) -> str:
+    """字节数转人话（1 位小数）：日志与悬停提示共用同一个口径。"""
+    return f"{float(n or 0) / _MB:.1f}MB"
+
+
+def progress_text(info: dict) -> str:
+    """把进度 dict 变成一句人话（托盘悬停提示用）。"""
+    info = info or {}
+    done = float(info.get("done") or 0)
+    total = float(info.get("total") or 0)
+    if total > 0:
+        pct = max(0, min(100, int(done * 100 / total)))
+        return f"正在下载更新 {pct}%（{_mb(done)}/{_mb(total)}）"
+    return f"正在下载更新 {_mb(done)}"
+
+
+def _report_progress(progress, done: int, total, base: int, started: float,
+                     resuming: bool) -> None:
+    """落一行进度日志，并回调调用方（托盘）更新可见进度。"""
+    elapsed = max(time.monotonic() - started, 0.001)
+    speed = max(done - base, 0) / elapsed
+    total_txt = _mb(total) if total else "未知大小"
+    tail = f"，续传自 {_mb(base)}" if resuming and base else ""
+    log(f"更新包下载中 {_mb(done)}/{total_txt}（{speed / _MB:.1f} MB/s{tail}）")
+    if progress:
+        try:
+            progress({"phase": "download", "done": done, "total": total,
+                      "speed": speed, "resuming": bool(resuming and base)})
+        except Exception:
+            pass
+
 
 def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT,
-                   attempts: int = DOWNLOAD_ATTEMPTS) -> dict:
+                   attempts: int = DOWNLOAD_ATTEMPTS, cfg: dict = None,
+                   progress=None) -> dict:
     """把 Release 资产流式下载到 dest，断线可续传。返回 {"ok": bool, "msg"?}。
 
     GitHub CDN 在弱网下经常半路断流（本项目实测 22MB 的 Setup 会断好几次）。
     旧实现一断就把已下载的部分删掉整包重来，于是弱网用户永远等不到一次完整的
     更新。现在带 Range 从断点续；服务端不认 Range（回 200 而不是 206）时退回
     整包重下，免得把整份内容追加成两份。全部尝试都失败才删掉半成品。
+
+    v1.29.7 起每 5 秒落一行「已下多少 / 总共多少 / 多少 MB/s」，并把同样的
+    进度回调给调用方（托盘悬停提示）；timeout 是「多久没有字节」而非总时长，
+    对端一声不吭挂住时会在 30 秒内断开重试，不再五分钟零反馈。
     """
     last_err = None
+    started_all = time.monotonic()
     for _attempt in range(max(1, int(attempts))):
         have = os.path.getsize(dest) if os.path.exists(dest) else 0
         headers = {"User-Agent": f"MemGuard/{__version__}"}
@@ -185,7 +333,7 @@ def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT,
         expected = None
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _open(req, timeout, cfg) as resp:
                 status = int(getattr(resp, "status", 200) or 200)
                 resuming = have > 0 and status == 206
                 try:
@@ -194,12 +342,25 @@ def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT,
                     length = 0
                 if length > 0:
                     expected = (have if resuming else 0) + length
+                base = have if resuming else 0
+                done = base
+                started = time.monotonic()
+                # 第一块就报一次：悬停提示立刻有百分比，不必等满 5 秒
+                last_report = 0.0
+                log("更新包开始下载（{}{}）".format(
+                    f"续传自 {_mb(base)}" if resuming and base else "从头开始",
+                    f"，共 {_mb(expected)}" if expected else ""))
                 with open(dest, "ab" if resuming else "wb") as f:
                     while True:
                         chunk = resp.read(1 << 20)
                         if not chunk:
                             break
                         f.write(chunk)
+                        done += len(chunk)
+                        now = time.monotonic()
+                        if now - last_report >= PROGRESS_LOG_SEC:
+                            last_report = now
+                            _report_progress(progress, done, expected, base, started, resuming)
             size = os.path.getsize(dest) if os.path.exists(dest) else 0
             if size == 0:
                 last_err = "下载结果为空"
@@ -208,16 +369,18 @@ def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT,
             if expected is not None and size < expected:
                 last_err = f"连接中断（{size}/{expected} 字节）"
                 continue
+            log(f"更新包下载完成（{_mb(size)}，用时 {time.monotonic() - started_all:.1f}s）")
             return {"ok": True}
         except Exception as e:
             last_err = e
+            log(f"更新包下载中断（{e}），1 秒后从断点续传")
             time.sleep(1)
     try:
         if os.path.exists(dest):
             os.remove(dest)
     except OSError:
         pass
-    return {"ok": False, "msg": f"下载失败：{last_err}"}
+    return {"ok": False, "msg": f"下载失败：{last_err}{_proxy_hint(cfg)}"}
 
 
 # ---------------------------------------------------------------- sha256 校验
@@ -296,11 +459,11 @@ def parse_checksums(text: str, name: str):
     return None
 
 
-def fetch_checksums(url: str, timeout: int = 30) -> dict:
+def fetch_checksums(url: str, timeout: int = 30, cfg: dict = None) -> dict:
     """下载 Release 上的 sha256 清单（几 KB 文本）。"""
     req = urllib.request.Request(url, headers={"User-Agent": f"MemGuard/{__version__}"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open(req, timeout, cfg) as resp:
             return {"ok": True, "text": resp.read().decode("utf-8", "replace")}
     except Exception as e:
         return {"ok": False, "msg": f"下载 sha256 清单失败：{e}"}
@@ -360,7 +523,7 @@ def due_for_check(cfg: dict, now=None) -> bool:
     return (time.time() if now is None else now) - last >= hours * 3600
 
 
-def fetch_latest_release(timeout: int = 8) -> dict:
+def fetch_latest_release(timeout: int = 8, cfg: dict = None) -> dict:
     """查询 GitHub 最新 Release。
 
     返回 {"ok": True, "tag", "url", "newer", "assets"} 或 {"ok": False, "msg"}。
@@ -372,14 +535,14 @@ def fetch_latest_release(timeout: int = 8) -> dict:
         "Accept": "application/vnd.github+json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open(req, timeout, cfg) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return {"ok": False, "msg": "该仓库暂无 Release（或不可访问）"}
         return {"ok": False, "msg": f"检查更新失败：HTTP {e.code}"}
     except Exception as e:
-        return {"ok": False, "msg": f"检查更新失败：{e}"}
+        return {"ok": False, "msg": f"检查更新失败：{e}{_proxy_hint(cfg)}"}
 
     tag = str(data.get("tag_name") or "").strip()
     if not tag:
@@ -415,7 +578,8 @@ def _set_notified(tag: str) -> None:
         pass
 
 
-def check_and_notify(cfg: dict, notify=None, on_ready=None, now=None) -> dict:
+def check_and_notify(cfg: dict, notify=None, on_ready=None, now=None,
+                     progress=None) -> dict:
     """检查一次更新并按结果安静处理，返回摘要 dict（供 CLI 与测试断言）。
 
     - 失败 / 已最新：只写日志，不打扰；
@@ -423,7 +587,7 @@ def check_and_notify(cfg: dict, notify=None, on_ready=None, now=None) -> dict:
     - 不打开浏览器：更新一律在程序内下载安装（v1.29.3 起），跳转网页留给用户自己。
     """
     record_check(now)
-    r = fetch_latest_release()
+    r = fetch_latest_release(cfg=cfg)
     if not r.get("ok"):
         log(r.get("msg", "检查更新失败"))
         return {"ok": False, "action": "none", "msg": r.get("msg", "检查更新失败")}
@@ -441,7 +605,7 @@ def check_and_notify(cfg: dict, notify=None, on_ready=None, now=None) -> dict:
                 notify(f"正在下载并安装 {tag}，完成后自动重启", "MemGuard 更新")
             except Exception:
                 pass
-        return install_latest(cfg, on_ready=on_ready, release=r)
+        return install_latest(cfg, on_ready=on_ready, release=r, progress=progress)
     if str((cfg or {}).get("update_notified_tag") or "") != tag:
         _set_notified(tag)
         if notify:
@@ -455,14 +619,14 @@ def check_and_notify(cfg: dict, notify=None, on_ready=None, now=None) -> dict:
 
 
 
-def _verify_download(asset: dict, assets, path: str) -> dict:
+def _verify_download(asset: dict, assets, path: str, cfg: dict = None) -> dict:
     """下载后的完整性校验：取清单 → 找摘要 → 比对，任何一步不通都算失败。
     """
     cks = find_checksums_asset(assets)
     if not cks:
         return {"ok": False,
                 "msg": "Release 缺少 sha256 清单，已取消安装（可在配置里关掉 sha256 校验）"}
-    fetched = fetch_checksums(cks["url"])
+    fetched = fetch_checksums(cks["url"], cfg=cfg)
     if not fetched.get("ok"):
         return {"ok": False, "msg": fetched.get("msg", "下载 sha256 清单失败")}
     expected = parse_checksums(fetched.get("text"), asset.get("name"))
@@ -474,7 +638,8 @@ def _verify_download(asset: dict, assets, path: str) -> dict:
         return {"ok": False, "msg": v.get("msg", "sha256 校验不通过")}
     return v
 
-def install_latest(cfg: dict, on_ready=None, release: dict = None) -> dict:
+def install_latest(cfg: dict, on_ready=None, release: dict = None,
+                   progress=None) -> dict:
     """下载最新版并静默安装 / 自替换。成功时进程被引导批处理重启，不再返回。
 
     on_ready 在引导批处理启动前回调：调用方在这里停托盘、收图标，保证目标 exe
@@ -484,7 +649,7 @@ def install_latest(cfg: dict, on_ready=None, release: dict = None) -> dict:
     if not exe:
         return {"ok": False, "action": "none",
                 "msg": "源码运行模式无法自更新：没有可替换的 exe，请 git pull 后重新打包"}
-    r = release or fetch_latest_release()
+    r = release or fetch_latest_release(cfg=cfg)
     if not r.get("ok"):
         return {"ok": False, "action": "none", "msg": r.get("msg", "检查更新失败")}
     if not r.get("newer"):
@@ -499,14 +664,14 @@ def install_latest(cfg: dict, on_ready=None, release: dict = None) -> dict:
     safe_tag = re.sub(r"[^0-9A-Za-z._-]", "_", tag)
     tmp_dir = tempfile.gettempdir()
     new_path = os.path.join(tmp_dir, f"mem_guard_update_{safe_tag}.exe")
-    d = download_asset(asset["url"], new_path)
+    d = download_asset(asset["url"], new_path, cfg=cfg, progress=progress)
     if not d.get("ok"):
         return {"ok": False, "action": "none", "msg": d.get("msg", "下载失败")}
     # 完整性校验：自动更新链路上唯一一道「装进机器的确实是作者发的那个包」的
     # 关卡。默认硬失败——Release 一定带 sha256 清单（CI 生成并一起上传），
     # 缺清单 / 摘要对不上 / 清单里没这个文件，一律在动手安装前中止。
     if bool((cfg or {}).get("verify_update_sha256", True)):
-        v = _verify_download(asset, r.get("assets"), new_path)
+        v = _verify_download(asset, r.get("assets"), new_path, cfg=cfg)
         if not v.get("ok"):
             # 校验不过的包当场删掉：引导批处理下一步就要 move 它，留着就是个
             # 未校验的可执行文件躺在临时目录里。

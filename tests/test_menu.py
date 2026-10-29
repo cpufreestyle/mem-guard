@@ -1038,13 +1038,13 @@ def test_check_update_installs_directly_and_never_opens_a_browser(monkeypatch):
     monkeypatch.setattr(menu, "threading", _InlineThreading())
     guard = _FakeGuard()
     guard.icon = _RecordingIcon()
-    monkeypatch.setattr(menu, "fetch_latest_release", lambda timeout=8: {
+    monkeypatch.setattr(menu, "fetch_latest_release", lambda timeout=8, cfg=None: {
         "ok": True, "tag": "v9.9.9", "url": "https://example/release",
         "newer": True, "assets": []})
     calls = []
     monkeypatch.setattr(
         menu, "install_latest",
-        lambda cfg, on_ready=None, release=None:
+        lambda cfg, on_ready=None, release=None, progress=None:
         calls.append(release["tag"]) or {"ok": False, "msg": "下载失败"})
 
     item = _find_item(build_menu(guard), "检查更新（v" + config.__version__ + "）")
@@ -1059,7 +1059,7 @@ def test_check_update_already_latest_stays_quiet(monkeypatch):
     monkeypatch.setattr(menu, "threading", _InlineThreading())
     guard = _FakeGuard()
     guard.icon = _RecordingIcon()
-    monkeypatch.setattr(menu, "fetch_latest_release", lambda timeout=8: {
+    monkeypatch.setattr(menu, "fetch_latest_release", lambda timeout=8, cfg=None: {
         "ok": True, "tag": "v1.0.0", "url": "https://example/release",
         "newer": False, "assets": []})
     calls = []
@@ -1069,3 +1069,36 @@ def test_check_update_already_latest_stays_quiet(monkeypatch):
     item(guard.icon)
     assert calls == []
     assert any("已是最新版本" in n for n in guard.icon.notes)
+
+
+def test_check_update_wires_progress_and_resets_it_on_failure(monkeypatch):
+    """v1.29.7：下载进度接到托盘那份回调上；失败后悬停提示要恢复原样。"""
+    monkeypatch.setattr(menu, "threading", _InlineThreading())
+    guard = _FakeGuard()
+    guard.icon = _RecordingIcon()
+    guard.update_progress = {"done": 1, "total": 2}
+    seen = []
+    guard._on_update_progress = seen.append
+    monkeypatch.setattr(menu, "fetch_latest_release", lambda timeout=8, cfg=None: {
+        "ok": True, "tag": "v9.9.9", "url": "https://example/release",
+        "newer": True, "assets": []})
+
+    def fake_install(cfg, on_ready=None, release=None, progress=None):
+        assert progress == guard._on_update_progress, "进度必须接到托盘那份回调"
+        progress({"done": 3, "total": 6})
+        return {"ok": False, "msg": "下载失败"}
+
+    monkeypatch.setattr(menu, "install_latest", fake_install)
+    menu.run_check_update(guard)
+    assert seen and seen[0]["done"] == 3
+    assert guard.update_progress is None, "失败后不能把「正在下载」永远挂在悬停提示上"
+
+
+def test_update_menu_shows_which_proxy_updates_use():
+    """代理写在配置里，菜单只负责显示口径：写死就显示它，留空就说自动探测。"""
+    tree = build_menu(_FakeGuard({"update_proxy": "http://127.0.0.1:7897"}))
+    assert "http://127.0.0.1:7897" in str(
+        _find_item_by_text(tree, "更新代理：").text)
+
+    auto = build_menu(_FakeGuard())
+    assert "自动探测" in str(_find_item_by_text(auto, "更新代理：").text)

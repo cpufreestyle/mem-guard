@@ -88,6 +88,7 @@ class Guard:
         self._show_event = None       # 唤窗事件句柄：给二次启动的信号用
         self._tray_pin_done = False   # 托盘常驻声明是否已尝试过（只试一次）
         self._update_checking = False  # 是否已有一次更新检查在途（防重复发起）
+        self.update_progress = None    # v1.29.7 更新下载进度（None=没有在下载）
         # 自适应冷却（v1.10.0）：纯内存态，不落盘；短效复发压间隔，连续达标恢复
         self._relief_short_streak = 0  # 连续「距上次清理不足 effect_min_relief_sec」次数
         self._relief_ok_streak = 0     # 连续「效果达标」次数
@@ -971,10 +972,14 @@ class Guard:
             if img is not self._icon_img:
                 self._icon_img = img
                 icon.icon = img
-            icon.title = (
+            title = (
                 f"MemGuard  物理 {s['phys_pct']:.0f}% / 提交 {s['commit_pct']:.0f}%\n"
                 f"可用物理 {gb(s['avail_phys'])}    可用提交 {gb(s['avail_commit'])}"
             )
+            prog = self.update_progress
+            if prog:
+                title += "\n" + update.progress_text(prog)
+            icon.title = title
         except Exception:
             pass
 
@@ -1002,15 +1007,27 @@ class Guard:
         """
         try:
             update.check_and_notify(self.cfg, notify=self._notify_update,
-                                    on_ready=self._stop_for_update)
+                                    on_ready=self._stop_for_update,
+                                    progress=self._on_update_progress)
         except Exception as e:
             log(f"更新检查异常: {e!r}")
         finally:
             self._update_checking = False
+            self.update_progress = None
+            self._refresh_icon()
 
     def _notify_update(self, msg: str, title: str) -> None:
         """更新通知：走托盘气泡（与其它通知共用空闲静默口径）。"""
         self._notify_balloon(msg, title)
+
+    def _on_update_progress(self, info: dict) -> None:
+        """下载进度（v1.29.7）：记在实例上并立刻写进悬停提示。
+
+        更新线程每 5 秒回调一次；_refresh_icon 也读同一个字段，所以监控线程
+        随后的例行刷新不会把百分比抹掉——两处共用一个事实来源。
+        """
+        self.update_progress = dict(info or {})
+        self._refresh_icon()
 
     def _stop_for_update(self) -> None:
         """安装开始前的收尾：停监控循环、收托盘图标，让目标 exe 不被占用。"""

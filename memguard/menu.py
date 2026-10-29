@@ -145,8 +145,11 @@ def run_check_update(guard) -> dict:
     下一个 exe → 双击安装」。下载与安装复用 install_latest 的同一条链路（sha256
     校验、便携覆盖 / Setup 静默升级、失败带原因）；成功时进程交给引导批处理，
     本进程不再返回。
+
+    v1.29.7：下载进度实时写进托盘悬停提示（每 5 秒一行日志），失败原因里带
+    「怎么配 update_proxy」——弱网下至少能看出它到底在动还是在等。
     """
-    r = fetch_latest_release()
+    r = fetch_latest_release(cfg=guard.cfg)
     if not r.get("ok"):
         msg = r.get("msg", "检查更新失败")
         log(msg)
@@ -163,9 +166,26 @@ def run_check_update(guard) -> dict:
         f"发现新版本 {r['tag']}（当前 v{__version__}）\n"
         f"正在后台下载并安装，完成后自动重启…",
         "MemGuard 更新")
-    res = install_latest(guard.cfg,
-                         on_ready=getattr(guard, "_stop_for_update", None),
-                         release=r)
+    # 进度回调走托盘那一份实现（Guard._on_update_progress）；测试里的桩 Guard
+    # 没有这个方法时退化成只写日志，绝不让「没有图标」把更新链路带崩。
+    progress = getattr(guard, "_on_update_progress", None)
+    try:
+        res = install_latest(guard.cfg,
+                             on_ready=getattr(guard, "_stop_for_update", None),
+                             release=r, progress=progress)
+    except Exception as e:
+        log(f"检查更新后自动安装异常: {e!r}")
+        _notify_guard(guard, f"更新失败：{e}", "MemGuard 更新")
+        return {"ok": False, "action": "none", "msg": f"更新失败：{e}"}
+    finally:
+        # 成功时进程已被引导批处理接管，走不到这里；失败要把悬停提示恢复原样
+        guard.update_progress = None
+        refresh = getattr(guard, "_refresh_icon", None)
+        if refresh:
+            try:
+                refresh()
+            except Exception:
+                pass
     if not res.get("ok"):
         msg = res.get("msg", "更新失败")
         log(f"检查更新后自动安装失败: {msg}")
@@ -724,6 +744,14 @@ def build_menu(guard) -> pystray.Menu:
                              checked=lambda i: bool(guard.cfg.get("auto_install", False))),
             pystray.MenuItem("更新包 sha256 校验", on_toggle_verify_sha256,
                              checked=lambda i: bool(guard.cfg.get("verify_update_sha256", True))),
+            pystray.Menu.SEPARATOR,
+            # v1.29.7：代理不是开关，是「写死在配置里」的一项；这里只显示当前口径，
+            # 免得用户点了检查更新没反应时不知道该去哪儿配。
+            pystray.MenuItem(
+                lambda i: "更新代理：" + (
+                    str(guard.cfg.get("update_proxy") or "").strip()
+                    or "自动探测（本机 7897/7890 等端口）"),
+                None, enabled=False),
         )
 
     def advanced_menu():

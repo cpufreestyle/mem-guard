@@ -213,14 +213,14 @@ class _Installer:
             picked = pick_asset(assets)["name"]
             text = (digest or hashlib.sha256(_PAYLOAD).hexdigest()) + "  " + picked + chr(13) + chr(10)
         monkeypatch.setattr(
-            update_mod, "fetch_latest_release", lambda timeout=8: {
+            update_mod, "fetch_latest_release", lambda timeout=8, **kw: {
                 "ok": True, "tag": "v9.9.9", "url": "https://example/release",
                 "newer": True, "assets": assets})
         monkeypatch.setattr(
-            update_mod, "fetch_checksums", lambda url, timeout=30: {
+            update_mod, "fetch_checksums", lambda url, timeout=30, **kw: {
                 "ok": True, "text": text})
 
-        def fake_download(url, dest, timeout=300):
+        def fake_download(url, dest, timeout=300, **kw):
             with open(dest, "wb") as f:
                 f.write(_PAYLOAD)
             return {"ok": True}
@@ -255,7 +255,8 @@ def test_install_latest_refuses_when_manifest_lacks_the_asset(monkeypatch, tmp_p
     it = _Installer(monkeypatch, tmp_path, digest="a" * 64)
     monkeypatch.setattr(
         update_mod, "fetch_checksums",
-        lambda url, timeout=30: {"ok": True, "text": "b" * 64 + "  other.exe" + chr(13) + chr(10)})
+        lambda url, timeout=30, **kw:
+        {"ok": True, "text": "b" * 64 + "  other.exe" + chr(13) + chr(10)})
     r = update_mod.install_latest(it.cfg())
     assert r["ok"] is False and "摘要" in r["msg"]
     assert it.state["popen"] == 0
@@ -264,7 +265,7 @@ def test_install_latest_refuses_when_manifest_lacks_the_asset(monkeypatch, tmp_p
 def test_install_latest_refuses_when_manifest_unreachable(monkeypatch, tmp_path):
     it = _Installer(monkeypatch, tmp_path, digest="a" * 64)
     monkeypatch.setattr(update_mod, "fetch_checksums",
-                        lambda url, timeout=30: {"ok": False, "msg": "网络不通"})
+                        lambda url, timeout=30, **kw: {"ok": False, "msg": "网络不通"})
     r = update_mod.install_latest(it.cfg())
     assert r["ok"] is False and "网络不通" in r["msg"]
     assert it.state["popen"] == 0
@@ -297,7 +298,7 @@ def test_install_latest_source_mode_explains_instead_of_opening_browser(monkeypa
 def test_install_latest_reports_missing_asset_without_page_jump(monkeypatch, tmp_path):
     """Release 里没有可用安装包：给一句人话，同样不跳网页。"""
     monkeypatch.setattr(update_mod, "_frozen_exe", lambda: str(tmp_path))
-    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8: {
+    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8, **kw: {
         "ok": True, "tag": "v9.9.9", "url": "https://example/release",
         "newer": True,
         "assets": [{"name": "README.md", "browser_download_url": "https://x/r"}]})
@@ -335,11 +336,11 @@ def test_download_asset_resumes_from_partial_file(monkeypatch, tmp_path):
     dest.write_bytes(b"A" * 4)
     seen = {}
 
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None, cfg=None):
         seen["range"] = req.get_header("Range")
         return _FakeResp(b"B" * 6, status=206)
 
-    monkeypatch.setattr(update_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(update_mod, "_open", fake_open)
     r = update_mod.download_asset("https://x/p.exe", str(dest))
     assert r["ok"] is True
     assert dest.read_bytes() == b"A" * 4 + b"B" * 6
@@ -351,8 +352,8 @@ def test_download_asset_restarts_when_server_ignores_range(monkeypatch, tmp_path
     dest = tmp_path / "pkg.exe"
     dest.write_bytes(b"A" * 4)
 
-    monkeypatch.setattr(update_mod.urllib.request, "urlopen",
-                        lambda req, timeout=None: _FakeResp(b"C" * 3, status=200))
+    monkeypatch.setattr(update_mod, "_open",
+                        lambda req, timeout=None, cfg=None: _FakeResp(b"C" * 3, status=200))
     r = update_mod.download_asset("https://x/p.exe", str(dest))
     assert r["ok"] is True and dest.read_bytes() == b"CCC"
 
@@ -362,13 +363,13 @@ def test_download_asset_retries_after_truncated_response(monkeypatch, tmp_path):
     dest = tmp_path / "pkg.exe"
     calls = []
 
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None, cfg=None):
         calls.append(req.get_header("Range"))
         if len(calls) == 1:
             return _FakeResp(b"D" * 4, status=200, length=10)
         return _FakeResp(b"E" * 6, status=206)
 
-    monkeypatch.setattr(update_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(update_mod, "_open", fake_open)
     monkeypatch.setattr(update_mod.time, "sleep", lambda s: None)
     r = update_mod.download_asset("https://x/p.exe", str(dest))
     assert r["ok"] is True
@@ -381,11 +382,12 @@ def test_download_asset_cleans_up_after_all_attempts_fail(monkeypatch, tmp_path)
     dest = tmp_path / "pkg.exe"
     dest.write_bytes(b"A" * 4)
 
-    def boom(req, timeout=None):
+    def boom(req, timeout=None, cfg=None):
         raise OSError("connection reset")
 
-    monkeypatch.setattr(update_mod.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(update_mod, "_open", boom)
     monkeypatch.setattr(update_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(update_mod, "resolve_proxy", lambda cfg=None: "")
     r = update_mod.download_asset("https://x/p.exe", str(dest), attempts=2)
     assert r["ok"] is False and "下载失败" in r["msg"]
     assert not dest.exists()
@@ -413,9 +415,9 @@ def _cfg(**over):
 def _fake_release(monkeypatch, tag="v9.9.9", ok=True, msg=""):
     if not ok:
         monkeypatch.setattr(update_mod, "fetch_latest_release",
-                            lambda timeout=8: {"ok": False, "msg": msg or "boom"})
+                            lambda timeout=8, **kw: {"ok": False, "msg": msg or "boom"})
         return
-    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8: {
+    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8, **kw: {
         "ok": True, "tag": tag, "url": "https://example/release",
         "newer": _parse_version(tag) > _parse_version("1.5.0"), "assets": _ASSETS})
 
@@ -453,11 +455,11 @@ def test_check_and_notify_stays_quiet_on_latest_and_error(monkeypatch):
 def test_check_and_notify_auto_install_takes_over(monkeypatch):
     calls = []
     monkeypatch.setattr(update_mod, "update_config", lambda changes: None)
-    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8: {
+    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8, **kw: {
         "ok": True, "tag": "v9.9.9", "url": "https://example/release",
         "newer": True, "assets": _ASSETS})
     monkeypatch.setattr(update_mod, "install_latest",
-                        lambda cfg, on_ready=None, release=None:
+                        lambda cfg, on_ready=None, release=None, progress=None:
                         calls.append(release["tag"]) or {"ok": True})
     bubbles = []
     check_and_notify(_cfg(auto_install=True), notify=lambda m, t: bubbles.append(m),
@@ -470,9 +472,164 @@ def test_check_and_notify_never_opens_a_browser(monkeypatch):
     """后台检查只提醒，不抢浏览器焦点；v1.29.3 起连「点了检查更新」也不跳网页。"""
     assert not hasattr(update_mod, "_open_url"), "更新链路里不该再留开浏览器的口子"
     monkeypatch.setattr(update_mod, "update_config", lambda changes: None)
-    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8: {
+    monkeypatch.setattr(update_mod, "fetch_latest_release", lambda timeout=8, **kw: {
         "ok": True, "tag": "v9.9.9", "url": "https://example/release",
         "newer": True, "assets": _ASSETS})
 
     r = check_and_notify(_cfg(), notify=lambda m, t: None)
     assert r["action"] == "notify"
+
+
+# --------------------------------------------------- v1.29.7 代理与下载进度
+
+class _Conn:
+    """socket.create_connection 的假返回值：只要求能进 with。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _no_proxy(monkeypatch):
+    """清掉进程内缓存并让系统代理与探测都返回空——测「直连」时别受本机影响。"""
+    monkeypatch.setattr(update_mod, "_PROXY_CACHE", {})
+    monkeypatch.setattr(update_mod, "_detected_proxy", lambda: "")
+    monkeypatch.setattr(update_mod, "_probe_local_proxy", lambda: "")
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+
+
+def test_resolve_proxy_prefers_explicit_config(monkeypatch):
+    """显式 update_proxy 最优先：用户写了就照办，不探测、不看系统代理。"""
+    monkeypatch.setattr(update_mod, "_PROXY_CACHE", {})
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    monkeypatch.setattr(update_mod, "_detected_proxy",
+                        lambda: (_ for _ in ()).throw(AssertionError("不该读系统代理")))
+    monkeypatch.setattr(update_mod, "_probe_local_proxy",
+                        lambda: (_ for _ in ()).throw(AssertionError("不该探测端口")))
+    assert update_mod.resolve_proxy(
+        {"update_proxy": " 127.0.0.1:7897 "}) == "http://127.0.0.1:7897"
+
+
+def test_resolve_proxy_uses_detected_system_proxy_before_probing(monkeypatch):
+    monkeypatch.setattr(update_mod, "_PROXY_CACHE", {})
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    monkeypatch.setattr(update_mod, "_detected_proxy", lambda: "http://127.0.0.1:10809")
+    monkeypatch.setattr(update_mod, "_probe_local_proxy",
+                        lambda: (_ for _ in ()).throw(AssertionError("不该探测端口")))
+    assert update_mod.resolve_proxy({}) == "http://127.0.0.1:10809"
+
+
+def test_resolve_proxy_probes_common_local_ports(monkeypatch):
+    """系统代理没开时按常见端口探测：Clash 7897 不通就试 7890。"""
+    monkeypatch.setattr(update_mod, "_PROXY_CACHE", {})
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    monkeypatch.setattr(update_mod, "_detected_proxy", lambda: "")
+    seen = []
+
+    def fake_connect(addr, timeout=None):
+        seen.append(addr)
+        if addr[1] == 7890:
+            return _Conn()
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(update_mod.socket, "create_connection", fake_connect)
+    assert update_mod.resolve_proxy({}) == "http://127.0.0.1:7890"
+    assert seen == [("127.0.0.1", 7897), ("127.0.0.1", 7890)]
+
+
+def test_resolve_proxy_is_cached_and_falls_back_to_direct(monkeypatch):
+    """一次更新要发三个请求：探测结果必须缓存；一个都没有就直连。"""
+    calls = []
+    _no_proxy(monkeypatch)
+
+    def fake_probe():
+        calls.append(1)
+        return ""
+
+    monkeypatch.setattr(update_mod, "_probe_local_proxy", fake_probe)
+    assert update_mod.resolve_proxy({}) == ""
+    assert update_mod.resolve_proxy({}) == ""
+    assert calls == [1], "同一个进程里不该反复探测"
+
+
+def test_proxy_label_never_leaks_credentials():
+    """日志只写 host:port：代理 URL 里的用户名密码绝不进日志。"""
+    assert update_mod._proxy_label(
+        "http://alice:s3cret@127.0.0.1:7897") == "127.0.0.1:7897"
+    assert "s3cret" not in update_mod._proxy_label(
+        "http://alice:s3cret@127.0.0.1:7897")
+
+
+def test_open_routes_through_the_resolved_proxy(monkeypatch):
+    """三处 urlopen 统一走 _open：代理最终落进 ProxyHandler 的 http/https。"""
+    seen = {}
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            seen["timeout"] = timeout
+            return "resp"
+
+    handlers = []
+
+    def fake_build(*h):
+        handlers.extend(h)
+        return _Opener()
+
+    monkeypatch.setattr(update_mod.urllib.request, "build_opener", fake_build)
+    r = update_mod._open("REQ", 5, {"update_proxy": "http://127.0.0.1:7897"})
+    assert r == "resp" and seen["timeout"] == 5
+    assert handlers[0].proxies == {"http": "http://127.0.0.1:7897",
+                                   "https": "http://127.0.0.1:7897"}
+
+
+def test_progress_text_is_human_readable():
+    assert update_mod.progress_text(
+        {"done": 1048576, "total": 2097152}) == "正在下载更新 50%（1.0MB/2.0MB）"
+    assert update_mod.progress_text({"done": 1048576}) == "正在下载更新 1.0MB"
+    assert update_mod.progress_text(None) == "正在下载更新 0.0MB"
+
+
+def test_download_asset_logs_progress_and_calls_back(monkeypatch, tmp_path):
+    """弱网下要能看出它其实在动：日志一行已下多少，回调同步给托盘。"""
+    dest = tmp_path / "pkg.exe"
+    logs, seen = [], []
+    monkeypatch.setattr(update_mod, "log", logs.append)
+    monkeypatch.setattr(update_mod, "_open",
+                        lambda req, timeout=None, cfg=None: _FakeResp(b"F" * 3, status=200))
+    r = update_mod.download_asset("https://x/p.exe", str(dest), progress=seen.append)
+    assert r["ok"] is True
+    assert seen and seen[0]["done"] == 3 and seen[0]["total"] == 3
+    assert any("更新包下载中" in m for m in logs)
+    assert any("更新包下载完成" in m for m in logs)
+
+
+def test_download_asset_never_breaks_on_a_faulty_progress_callback(monkeypatch, tmp_path):
+    """回调是 UI 的事：它抛异常也不能把下载带崩。"""
+    dest = tmp_path / "pkg.exe"
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    monkeypatch.setattr(update_mod, "_open",
+                        lambda req, timeout=None, cfg=None: _FakeResp(b"G" * 3, status=200))
+
+    def boom(_info):
+        raise RuntimeError("ui 炸了")
+
+    r = update_mod.download_asset("https://x/p.exe", str(dest), progress=boom)
+    assert r["ok"] is True and dest.read_bytes() == b"GGG"
+
+
+def test_download_failure_explains_how_to_set_a_proxy(monkeypatch, tmp_path):
+    """直连失败时把「怎么配代理」写进失败原因；已经走代理就不再劝人配。"""
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    monkeypatch.setattr(update_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(update_mod, "_open",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("timed out")))
+    monkeypatch.setattr(update_mod, "resolve_proxy", lambda cfg=None: "")
+    r = update_mod.download_asset("https://x/p.exe", str(tmp_path / "p.exe"), attempts=1)
+    assert r["ok"] is False and "update_proxy" in r["msg"]
+
+    monkeypatch.setattr(update_mod, "resolve_proxy",
+                        lambda cfg=None: "http://127.0.0.1:7897")
+    r2 = update_mod.download_asset("https://x/p.exe", str(tmp_path / "p2.exe"), attempts=1)
+    assert r2["ok"] is False and "update_proxy" not in r2["msg"]
