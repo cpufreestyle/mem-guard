@@ -139,8 +139,15 @@ def _opener(proxy: str):
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _open(req, timeout: float, cfg: dict = None):
-    """更新链路的唯一网络出口：三处请求全部走这里，代理只在这里决定。"""
+def _open(req, timeout: float, cfg: dict = None, direct: bool = False):
+    """更新链路的唯一网络出口：三处请求全部走这里，代理只在这里决定。
+
+    direct=True 强制直连：GitHub 的匿名 API 配额按**出口 IP** 计（60 次/小时），
+    共享代理出口经常已经被别人用光（真机实测：同一个请求经代理 403、直连 200），
+    而查询接口本身只有几 KB，直连往往反而更快。下载仍然走代理。
+    """
+    if direct:
+        return _opener("").open(req, timeout=timeout)
     return _opener(resolve_proxy(cfg)).open(req, timeout=timeout)
 
 
@@ -523,24 +530,48 @@ def due_for_check(cfg: dict, now=None) -> bool:
     return (time.time() if now is None else now) - last >= hours * 3600
 
 
+def _read_release_json(url: str, timeout: int, cfg: dict, direct: bool = False) -> dict:
+    """读一次 Release JSON。
+
+    每次都新建 Request：urllib 的 ProxyHandler 会**原地**改写请求对象
+    （`set_proxy` 把 host 换成代理地址），复用同一个对象重试等于又走一遍代理——
+    真机踩过：代理被限流后「直连重试」照样 403。
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"MemGuard/{__version__}",
+        "Accept": "application/vnd.github+json",
+    })
+    with _open(req, timeout, cfg, direct=direct) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
 def fetch_latest_release(timeout: int = 8, cfg: dict = None) -> dict:
     """查询 GitHub 最新 Release。
 
     返回 {"ok": True, "tag", "url", "newer", "assets"} 或 {"ok": False, "msg"}。
     仅用标准库 urllib，PyInstaller 打包后无需额外依赖。
+
+    经代理被限流（403/429）时自动改直连重试一次：GitHub 匿名 API 配额按出口
+    IP 计，共享代理出口常常已被别人用光；这一步失败也不影响下载仍走代理。
     """
     url = f"https://api.github.com/repos/{REPO_SLUG}/releases/latest"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": f"MemGuard/{__version__}",
-        "Accept": "application/vnd.github+json",
-    })
     try:
-        with _open(req, timeout, cfg) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
+        data = _read_release_json(url, timeout, cfg)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return {"ok": False, "msg": "该仓库暂无 Release（或不可访问）"}
-        return {"ok": False, "msg": f"检查更新失败：HTTP {e.code}"}
+        if e.code in (403, 429) and resolve_proxy(cfg):
+            log(f"检查更新经代理被限流（HTTP {e.code}），改直连重试一次")
+            try:
+                data = _read_release_json(url, timeout, cfg, direct=True)
+            except Exception as e2:
+                return {"ok": False,
+                        "msg": f"检查更新失败：HTTP {e.code}（代理出口被限流，直连也没通：{e2}）"}
+        elif e.code in (403, 429):
+            return {"ok": False,
+                    "msg": f"检查更新失败：HTTP {e.code}（GitHub 匿名 API 配额可能已用尽，稍后再试）"}
+        else:
+            return {"ok": False, "msg": f"检查更新失败：HTTP {e.code}"}
     except Exception as e:
         return {"ok": False, "msg": f"检查更新失败：{e}{_proxy_hint(cfg)}"}
 

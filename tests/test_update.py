@@ -5,6 +5,8 @@
 tag 只提醒一次，打开发布页只在用户显式点了「检查更新」时才发生。
 """
 import hashlib
+import json
+import urllib.error
 
 from memguard import update as update_mod
 from memguard.update import (_parse_version, check_and_notify, due_for_check,
@@ -633,3 +635,58 @@ def test_download_failure_explains_how_to_set_a_proxy(monkeypatch, tmp_path):
                         lambda cfg=None: "http://127.0.0.1:7897")
     r2 = update_mod.download_asset("https://x/p.exe", str(tmp_path / "p2.exe"), attempts=1)
     assert r2["ok"] is False and "update_proxy" not in r2["msg"]
+
+
+class _JsonResp:
+    """最小 JSON 响应：fetch_latest_release 只用到 read 与 with。"""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_fetch_latest_release_falls_back_to_direct_when_proxy_is_rate_limited(monkeypatch):
+    """真机踩过：共享代理出口把 GitHub 匿名配额用光（403），直连却是 200。
+
+    查询接口只有几 KB，降级直连重试一次即可；下载仍然走代理（那才是慢的一段）。
+    """
+    calls = []
+    reqs = []
+    body = json.dumps({"tag_name": "v9.9.9", "html_url": "https://x",
+                       "assets": []}).encode()
+
+    def fake_open(req, timeout=None, cfg=None, direct=False):
+        calls.append(direct)
+        reqs.append(req)
+        if not direct:
+            raise urllib.error.HTTPError("u", 403, "rate limit", None, None)
+        return _JsonResp(body)
+
+    monkeypatch.setattr(update_mod, "_open", fake_open)
+    monkeypatch.setattr(update_mod, "resolve_proxy", lambda cfg=None: "http://127.0.0.1:7897")
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    r = update_mod.fetch_latest_release(cfg={})
+    assert r["ok"] is True and r["tag"] == "v9.9.9"
+    assert calls == [False, True], "先代理、被限流后直连，各一次"
+    assert reqs[0] is not reqs[1], \
+        "重试必须新建 Request：ProxyHandler 会原地改写请求对象（真机踩过）"
+
+
+def test_fetch_latest_release_reports_rate_limit_without_a_proxy(monkeypatch):
+    """直连也被限流时说清是配额问题，不要含糊成一句「HTTP 403」。"""
+    def fake_open(req, timeout=None, cfg=None, direct=False):
+        raise urllib.error.HTTPError("u", 403, "rate limit", None, None)
+
+    monkeypatch.setattr(update_mod, "_open", fake_open)
+    monkeypatch.setattr(update_mod, "resolve_proxy", lambda cfg=None: "")
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    r = update_mod.fetch_latest_release(cfg={})
+    assert r["ok"] is False and "配额" in r["msg"]
