@@ -61,6 +61,17 @@ def test_pick_asset_falls_back_and_handles_empty():
     assert pick_asset([{"name": "mem_guard.exe"}]) is None, "没有下载地址的资产不能用"
 
 
+def test_pick_asset_accepts_normalized_release_shape():
+    """真实链路的资产是 fetch_latest_release 归一化过的（键名 url，不是
+    browser_download_url）。只认后者时线上永远「没有可用安装包」——v1.29.4 修。
+    """
+    normalized = [{"name": a["name"], "url": a["browser_download_url"]} for a in _ASSETS]
+    assert pick_asset(normalized)["name"] == "MemGuard-Setup-1.5.0.exe"
+    assert pick_asset(normalized, prefer="portable")["name"] == "mem_guard.exe"
+    assert find_checksums_asset(normalized + [{"name": "checksums.txt",
+                                               "url": "https://x/ck"}])["url"] == "https://x/ck"
+
+
 # ---------------------------------------------------------------- 检查节流
 
 def test_due_for_check_gate():

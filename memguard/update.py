@@ -65,14 +65,16 @@ def _frozen_exe():
 def pick_asset(assets, prefer: str = "setup"):
     """从 Release 资产里挑安装包：默认优先安装器，没有才退回便携单文件。
 
-    assets 是 GitHub API 返回的资产列表（dict，含 name / browser_download_url）。
+    assets 既接受 GitHub API 原始字段（browser_download_url），也接受
+    fetch_latest_release 归一化后的（url）——这两处曾各用一套键名，
+    pick_asset 只认前者，于是真实 Release 永远挑不到包（v1.29.4 修）。
     """
     patterns = ((SETUP_ASSET_RE, PORTABLE_ASSET_RE) if prefer == "setup"
                 else (PORTABLE_ASSET_RE, SETUP_ASSET_RE))
     for pat in patterns:
         for a in assets or ():
             name = str(a.get("name") or "")
-            url = str(a.get("browser_download_url") or "")
+            url = str(a.get("browser_download_url") or a.get("url") or "")
             if pat.match(name) and url:
                 return {"name": name, "url": url}
     return None
@@ -222,7 +224,7 @@ def find_checksums_asset(assets):
     """从 Release 资产里挑 sha256 清单；没有则返回 None。"""
     for a in assets or ():
         name = str(a.get("name") or "")
-        url = str(a.get("browser_download_url") or "")
+        url = str(a.get("browser_download_url") or a.get("url") or "")
         if CHECKSUMS_ASSET_RE.match(name) and url:
             return {"name": name, "url": url}
     return None

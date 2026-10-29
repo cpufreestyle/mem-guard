@@ -7,7 +7,8 @@
 Windows 托盘小工具：实时监控**物理内存**与**提交内存(commit)**，超阈值自动清理并提醒，专治「明明还剩几 G 却一直弹『内存不足』」——根因是 commit 耗尽（提交上限 = 物理 + 页面文件），而非物理内存。
 
 - 仓库：`cpufreestyle/mem-guard`（本地 `D:\ai share\repo\mem-guard`，main 分支）
-- 最新已发布 tag：`v1.29.3`（CI 自动出 Release，附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）
+- 最新已发布 tag：`v1.29.4`（CI 自动出 Release，附件 `mem_guard.exe` + `MemGuard-Setup-x.y.z.exe`）
+- **v1.29.4 真机升级实测抓到的致命 bug：线上自动更新从来没成功过（`update.pick_asset` / `find_checksums_asset`）**：按 v1.29.3 的说明在本机做「1.29.2 → 1.29.3」真实升级，结果 `mem_guard.exe --update` 秒退并打印「Release 里没有可用安装包」。查因：`fetch_latest_release()` 把资产归一化成 `{"name", "url"}`，而 `pick_asset()` 只读 `browser_download_url`——真实链路永远拿不到下载地址，于是**每个版本都判定「没有可用安装包」**；`find_checksums_asset()` 同病，就算挑到了包也会因为「找不到清单」而中止。测试一直是绿的，因为用例喂的是 API 原始形状（`browser_download_url`），喂不到真实链路那一份。修法：两个函数都改成 `a.get("browser_download_url") or a.get("url")`，并新增回归用例 `test_pick_asset_accepts_normalized_release_shape`（拿归一化形状喂 `pick_asset` / `find_checksums_asset`，含便携偏好分支）。教训写进 §5：**跨模块传数据时，键名就是契约**；「函数单测绿 + 端到端从没跑过」等于没测，能用真实 Release 走一遍就别只测纯函数。
 - **已推送**：`v1.24.0`–`v1.29.2` 已 push 到 `main`，`v1.29.1` 的 Release 因 CI 红而未生成，改由 tag `v1.29.2` 覆盖整批（一个 tag 出一次 Release）。工作树除 `.pytest_tmp/`（本机测试临时目录、不进版本库）外干净。
 - **v1.29.3 「检查更新」不再跳浏览器，改为程序内直接下载安装（`update` / `menu`）**：用户原话「能否自动更新 不是跳转github」。旧实现里两条路径都往外甩——托盘「检查更新（vX）」查到新版后 `webbrowser.open(r["url"])` 打开发布页，`install_latest` 在「源码运行模式」和「Release 里没有可用安装包」两处也各自 `_open_url` 跳一次。现在**更新链路里一个开浏览器的地方都没有**：`update._open_url` 与 `check_and_notify` 的 `open_page` 参数整体删掉；`install_latest` 的两个兜底分支改成返回带原因的中文 msg（源码态提示 `git pull` 后重新打包、缺安装包提示「已取消更新」），由调用方弹气泡。新增 `menu.run_check_update(guard)`（模块级，便于测试）：「检查更新」= 查 + 直接 `install_latest(..., release=r)`，成功时进程交给引导批处理不再返回；失败（断网 / sha256 不过 / 缺安装包 / 写脚本失败）弹一条带原因的气泡，已是最新只回一句。`menu.on_check_update` 退化成一行线程投递，`_notify_guard()` 统一「有图标发气泡、没图标只落日志」。测试侧：`test_update` 把「只有点名才打开发布页」换成「更新链路里不许有余留的开浏览器口子」（断言 `_open_url` 已不存在）+ 源码态 / 缺安装包两条兜底话术；`test_menu` 用既有的 `_InlineThreading` + `_RecordingIcon` 点真菜单项，断言「查到新版必须走 `install_latest(release=...)`」「已是最新不下载」「失败原因回到用户眼前」，并静态断言 `menu` 源码里不再出现 `webbrowser`。顺带修掉 README 里三处历史写入损坏的 `NaNNaN…`（`checksums.txt` 校验、`.bak` 回滚、`verify_update_sha256` 表格行）。
 - **v1.29.2 CI 假红三连 + 一个真 bug（`update` / `menutips` / `menu` 说明对账 / `tests`）**：v1.29.1 的 tag 构建在 windows-latest 上 `5 failed`，本地全绿——差异全在环境。① **真 bug：非中文 Windows 上自动更新整条链路会静默中止**。引导批处理用 `encoding="mbcs"` 写盘（cmd.exe 按 ANSI 代码页读），而 `portable_boot_cmd` 里那句中文注释在 en-US 机器（cp1252）编码不了，抛的是 `UnicodeEncodeError`（不是原 `except (LookupError, OSError)` 能接住的），于是 `install_latest` 在「准备切换到 vX」之后直接返回「写入更新脚本失败」。修法：批处理正文改成纯 ASCII（注释改英文），写盘抽成 `update._write_boot_cmd()`，`_BOOT_ENCODING = "mbcs"` 失败时连 `UnicodeEncodeError` 一起接住再退 UTF-8（中文路径仍能写出）。② **权限状态行两条文案只有一条能划到**：菜单项 `权限：管理员（可清理） / ⚠ 非管理员，无法清理` 是同一个位置的两条动态文案，说明表只收了后者，CI 以管理员身份跑就对不上账（`test_menutips` + `--selftest` 同时红）。修法：两条都进说明表，新增 `menutips.LABEL_VARIANTS` 与 `menutips.reachable(key, labels)`——对账只要求「同义组里任一文案划得到」，`--selftest` 探针与测试同一口径。③ **`test_gates` 吃了 CI 的环境变量**：推 tag 触发时 `GITHUB_REF_TYPE=tag` / `GITHUB_REF_NAME=v1.29.1` 会泄进 `check_version_sync.main()`，让「同名 tag 重复只是冗余」这条用例按当时真实 tag 判红。修法：`tests/test_gates.py` 加 autouse fixture 清掉这两个变量，要测 tag 分支的用例自己 setenv。新增测试 4 条（批处理正文必须 ASCII 可编码、mbcs 编不了时退 UTF-8、管理员/非管理员两条文案都能划到、说明同义组可达），全量 785 passed / 1 skipped；本地另用 `GITHUB_REF_TYPE=tag GITHUB_REF_NAME=v1.29.1 PYTHONUTF8=1` 复跑全套 + 把 `menu.is_admin` 打桩成 True 复跑「说明可达」探针，均绿。
@@ -177,6 +178,12 @@ pip install pyinstaller
 ``
 
 **本地编译安装器（可选）**：需自装 Inno Setup 6，然后执行
+
+**发布前的最后一道人工关（v1.29.4 血的教训）**：发版前，用「上一版」的**真实产物**在本机跑一次
+`mem_guard.exe --update`，确认它真的能挑到资产、下得下来、装得上。v1.29.0–v1.29.3 全部没跑过这一步，
+于是 `pick_asset()` 只认 `browser_download_url` 而 `fetch_latest_release()` 交的是 `url`，
+线上每个版本都判定「Release 里没有可用安装包」，而 40 多条 update 单测全绿——**纯函数测试喂的是
+API 原始形状，喂不到真实链路那一份；键名就是跨模块契约，改了归一化就不能只改一边**。
 
 本地打包同样产出 `dist\checksums.txt`（对产物逐个算 SHA256）——自动更新在跑引导批处理
 之前会拿它比对下载文件的哈希，自己发的 Release 缺这份清单会被客户端拒绝安装。目录版落在
