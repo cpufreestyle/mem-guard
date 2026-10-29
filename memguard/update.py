@@ -164,26 +164,60 @@ def _write_boot_cmd(path: str, text: str) -> None:
         f.write(text)
 
 
-def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> dict:
-    """把 Release 资产流式下载到 dest。返回 {"ok": bool, "msg"?}。"""
-    req = urllib.request.Request(url, headers={"User-Agent": f"MemGuard/{__version__}"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
-            while True:
-                chunk = resp.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-    except Exception as e:
+DOWNLOAD_ATTEMPTS = 3
+
+
+def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT,
+                   attempts: int = DOWNLOAD_ATTEMPTS) -> dict:
+    """把 Release 资产流式下载到 dest，断线可续传。返回 {"ok": bool, "msg"?}。
+
+    GitHub CDN 在弱网下经常半路断流（本项目实测 22MB 的 Setup 会断好几次）。
+    旧实现一断就把已下载的部分删掉整包重来，于是弱网用户永远等不到一次完整的
+    更新。现在带 Range 从断点续；服务端不认 Range（回 200 而不是 206）时退回
+    整包重下，免得把整份内容追加成两份。全部尝试都失败才删掉半成品。
+    """
+    last_err = None
+    for _attempt in range(max(1, int(attempts))):
+        have = os.path.getsize(dest) if os.path.exists(dest) else 0
+        headers = {"User-Agent": f"MemGuard/{__version__}"}
+        if have:
+            headers["Range"] = f"bytes={have}-"
+        expected = None
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
-        except OSError:
-            pass
-        return {"ok": False, "msg": f"下载失败：{e}"}
-    if not os.path.exists(dest) or os.path.getsize(dest) == 0:
-        return {"ok": False, "msg": "下载结果为空"}
-    return {"ok": True}
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                resuming = have > 0 and status == 206
+                try:
+                    length = int(resp.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    length = 0
+                if length > 0:
+                    expected = (have if resuming else 0) + length
+                with open(dest, "ab" if resuming else "wb") as f:
+                    while True:
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            size = os.path.getsize(dest) if os.path.exists(dest) else 0
+            if size == 0:
+                last_err = "下载结果为空"
+                continue
+            # 连接被对端提前关掉时 read 不会抛异常，只能拿 Content-Length 对账
+            if expected is not None and size < expected:
+                last_err = f"连接中断（{size}/{expected} 字节）"
+                continue
+            return {"ok": True}
+        except Exception as e:
+            last_err = e
+            time.sleep(1)
+    try:
+        if os.path.exists(dest):
+            os.remove(dest)
+    except OSError:
+        pass
+    return {"ok": False, "msg": f"下载失败：{last_err}"}
 
 
 # ---------------------------------------------------------------- sha256 校验

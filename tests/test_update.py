@@ -306,6 +306,91 @@ def test_install_latest_reports_missing_asset_without_page_jump(monkeypatch, tmp
     assert "没有可用安装包" in r["msg"]
 
 
+# ---------------------------------------------------------------- 断点续传
+
+class _FakeResp:
+    """最小的 urlopen 响应：body / status / Content-Length 都由用例指定。"""
+
+    def __init__(self, body: bytes, status: int = 200, length=None):
+        self._body = body
+        self.status = status
+        self.headers = {"Content-Length": str(len(body) if length is None else length)}
+
+    def read(self, n=-1):
+        if not self._body:
+            return b""
+        chunk, self._body = self._body[:n], self._body[n:]
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_download_asset_resumes_from_partial_file(monkeypatch, tmp_path):
+    """断流后必须从断点续：弱网下整包重来等于永远更不完。"""
+    dest = tmp_path / "pkg.exe"
+    dest.write_bytes(b"A" * 4)
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["range"] = req.get_header("Range")
+        return _FakeResp(b"B" * 6, status=206)
+
+    monkeypatch.setattr(update_mod.urllib.request, "urlopen", fake_urlopen)
+    r = update_mod.download_asset("https://x/p.exe", str(dest))
+    assert r["ok"] is True
+    assert dest.read_bytes() == b"A" * 4 + b"B" * 6
+    assert seen["range"] == "bytes=4-"
+
+
+def test_download_asset_restarts_when_server_ignores_range(monkeypatch, tmp_path):
+    """服务端不认 Range（回 200 而不是 206）时必须整包重写，不能追加成两份。"""
+    dest = tmp_path / "pkg.exe"
+    dest.write_bytes(b"A" * 4)
+
+    monkeypatch.setattr(update_mod.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp(b"C" * 3, status=200))
+    r = update_mod.download_asset("https://x/p.exe", str(dest))
+    assert r["ok"] is True and dest.read_bytes() == b"CCC"
+
+
+def test_download_asset_retries_after_truncated_response(monkeypatch, tmp_path):
+    """对端提前关连接时 read 不抛异常：靠 Content-Length 对账发现缺口并续传。"""
+    dest = tmp_path / "pkg.exe"
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.get_header("Range"))
+        if len(calls) == 1:
+            return _FakeResp(b"D" * 4, status=200, length=10)
+        return _FakeResp(b"E" * 6, status=206)
+
+    monkeypatch.setattr(update_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(update_mod.time, "sleep", lambda s: None)
+    r = update_mod.download_asset("https://x/p.exe", str(dest))
+    assert r["ok"] is True
+    assert dest.read_bytes() == b"D" * 4 + b"E" * 6
+    assert calls == [None, "bytes=4-"]
+
+
+def test_download_asset_cleans_up_after_all_attempts_fail(monkeypatch, tmp_path):
+    """全部尝试都失败：不留半成品（未校验的 exe 躺在临时目录里更糟）。"""
+    dest = tmp_path / "pkg.exe"
+    dest.write_bytes(b"A" * 4)
+
+    def boom(req, timeout=None):
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(update_mod.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(update_mod.time, "sleep", lambda s: None)
+    r = update_mod.download_asset("https://x/p.exe", str(dest), attempts=2)
+    assert r["ok"] is False and "下载失败" in r["msg"]
+    assert not dest.exists()
+
+
 def test_purge_stale_backup_removes_only_the_bak(monkeypatch, tmp_path):
     exe = tmp_path / "mem_guard.exe"
     exe.write_bytes(b"me")
