@@ -92,10 +92,30 @@ _EVENT_ALL_ACCESS = 0x001F0003
 _WAIT_OBJECT_0 = 0x00000000
 
 
+def ensure_notifications_enabled(aumid: str = APP_USER_MODEL_ID) -> bool:
+    """如果 Windows 专注助手 / 通知设置把 MemGuard 静音（Enabled=0），自动恢复启用。"""
+    if not aumid:
+        return False
+    try:
+        import winreg
+        key_path = rf"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\{aumid}"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+            val, _ = winreg.QueryValueEx(k, "Enabled")
+            if val == 0:
+                winreg.SetValueEx(k, "Enabled", 0, winreg.REG_DWORD, 1)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def set_app_user_model_id(aumid: str = APP_USER_MODEL_ID) -> bool:
     """给当前进程指定任务栏 AppUserModelID；失败只是分组不正常，托盘照常工作。"""
     try:
-        return shell32.SetCurrentProcessExplicitAppUserModelID(aumid) >= 0
+        ok = shell32.SetCurrentProcessExplicitAppUserModelID(aumid) >= 0
+        if ok and aumid:
+            ensure_notifications_enabled(aumid)
+        return ok
     except Exception:
         return False
 

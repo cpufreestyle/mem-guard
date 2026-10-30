@@ -109,6 +109,12 @@ def test_set_app_user_model_id_returns_bool():
     assert isinstance(winapi.set_app_user_model_id(), bool)
 
 
+def test_ensure_notifications_enabled_handles_exceptions_safely():
+    """无论注册表权限还是未知 AUMID，都不允许抛异常砸掉启动。"""
+    assert winapi.ensure_notifications_enabled("") is False
+    assert isinstance(winapi.ensure_notifications_enabled("NonExistent.App.Id"), bool)
+
+
 # ---------------------------------------------------------------- 窗口类图标（HICON）
 
 

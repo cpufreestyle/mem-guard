@@ -37,7 +37,8 @@ from .idle import is_user_away
 from .menu import build_menu
 from .ui import (make_icon, show_advice_window, show_overview_window,
                 show_top_window, show_trend_window)
-from .winapi import (close_show_event, create_show_event, ensure_tray_promoted,
+from .winapi import (close_show_event, create_show_event, ensure_notifications_enabled,
+                    ensure_tray_promoted,
                     get_mem, is_admin, wait_show_request)
 
 # ---------------------------------------------------------------- 主程序
@@ -1144,6 +1145,7 @@ class Guard:
     def _tray_pin_worker(self) -> None:
         """后台等条目出现并写 IsPromoted。"""
         try:
+            ensure_notifications_enabled()
             result = ensure_tray_promoted(wait_sec=TRAY_PIN_WAIT)
         except Exception as e:
             log(f"托盘常驻声明失败: {e!r}")

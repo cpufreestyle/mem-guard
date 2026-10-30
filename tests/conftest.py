@@ -57,3 +57,10 @@ def no_idle_suppression(monkeypatch):
     需要验证静默本身的用例（test_idle.py）在自己的 monkeypatch 里覆盖即可。
     """
     monkeypatch.setattr(_tray, "is_user_away", lambda sec: False)
+
+@pytest.fixture(autouse=True)
+def no_real_message_box(monkeypatch):
+    """测试期间不弹出真实 MessageBox 窗口。"""
+    from memguard import ui, menu
+    monkeypatch.setattr(ui, "message_box", lambda *a, **k: None)
+    monkeypatch.setattr(menu, "message_box", lambda *a, **k: None)

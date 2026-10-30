@@ -1055,7 +1055,9 @@ def test_check_update_installs_directly_and_never_opens_a_browser(monkeypatch):
 
 
 def test_check_update_already_latest_stays_quiet(monkeypatch):
-    """已是最新版本时不下载、不安装，只回一句状态。"""
+    """已是最新版本时不下载、不安装，只回一句状态，并弹窗提示（防气泡被静音）。"""
+    boxes = []
+    monkeypatch.setattr(menu, "message_box", lambda t, m: boxes.append((t, m)))
     monkeypatch.setattr(menu, "threading", _InlineThreading())
     guard = _FakeGuard()
     guard.icon = _RecordingIcon()
@@ -1069,6 +1071,21 @@ def test_check_update_already_latest_stays_quiet(monkeypatch):
     item(guard.icon)
     assert calls == []
     assert any("已是最新版本" in n for n in guard.icon.notes)
+    assert any("已是最新版本" in m for t, m in boxes), "弹窗必须给到用户眼前"
+
+
+def test_check_update_failure_shows_popup(monkeypatch):
+    """检查更新失败时弹窗提示具体原因。"""
+    boxes = []
+    monkeypatch.setattr(menu, "message_box", lambda t, m: boxes.append((t, m)))
+    monkeypatch.setattr(menu, "threading", _InlineThreading())
+    guard = _FakeGuard()
+    guard.icon = _RecordingIcon()
+    monkeypatch.setattr(menu, "fetch_latest_release", lambda timeout=8, cfg=None: {
+        "ok": False, "msg": "网络超时"})
+    item = _find_item(build_menu(guard), "检查更新（v" + config.__version__ + "）")
+    item(guard.icon)
+    assert any("网络超时" in m for t, m in boxes)
 
 
 def test_check_update_wires_progress_and_resets_it_on_failure(monkeypatch):

@@ -126,13 +126,17 @@ def _slot_action(slots: "_KillSlots", idx: int):
     return act
 
 
-def _notify_guard(guard, msg: str, title: str) -> None:
-    """托盘气泡；没有图标（启动中 / 已收尾）就只落日志，绝不向外抛。"""
+def _notify_guard(guard, msg: str, title: str, popup: bool = True) -> None:
+    """反馈提示：同时触发托盘气泡与弹窗（防 Windows 专注助手 / 通知静默吞掉）。"""
     icon = getattr(guard, "icon", None)
     if icon is not None:
         try:
             icon.notify(msg, title)
-            return
+        except Exception:
+            pass
+    if popup:
+        try:
+            message_box(title, msg)
         except Exception:
             pass
     log(msg)
@@ -152,12 +156,10 @@ def run_check_update(guard) -> dict:
     r = fetch_latest_release(cfg=guard.cfg)
     if not r.get("ok"):
         msg = r.get("msg", "检查更新失败")
-        log(msg)
         _notify_guard(guard, msg, "MemGuard 更新")
         return {"ok": False, "action": "none", "msg": msg}
     if not r.get("newer"):
         msg = f"已是最新版本（v{__version__}）"
-        log(msg)
         _notify_guard(guard, msg, "MemGuard 更新")
         return {"ok": True, "action": "none", "msg": msg}
     log(f"发现新版本 {r['tag']}（当前 v{__version__}）")
