@@ -174,6 +174,26 @@ def _frozen_exe():
     return None
 
 
+def _parent_bootloader_pid(exe: str | None = None) -> int | None:
+    """如果当前进程由 PyInstaller 引导进程拉起，返回父引导进程 PID。
+
+    仅当父进程名与 exe 名字相同时才判定为引导进程，避免在由
+    explorer.exe 或 cmd.exe 直接启动时误等无关父进程。
+    """
+    target = exe or _frozen_exe()
+    if not target:
+        return None
+    try:
+        import psutil
+        parent = psutil.Process().parent()
+        if parent and parent.is_running():
+            if (parent.name() or "").lower() == os.path.basename(target).lower():
+                return parent.pid
+    except Exception:
+        pass
+    return None
+
+
 def pick_asset(assets, prefer: str = "setup"):
     """从 Release 资产里挑安装包：默认优先安装器，没有才退回便携单文件。
 
@@ -200,21 +220,31 @@ def is_installed_layout() -> bool:
     return os.path.exists(os.path.join(os.path.dirname(exe), "unins000.exe"))
 
 
-def portable_boot_cmd(pid: int, new_path: str, target_path: str) -> str:
-    """便携单文件的自替换引导批处理：等本进程退出 → 覆盖 → 重启。
+def portable_boot_cmd(pid: int, new_path: str, target_path: str,
+                      parent_pid: int | None = None) -> str:
+    """便携单文件原地替换引导脚本：等旧进程退出 -> 覆盖 -> 启动。
 
-    做成纯函数是因为命令串里嵌着 PID 与路径，拼错就是「更新完程序消失」，
-    这种错误必须在测试里直接断言，不能等用户反馈。窗口以 CREATE_NO_WINDOW
-    启动，全程无黑窗。
+    生成的批处理作为命令串内嵌 PID 和路径，拼接必须恰当。任何语法错误、
+    执行错误在内部均直接吞掉；可被用户打断或隐藏窗口（CREATE_NO_WINDOW
+    下完全无黑窗口）。
 
-    覆盖前先把当前 exe 留一份 .bak，新版本 6 秒内没起来就把旧版本还原回去：
-    宁可退回老代码，也不让用户面对一个双击打不开的程序。
+    覆盖前先把当前 exe 拷一份 .bak，新版本 6 秒内没起就把旧版本还原回去。
+    既防灰度上传大锅，也防用户手抖一个双击打不开的程序。
     """
     image = os.path.basename(target_path)
     bak = target_path + ".bak"
+    wait_parent = ""
+    if parent_pid:
+        wait_parent = (
+            ":wait_parent\r\n"
+            f'tasklist /fi "PID eq {parent_pid}" 2>nul | find /i "%image%" >nul\r\n'
+            "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait_parent)\r\n"
+        )
     return (
         "@echo off\r\n"
         "setlocal\r\n"
+        'set "_MEIPASS2="\r\n'
+        'set "_MEIPASS="\r\n'
         'set "new={0}"\r\n'
         'set "target={1}"\r\n'
         'set "bak={2}"\r\n'
@@ -222,6 +252,7 @@ def portable_boot_cmd(pid: int, new_path: str, target_path: str) -> str:
         ":wait\r\n"
         'tasklist /fi "PID eq {4}" 2>nul | find /i "%image%" >nul\r\n'
         "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)\r\n"
+        "{5}"
         'if exist "%target%" copy /y "%target%" "%bak%" >nul\r\n'
         'move /y "%new%" "%target%" >nul\r\n'
         'start "" "%target%"\r\n'
@@ -234,28 +265,39 @@ def portable_boot_cmd(pid: int, new_path: str, target_path: str) -> str:
         '  if exist "%bak%" del "%bak%"\r\n'
         ")\r\n"
         'del "%~f0"\r\n'
-    ).format(new_path, target_path, bak, image, pid)
+    ).format(new_path, target_path, bak, image, pid, wait_parent)
 
 
-def setup_boot_cmd(pid: int, setup_path: str, app_dir: str) -> str:
-    """安装器升级的引导批处理：等本进程退出 → 静默 Setup → 重启新程序。
+def setup_boot_cmd(pid: int, setup_path: str, app_dir: str,
+                   parent_pid: int | None = None) -> str:
+    """安装包原地更新引导脚本：等旧进程退出 -> 调静默 Setup -> 启动新程序。
 
-    Setup 的 [Run] 带 skipifsilent，静默安装不会自己拉起程序，这里补一次 start。
+    Setup 的 [Run] 带 skipifsilent，静默安装不会自己拉起，这里补一个 start。
     """
     exe = os.path.join(app_dir, "mem_guard.exe")
     image = os.path.basename(exe)
+    wait_parent = ""
+    if parent_pid:
+        wait_parent = (
+            ":wait_parent\r\n"
+            f'tasklist /fi "PID eq {parent_pid}" 2>nul | find /i "{image}" >nul\r\n'
+            "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait_parent)\r\n"
+        )
     return (
         "@echo off\r\n"
         "setlocal\r\n"
+        'set "_MEIPASS2="\r\n'
+        'set "_MEIPASS="\r\n'
         'set "setup={0}"\r\n'
         'set "exe={1}"\r\n'
         ":wait\r\n"
         'tasklist /fi "PID eq {2}" 2>nul | find /i "{3}" >nul\r\n'
         "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)\r\n"
+        "{4}"
         '"{0}" /VERYSILENT /SP- /NORESTART\r\n'
         'start "" "{1}"\r\n'
         'del "%~f0"\r\n'
-    ).format(setup_path, exe, pid, image)
+    ).format(setup_path, exe, pid, image, wait_parent)
 
 
 # cmd.exe 按 ANSI 代码页读批处理。非中文 Windows（如 en-US 的 CI runner）的
@@ -378,7 +420,30 @@ def download_asset(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT,
                 continue
             log(f"更新包下载完成（{_mb(size)}，用时 {time.monotonic() - started_all:.1f}s）")
             return {"ok": True}
+        except urllib.error.HTTPError as e:
+            if getattr(e, "code", None) == 416 and have > 0:
+                cr = str((getattr(e, "headers", None) or {}).get("Content-Range") or "")
+                m = re.search(r"bytes\s+\*/(\d+)", cr)
+                total = int(m.group(1)) if m else None
+                if total is not None and have == total:
+                    log(f"更新包已完整下载（{_mb(have)}，耗时 {time.monotonic() - started_all:.1f}s）")
+                    return {"ok": True}
+                log(f"更新包 Range 无效（416 {cr}），重置从头下载")
+                try:
+                    if os.path.exists(dest):
+                        os.remove(dest)
+                except OSError:
+                    pass
+                time.sleep(0.5)
+                continue
+            last_err = e
+            log(f"更新包下载中断（{e}），1 秒后从断点续传")
+            time.sleep(1)
         except Exception as e:
+            size = os.path.getsize(dest) if os.path.exists(dest) else 0
+            if expected is not None and size == expected and size > 0:
+                log(f"更新包已完整下载（连接关闭提示 {e}，但数据已完整到达：{_mb(size)}）")
+                return {"ok": True}
             last_err = e
             log(f"更新包下载中断（{e}），1 秒后从断点续传")
             time.sleep(1)
@@ -686,7 +751,7 @@ def install_latest(cfg: dict, on_ready=None, release: dict = None,
     if not r.get("newer"):
         return {"ok": False, "action": "none",
                 "msg": f"已是最新版本（v{__version__}）"}
-    asset = pick_asset(r.get("assets"))
+    asset = pick_asset(r.get("assets"), prefer="setup" if is_installed_layout() else "portable")
     if not asset:
         return {"ok": False, "action": "none",
                 "msg": "Release 里没有可用安装包（需要 mem_guard.exe 或 MemGuard-Setup-x.y.z.exe），已取消更新"}
@@ -717,21 +782,28 @@ def install_latest(cfg: dict, on_ready=None, release: dict = None,
     log(f"更新包下载完成（{asset['name']}），准备切换到 {tag}")
 
     pid = os.getpid()
+    parent_pid = _parent_bootloader_pid(exe)
     if is_installed_layout():
-        boot_cmd = setup_boot_cmd(pid, new_path, os.path.dirname(exe))
+        boot_cmd = setup_boot_cmd(pid, new_path, os.path.dirname(exe),
+                                  parent_pid=parent_pid)
     else:
-        boot_cmd = portable_boot_cmd(pid, new_path, exe)
+        boot_cmd = portable_boot_cmd(pid, new_path, exe,
+                                     parent_pid=parent_pid)
     boot_path = os.path.join(tmp_dir, f"mem_guard_update_boot_{pid}.cmd")
     try:
         _write_boot_cmd(boot_path, boot_cmd)
     except Exception as e:
         return {"ok": False, "action": "none", "msg": f"写入更新脚本失败：{e}"}
 
+    env = dict(os.environ)
+    env.pop("_MEIPASS2", None)
+    env.pop("_MEIPASS", None)
     try:
         subprocess.Popen(
             ["cmd", "/c", boot_path],
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             close_fds=True,
+            env=env,
         )
     except Exception as e:
         return {"ok": False, "action": "none", "msg": f"启动更新脚本失败：{e}"}

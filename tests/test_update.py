@@ -6,6 +6,7 @@ tag 只提醒一次，打开发布页只在用户显式点了「检查更新」�
 """
 import hashlib
 import json
+import sys
 import urllib.error
 
 from memguard import update as update_mod
@@ -96,6 +97,8 @@ def test_due_for_check_gate():
 def test_portable_boot_cmd_carries_pid_paths_and_selfdelete():
     cmd = portable_boot_cmd(4321, "C:\\T\\new.exe", "C:\\App\\mem_guard.exe")
     assert "@echo off" in cmd
+    assert 'set "_MEIPASS2="' in cmd
+    assert 'set "_MEIPASS="' in cmd
     assert "PID eq 4321" in cmd
     assert "set \"new=C:\\T\\new.exe\"" in cmd
     assert "set \"target=C:\\App\\mem_guard.exe\"" in cmd
@@ -107,10 +110,95 @@ def test_portable_boot_cmd_carries_pid_paths_and_selfdelete():
 def test_setup_boot_cmd_silent_install_and_restart():
     cmd = setup_boot_cmd(777, "C:\\T\\MemGuard-Setup-1.5.0.exe", "C:\\App")
     assert "@echo off" in cmd
+    assert 'set "_MEIPASS2="' in cmd
+    assert 'set "_MEIPASS="' in cmd
     assert "PID eq 777" in cmd
     assert "\"C:\\T\\MemGuard-Setup-1.5.0.exe\" /VERYSILENT /SP- /NORESTART" in cmd
     assert "start \"\" \"C:\\App\\mem_guard.exe\"" in cmd
     assert "del \"%~f0\"" in cmd
+
+
+def test_portable_boot_cmd_waits_for_parent_bootloader_when_provided():
+    cmd = portable_boot_cmd(4321, "C:\\T\\new.exe", "C:\\App\\mem_guard.exe", parent_pid=2300)
+    assert "PID eq 4321" in cmd
+    assert "PID eq 2300" in cmd
+
+
+def test_setup_boot_cmd_waits_for_parent_bootloader_when_provided():
+    cmd = setup_boot_cmd(777, "C:\\T\\MemGuard-Setup-1.5.0.exe", "C:\\App", parent_pid=2300)
+    assert "PID eq 777" in cmd
+    assert "PID eq 2300" in cmd
+
+
+def test_install_latest_cleans_meipass_from_child_env(monkeypatch, tmp_path):
+    it = _Installer(monkeypatch, tmp_path)
+    captured_env = {}
+    monkeypatch.setattr(
+        update_mod.subprocess, "Popen",
+        lambda *a, **k: captured_env.update(k.get("env") or {}))
+    monkeypatch.setenv("_MEIPASS2", r"C:\Temp\_MEI23002")
+    monkeypatch.setenv("_MEIPASS", r"C:\Temp\_MEI23002")
+    update_mod.install_latest(it.cfg())
+    assert "_MEIPASS2" not in captured_env
+    assert "_MEIPASS" not in captured_env
+
+
+def test_install_latest_picks_portable_asset_when_not_installed(monkeypatch, tmp_path):
+    it = _Installer(monkeypatch, tmp_path)
+    downloaded_urls = []
+
+    def fake_dl(url, dest, **kw):
+        downloaded_urls.append(url)
+        with open(dest, "wb") as f:
+            f.write(_PAYLOAD)
+        return {"ok": True}
+
+    monkeypatch.setattr(update_mod, "download_asset", fake_dl)
+    update_mod.install_latest(it.cfg())
+    assert downloaded_urls == ["https://x/portable"]
+
+
+def test_install_latest_picks_setup_asset_when_installed_layout(monkeypatch, tmp_path):
+    it = _Installer(monkeypatch, tmp_path)
+    monkeypatch.setattr(update_mod, "is_installed_layout", lambda: True)
+    downloaded_urls = []
+
+    def fake_dl(url, dest, **kw):
+        downloaded_urls.append(url)
+        with open(dest, "wb") as f:
+            f.write(_PAYLOAD)
+        return {"ok": True}
+
+    monkeypatch.setattr(update_mod, "download_asset", fake_dl)
+    update_mod.install_latest(it.cfg())
+    assert downloaded_urls == ["https://x/setup"]
+
+
+def test_parent_bootloader_pid_matches_exe_name(monkeypatch):
+    class FakeProc:
+        def __init__(self, name="mem_guard.exe", pid=2300):
+            self._name = name
+            self.pid = pid
+
+        def is_running(self):
+            return True
+
+        def name(self):
+            return self._name
+
+        def parent(self):
+            return FakeProc("mem_guard.exe", 2300)
+
+    monkeypatch.setitem(sys.modules, "psutil", type("Mod", (), {"Process": lambda *a, **k: FakeProc()})())
+    monkeypatch.setattr(update_mod, "_frozen_exe", lambda: r"C:\App\mem_guard.exe")
+    assert update_mod._parent_bootloader_pid() == 2300
+
+    class ExplorerParent(FakeProc):
+        def parent(self):
+            return FakeProc("explorer.exe", 1000)
+
+    monkeypatch.setitem(sys.modules, "psutil", type("Mod", (), {"Process": lambda *a, **k: ExplorerParent()})())
+    assert update_mod._parent_bootloader_pid() is None
 
 
 def test_boot_cmds_stay_ascii_so_ansi_codepages_can_write_them():
@@ -211,9 +299,10 @@ class _Installer:
         text = ""
         if not no_checksums:
             assets.append({"name": "checksums.txt", "browser_download_url": _CK_URL})
-            # 清单里的文件名必须与 pick_asset 真正挑中的那个一致，否则校验的是别的包
-            picked = pick_asset(assets)["name"]
-            text = (digest or hashlib.sha256(_PAYLOAD).hexdigest()) + "  " + picked + chr(13) + chr(10)
+            # 清单包含待发布 assets 中所有的 exe，与真实 CI 的 make_checksums.py 行为一致
+            dig = digest or hashlib.sha256(_PAYLOAD).hexdigest()
+            lines = [dig + "  " + a["name"] + "\r\n" for a in assets if a.get("name", "").endswith(".exe")]
+            text = "".join(lines)
         monkeypatch.setattr(
             update_mod, "fetch_latest_release", lambda timeout=8, **kw: {
                 "ok": True, "tag": "v9.9.9", "url": "https://example/release",
@@ -393,6 +482,68 @@ def test_download_asset_cleans_up_after_all_attempts_fail(monkeypatch, tmp_path)
     r = update_mod.download_asset("https://x/p.exe", str(dest), attempts=2)
     assert r["ok"] is False and "下载失败" in r["msg"]
     assert not dest.exists()
+
+
+def test_download_asset_handles_416_when_already_completed(monkeypatch, tmp_path):
+    dest = tmp_path / "pkg.exe"
+    dest.write_bytes(b"X" * 10)
+
+    def fake_open_416(req, timeout=None, cfg=None):
+        raise urllib.error.HTTPError(
+            "https://x/p.exe", 416, "Range Not Satisfiable",
+            {"Content-Range": "bytes */10"}, None)
+
+    monkeypatch.setattr(update_mod, "_open", fake_open_416)
+    r = update_mod.download_asset("https://x/p.exe", str(dest))
+    assert r["ok"] is True
+    assert dest.read_bytes() == b"X" * 10
+
+
+def test_download_asset_restarts_from_scratch_when_416_size_mismatched(monkeypatch, tmp_path):
+    dest = tmp_path / "pkg.exe"
+    dest.write_bytes(b"X" * 15)
+    calls = []
+
+    def fake_open(req, timeout=None, cfg=None):
+        calls.append(req.get_header("Range"))
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(
+                "https://x/p.exe", 416, "Range Not Satisfiable",
+                {"Content-Range": "bytes */10"}, None)
+        return _FakeResp(b"Y" * 10, status=200, length=10)
+
+    monkeypatch.setattr(update_mod, "_open", fake_open)
+    monkeypatch.setattr(update_mod.time, "sleep", lambda s: None)
+    r = update_mod.download_asset("https://x/p.exe", str(dest))
+    assert r["ok"] is True
+    assert dest.read_bytes() == b"Y" * 10
+    assert calls == ["bytes=15-", None]
+
+
+def test_download_asset_succeeds_when_read_completed_before_exception(monkeypatch, tmp_path):
+    dest = tmp_path / "pkg.exe"
+
+    class ExplodingResp:
+        def __init__(self):
+            self.status = 200
+            self.headers = {"Content-Length": "8"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            raise OSError("SSL: UNEXPECTED_EOF_WHILE_READING")
+
+        def read(self, n=-1):
+            if hasattr(self, "_done"):
+                return b""
+            self._done = True
+            return b"Z" * 8
+
+    monkeypatch.setattr(update_mod, "_open", lambda req, timeout=None, cfg=None: ExplodingResp())
+    r = update_mod.download_asset("https://x/p.exe", str(dest))
+    assert r["ok"] is True
+    assert dest.read_bytes() == b"Z" * 8
 
 
 def test_purge_stale_backup_removes_only_the_bak(monkeypatch, tmp_path):
