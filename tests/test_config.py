@@ -369,6 +369,20 @@ def test_normalize_config_stats_bg_trimmed_roundtrip():
     assert plain["stats"] == {"count": 3, "freed": 100}
 
 
+def test_low_mem_leap_default_and_toggle():
+    assert normalize_config({})["low_mem_leap"] is True
+    assert DEFAULT_CONFIG["low_mem_leap"] is True
+    assert normalize_config({"low_mem_leap": 0})["low_mem_leap"] is False
+    assert normalize_config({"low_mem_leap": "no"})["low_mem_leap"] is True
+
+
+def test_normalize_config_stats_low_mem_leap_roundtrip():
+    cfg = normalize_config({"stats": {"count": 3, "freed": 100, "low_mem_leap": 5}})
+    assert cfg["stats"] == {"count": 3, "freed": 100, "low_mem_leap": 5}
+    zero = normalize_config({"stats": {"count": 3, "freed": 100, "low_mem_leap": 0}})
+    assert zero["stats"] == {"count": 3, "freed": 100}
+
+
 def test_default_config_predict_clean_keys_present():
     """趋势预防式清理（v1.8.0）两个键必须有默认值，否则老配置行为漂移。"""
     for key in ("predict_clean", "predict_window_min"):

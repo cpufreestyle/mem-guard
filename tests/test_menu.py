@@ -574,6 +574,35 @@ def test_stats_line_shows_bg_trim_count():
 
 # ------------------------------------ 持续压力粘滞激进 + 阶段自学习菜单项（v1.12.0）
 
+def test_menu_toggle_low_mem_leap_writes_current_config(monkeypatch):
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    guard = _FakeGuard({"low_mem_leap": True})
+    menu_tree = build_menu(guard)
+
+    item = _find_item(menu_tree, "低内存智能两级跃迁")
+    assert item.checked is True
+    item(guard.icon)
+
+    assert merged == [{"low_mem_leap": False}]
+    assert guard.cfg["low_mem_leap"] is False
+
+
+def test_stats_line_shows_low_mem_leap_count():
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024, "low_mem_leap": 3}})
+    line = next(i.text for i in _walk_items(build_menu(guard))
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "累计清理 5 次" in line
+    assert "（跃迁 3 次）" in line
+
+    guard = _FakeGuard({"stats": {"count": 5, "freed": 1024}})
+    line = next(i.text for i in _walk_items(build_menu(guard))
+                if isinstance(i.text, str) and "累计清理" in i.text)
+    assert "跃迁" not in line
+
+
 def test_menu_toggle_sticky_writes_current_config(monkeypatch):
     """「持续高压粘滞激进」勾选只提交增量 sticky_aggressive，并即时回填。"""
     merged = []

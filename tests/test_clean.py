@@ -1706,6 +1706,67 @@ def test_do_clean_skip_bg_stage_still_escalates(monkeypatch):
     assert calls.count("esw") == 1 and calls.count("epw") == 1
     assert r["escalated"] is True
 
+def test_do_clean_critical_low_mem_leap_bypasses_bg_skip(monkeypatch):
+    """当可用物理跌破 1.5GB 紧迫红线且仍受压时，两级跃迁强制绕过 skip={'bg'} 执行后台减压。"""
+    low_mem_bytes = 1000 * 1024 * 1024  # 1000MB < 1536MB
+    calls = []
+    wait_after = [
+        {"avail_phys": low_mem_bytes, "phys_pct": 92.0, "commit_pct": 40.0},        # 保守后
+        {"avail_phys": low_mem_bytes + 100 * 1024 * 1024, "phys_pct": 91.0, "commit_pct": 40.0}, # 定向后
+        {"avail_phys": low_mem_bytes + 200 * 1024 * 1024, "phys_pct": 90.0, "commit_pct": 40.0}, # 后台跃迁后仍受压
+        {"avail_phys": low_mem_bytes + 4000 * 1024 * 1024, "phys_pct": 50.0, "commit_pct": 40.0}, # 升档后缓解
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls,
+               top_rows=_big_rows(), bg_trim=True, bg_result=(2, 0))
+    r = clean.do_clean("自动", skip={"bg"})
+
+    assert "ebw" in calls, "两级跃迁必须执行后台进程减压"
+    assert r["bg_trim"] == 2
+    assert r["low_mem_leap"] is True
+    assert "低内存跃迁·后台进程工作集" in r["detail"]
+    assert calls.count("epw") == 1
+    assert r["escalated"] is True
+
+
+def test_do_clean_critical_low_mem_leap_relieved_blocks_escalate(monkeypatch):
+    """两级跃迁释放足够内存解除受压后，成功阻断 escalate 自动升档（保住前台流畅）。"""
+    low_mem_bytes = 1000 * 1024 * 1024  # 1000MB < 1536MB
+    calls = []
+    wait_after = [
+        {"avail_phys": low_mem_bytes, "phys_pct": 92.0, "commit_pct": 40.0},        # 保守后
+        {"avail_phys": low_mem_bytes + 100 * 1024 * 1024, "phys_pct": 91.0, "commit_pct": 40.0}, # 定向后
+        {"avail_phys": low_mem_bytes + 4000 * 1024 * 1024, "phys_pct": 55.0, "commit_pct": 30.0}, # 后台跃迁后大幅自愈解压
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls,
+               top_rows=_big_rows(), bg_trim=True, bg_result=(3, 0))
+    r = clean.do_clean("自动", skip={"bg"})
+
+    assert "ebw" in calls
+    assert r["bg_trim"] == 3
+    assert r["low_mem_leap"] is True
+    assert r["escalated"] is False, "后台自愈解压后阻断全量激进升档"
+    assert "epw" not in calls
+
+
+def test_do_clean_critical_low_mem_leap_disabled_respects_skip(monkeypatch):
+    """开关关闭时，即使跌入红线也尊重 stage_learn 的 skip 决策。"""
+    low_mem_bytes = 1000 * 1024 * 1024
+    calls = []
+    wait_after = [
+        {"avail_phys": low_mem_bytes, "phys_pct": 92.0, "commit_pct": 40.0},        # 保守后
+        {"avail_phys": low_mem_bytes + 100 * 1024 * 1024, "phys_pct": 91.0, "commit_pct": 40.0}, # 定向后仍然受压
+        {"avail_phys": low_mem_bytes + 4000 * 1024 * 1024, "phys_pct": 50.0, "commit_pct": 40.0}, # 升档激进后
+    ]
+    _admin_env(monkeypatch, wait_after=wait_after, calls=calls,
+               top_rows=_big_rows(), bg_trim=True, cfg_over={"low_mem_leap": False})
+    r = clean.do_clean("自动", skip={"bg"})
+
+    assert "ebw" not in calls
+    assert r["bg_trim"] == 0
+    assert r["low_mem_leap"] is False
+    assert r["escalated"] is True
+
+
 def test_do_clean_reports_per_stage_release(monkeypatch):
     """分阶段释放量按各级 before→after 拆开算：合计即「保守第一遍之后」的增量。"""
     base = 8 * 1024 ** 3

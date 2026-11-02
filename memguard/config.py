@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.29.12"
+__version__ = "1.29.13"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
     "target_clean_top": 3,     # 单次最多精确清空前 N 个工作集最大的进程
     # ---- 后台进程工作集清理（v1.11.0）：定向仍不达标时，清空没有可见窗口的后台进程 ----
     "bg_trim": True,          # 开：仍超阈值时清空后台进程工作集，跳过有可见窗口的，前台零感知
+    # ---- 低内存智能两级跃迁（v1.29.13）----
+    "low_mem_leap": True,     # 开：可用物理跌破 1.5GB 且仍受压时，强制对后台无窗口进程减压，全力避免全量激进卡顿
     # ---- 趋势预防式清理（v1.8.0）：按历史采样拟合上升斜率，预判即将触阈就提前清 ----
     "predict_clean": True,     # 开：预计 predict_window_min 分钟内触及阈值，就提前清一次（仍走保守→定向→升档阶梯）
     "predict_window_min": 5,   # 预计触阈时间窗口(分钟)：只有窗口内会触阈才预防，越小平稳期越不打扰
@@ -267,6 +269,7 @@ _BOOL_KEYS = (
     "escalate_clean",
     "target_clean",
     "bg_trim",
+    "low_mem_leap",
     "predict_clean",
     "effect_track",
     "adaptive_cooldown",
@@ -381,6 +384,10 @@ def normalize_config(raw) -> dict:
             raw_stats.get("fg_protected"), 0, 10 ** 9, 0)
     # process_killed（v1.25.0 结束进程次数）口径同上：非 0 才落键，没结束过的配置保持原形状
     # 结束进程不计入 count/freed（那是内存清理账本），只独立累计过程 killed 计数
+    # low_mem_leap（低内存智能两级跃迁次数）：非 0 才落键
+    if raw_stats.get("low_mem_leap"):
+        cfg["stats"]["low_mem_leap"] = _clamp_int(
+            raw_stats.get("low_mem_leap"), 0, 10 ** 9, 0)
     if raw_stats.get("process_killed"):
         cfg["stats"]["process_killed"] = _clamp_int(
             raw_stats.get("process_killed"), 0, 10 ** 9, 0)

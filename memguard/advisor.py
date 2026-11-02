@@ -561,6 +561,14 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
                     "只清真正后台的进程。",
             "action": {"label": "开启前台保护", "changes": {"fs_protect": True}},
         })
+    if not cfg.get("low_mem_leap", True):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "低内存智能两级跃迁已关闭",
+            "text": "可用物理跌入 1.5GB 紧迫区时，两级跃迁可优先针对后台无窗口进程减压，"
+                    "避免直接全量激进清理导致前台窗口掉帧或读盘卡顿。建议开启。",
+            "action": {"label": "开启低内存跃迁", "changes": {"low_mem_leap": True}},
+        })
     if not cfg.get("notify_idle_sec", 300):
         items.append({
             "level": LEVEL_TIP,

@@ -399,6 +399,11 @@ def build_menu(guard) -> pystray.Menu:
             {"bg_trim": not bool(guard.cfg.get("bg_trim", True))})
         log(f"后台进程工作集清理 -> {'开' if guard.cfg['bg_trim'] else '关'}")
 
+    def on_toggle_low_mem_leap(icon, item) -> None:
+        guard.cfg = update_config(
+            {"low_mem_leap": not bool(guard.cfg.get("low_mem_leap", True))})
+        log(f"低内存智能两级跃迁 -> {'开' if guard.cfg['low_mem_leap'] else '关'}")
+
     def on_toggle_predict_clean(icon, item) -> None:
         guard.cfg = update_config(
             {"predict_clean": not bool(guard.cfg.get("predict_clean", True))})
@@ -425,6 +430,7 @@ def build_menu(guard) -> pystray.Menu:
         dpn = int(st.get('deepen', 0))
         lm = int(st.get('low_mem', 0))
         pk = int(st.get('process_killed', 0))
+        lml = int(st.get('low_mem_leap', 0))
         base = f"累计清理 {int(st.get('count', 0))} 次   释放 {gb(int(st.get('freed', 0)))}"
         return (base + (f"（升档 {esc} 次）" if esc else "")
                 + (f"（定向 {tgt} 次）" if tgt else "")
@@ -434,7 +440,8 @@ def build_menu(guard) -> pystray.Menu:
                 + (f"（后台 {bgt} 次）" if bgt else "")
                 + (f"（粘滞 {stk} 次）" if stk else "")
                 + (f"（低内存 {lm} 次）" if lm else "")
-                + (f"（结束进程 {pk} 次）" if pk else ""))
+                + (f"（结束进程 {pk} 次）" if pk else "")
+                + (f"（跃迁 {lml} 次）" if lml else ""))
 
     def on_toggle_autostart(icon, item) -> None:
         if autostart_enabled():
@@ -699,6 +706,8 @@ def build_menu(guard) -> pystray.Menu:
                              checked=lambda i: bool(guard.cfg.get("target_clean", True))),
             pystray.MenuItem("后台进程工作集清理", on_toggle_bg_trim,
                              checked=lambda i: bool(guard.cfg.get("bg_trim", True))),
+            pystray.MenuItem("低内存智能两级跃迁", on_toggle_low_mem_leap,
+                             checked=lambda i: bool(guard.cfg.get("low_mem_leap", True))),
         )
 
     def adapters_menu():

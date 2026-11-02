@@ -871,3 +871,18 @@ def test_analyze_recommends_16g_optimization_and_provides_action():
     acts = {a["label"]: a["changes"] for a in advisor.advice_actions(items)}
     assert "应用 16G 优化预设" in acts
     assert acts["应用 16G 优化预设"] == advisor.PROFILE_16G
+
+
+def test_analyze_low_mem_leap_advice_when_disabled():
+    """低内存两级跃迁关闭时，advisor 给出提示并提供一键开启动作。"""
+    cfg_off = normalize_config({"low_mem_leap": False})
+    items = advisor.analyze(cfg_off, mem=_mem())
+    hit = [i for i in items if "低内存智能两级跃迁已关闭" in i["title"]]
+    assert len(hit) == 1
+    assert hit[0]["level"] == advisor.LEVEL_TIP
+    acts = {a["label"]: a["changes"] for a in advisor.advice_actions(items)}
+    assert acts["开启低内存跃迁"] == {"low_mem_leap": True}
+
+    cfg_on = normalize_config({"low_mem_leap": True})
+    items_on = advisor.analyze(cfg_on, mem=_mem())
+    assert not any("低内存智能两级跃迁已关闭" in i["title"] for i in items_on)
