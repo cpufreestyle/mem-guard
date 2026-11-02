@@ -250,6 +250,9 @@ ERROR_CLASS_ALREADY_EXISTS = 1410
 TRANSPARENT = 1
 OPAQUE = 2
 CLEARTYPE_QUALITY = 5
+CS_DROPSHADOW = 0x00020000
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_ROUND = 2
 
 _TIP_CLASS = "MemGuardMenuTip"
 # 说明窗的排版参数：v1.29.6 起从「一整块散文」改成「一句结论 + 项目符号清单」。
@@ -268,9 +271,9 @@ _TIP_SENTENCE_SPLIT_MIN = 70
 # 画文字统一用这一组标志：自动折行 + 额外行距 + 不解释 & 前缀
 _DT_TEXT = DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXTERNALLEADING
 _TIP_GAP = 6              # 说明窗与菜单之间的间隙
-_TIP_BG = 0x00FFFFFF      # COLORREF：卡片洁净白 (#FFFFFF)
+_TIP_BG = 0x00F9F9F9      # COLORREF：柔和微灰 (#F9F9F9，与 Win11 系统右键菜单同色，告别生硬死白)
 _TIP_FG = 0x001F1F1F      # COLORREF：高级深灰 (#1F1F1F)，相比纯黑更柔和护眼且清晰
-_TIP_BORDER = 0x00D4D4D4  # COLORREF：现代浅灰精致 1px 边框 (#D4D4D4)
+_TIP_BORDER = 0x00E0E0E0  # COLORREF：现代浅灰精致 1px 边框 (#E0E0E0)
 _TIP_MIN_W, _TIP_MIN_H = 90, 26
 
 _WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
@@ -333,6 +336,7 @@ for _f, _args, _rest in [
                      wintypes.LPCWSTR], wintypes.HFONT),
     ("SelectObject", [wintypes.HDC, wintypes.HGDIOBJ], wintypes.HGDIOBJ),
     ("SetTextColor", [wintypes.HDC, wintypes.COLORREF], wintypes.COLORREF),
+    ("SetBkColor", [wintypes.HDC, wintypes.COLORREF], wintypes.COLORREF),
     ("SetBkMode", [wintypes.HDC, ctypes.c_int], ctypes.c_int),
     ("CreateSolidBrush", [wintypes.COLORREF], wintypes.HBRUSH),
 ]:
@@ -513,6 +517,7 @@ class _TipWindow:
         self._border_brush = gdi32.CreateSolidBrush(_TIP_BORDER)
         wc = WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wc.style = CS_DROPSHADOW
         wc.lpfnWndProc = _TIP_PROC_REF
         wc.hInstance = hinst
         wc.hbrBackground = None
@@ -524,6 +529,14 @@ class _TipWindow:
             _TIP_EX_STYLE, _TIP_CLASS,
             "MemGuard", WS_POPUP, 0, 0, _TIP_MIN_W, _TIP_MIN_H,
             None, None, hinst, None) or 0)
+        if self.hwnd:
+            try:
+                dwmapi = ctypes.WinDLL("dwmapi")
+                pref = ctypes.c_int(DWMWCP_ROUND)
+                dwmapi.DwmSetWindowAttribute(self.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                                             ctypes.byref(pref), ctypes.sizeof(pref))
+            except Exception:
+                pass
 
     def _on_paint(self, hwnd) -> None:
         ps = PAINTSTRUCT()
@@ -538,6 +551,7 @@ class _TipWindow:
                 user32.FrameRect(hdc, ctypes.byref(rc), self._border_brush)
             old_font = gdi32.SelectObject(hdc, self._font)
             old_bk = gdi32.SetBkMode(hdc, TRANSPARENT)
+            gdi32.SetBkColor(hdc, _TIP_BG)
             gdi32.SetTextColor(hdc, _TIP_FG)
             self._draw_paragraphs(hdc, int(rc.right))
             if old_bk:

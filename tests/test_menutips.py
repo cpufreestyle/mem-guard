@@ -293,9 +293,9 @@ def test_modern_tip_font_and_visual_style():
     assert menutips._TIP_FONT_FACE == "Microsoft YaHei UI"
     assert menutips.CLEARTYPE_QUALITY == 5
     assert menutips.TRANSPARENT == 1
-    assert menutips._TIP_BG == 0x00FFFFFF       # 洁净白底
+    assert menutips._TIP_BG == 0x00F9F9F9       # 柔和微灰底（与 Win11 菜单一致）
     assert menutips._TIP_FG == 0x001F1F1F       # 高级深灰文字（避免纯黑生硬）
-    assert menutips._TIP_BORDER == 0x00D4D4D4   # 细腻浅灰边框
+    assert menutips._TIP_BORDER == 0x00E0E0E0   # 细腻浅灰边框
 
 def test_window_size_leaves_room_for_the_frame():
     """客户区尺寸必须经 AdjustWindowRectEx 换算成窗口尺寸。
