@@ -247,10 +247,15 @@ SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 ERROR_CLASS_ALREADY_EXISTS = 1410
 
+TRANSPARENT = 1
+OPAQUE = 2
+CLEARTYPE_QUALITY = 5
+
 _TIP_CLASS = "MemGuardMenuTip"
 # 说明窗的排版参数：v1.29.6 起从「一整块散文」改成「一句结论 + 项目符号清单」。
 # 用户原话「悬停注释 文字显示优化更加容易读」——旧版 14px、行距为零、左右 9px，
 # 三百字的说明压成一面墙，划过去根本找不到从哪儿读起。
+_TIP_FONT_FACE = "Microsoft YaHei UI"
 _TIP_FONT_PX = -15        # 字号（逻辑像素，负值 = 字符高度）
 _TIP_MAX_W = 380          # 折行宽度上限（逻辑像素）：一行约 22 个汉字，比 400 更好扫
 _TIP_PAD_X = 12
@@ -263,9 +268,9 @@ _TIP_SENTENCE_SPLIT_MIN = 70
 # 画文字统一用这一组标志：自动折行 + 额外行距 + 不解释 & 前缀
 _DT_TEXT = DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXTERNALLEADING
 _TIP_GAP = 6              # 说明窗与菜单之间的间隙
-_TIP_BG = 0x00E1FFFF      # COLORREF：经典提示黄
-_TIP_FG = 0x00000000
-_TIP_BORDER = 0x00A0A0A0  # 1px 边框：压在白色窗口 / 深色菜单上都有个边界
+_TIP_BG = 0x00FFFFFF      # COLORREF：卡片洁净白 (#FFFFFF)
+_TIP_FG = 0x001F1F1F      # COLORREF：高级深灰 (#1F1F1F)，相比纯黑更柔和护眼且清晰
+_TIP_BORDER = 0x00D4D4D4  # COLORREF：现代浅灰精致 1px 边框 (#D4D4D4)
 _TIP_MIN_W, _TIP_MIN_H = 90, 26
 
 _WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
@@ -328,6 +333,7 @@ for _f, _args, _rest in [
                      wintypes.LPCWSTR], wintypes.HFONT),
     ("SelectObject", [wintypes.HDC, wintypes.HGDIOBJ], wintypes.HGDIOBJ),
     ("SetTextColor", [wintypes.HDC, wintypes.COLORREF], wintypes.COLORREF),
+    ("SetBkMode", [wintypes.HDC, ctypes.c_int], ctypes.c_int),
     ("CreateSolidBrush", [wintypes.COLORREF], wintypes.HBRUSH),
 ]:
     _fn = getattr(gdi32, _f)
@@ -499,10 +505,10 @@ class _TipWindow:
 
     def _create(self) -> None:
         hinst = kernel32.GetModuleHandleW(None)
-        # 字号取 _TIP_FONT_PX、GB2312 字符集、PROOF_QUALITY：进程不是 DPI 感知
-        # （与全项目一致，坐标与字号都走 96dpi 虚拟空间），高 DPI 屏上由系统整体缩放。
+        # 字号取 _TIP_FONT_PX、GB2312 字符集、CLEARTYPE_QUALITY：启用 ClearType 次像素渲染，
+        # 搭配 Microsoft YaHei UI 现代无衬线字体，字形清晰饱满无毛刺。
         self._font = gdi32.CreateFontW(_TIP_FONT_PX, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0,
-                                       0x0004, 0x0020, "Microsoft YaHei")
+                                       CLEARTYPE_QUALITY, 0x0020, _TIP_FONT_FACE)
         self._bg_brush = gdi32.CreateSolidBrush(_TIP_BG)
         self._border_brush = gdi32.CreateSolidBrush(_TIP_BORDER)
         wc = WNDCLASSEXW()
@@ -530,11 +536,14 @@ class _TipWindow:
             user32.FillRect(hdc, ctypes.byref(rc), self._bg_brush)
             if self._border_brush:
                 user32.FrameRect(hdc, ctypes.byref(rc), self._border_brush)
-            old = gdi32.SelectObject(hdc, self._font)
+            old_font = gdi32.SelectObject(hdc, self._font)
+            old_bk = gdi32.SetBkMode(hdc, TRANSPARENT)
             gdi32.SetTextColor(hdc, _TIP_FG)
             self._draw_paragraphs(hdc, int(rc.right))
-            if old:
-                gdi32.SelectObject(hdc, old)
+            if old_bk:
+                gdi32.SetBkMode(hdc, old_bk)
+            if old_font:
+                gdi32.SelectObject(hdc, old_font)
         finally:
             user32.EndPaint(hwnd, ctypes.byref(ps))
 
