@@ -829,3 +829,45 @@ def test_advice_change_keys_cover_the_expected_knobs():
     }
     missing = sorted(must - keys)
     assert not missing, "正则漏抓了这些键: %s" % missing
+
+# ---------------------------------------------------------------- 16G 内存黄金预设优化（v1.29.12）
+
+def test_needs_16g_optimization_criteria():
+    """16G 机器在日常工作占用下且未应用 16G 预设时才触发建议。"""
+    cfg_default = normalize_config({})
+    mem_16g_busy = _mem(phys_pct=70.0, commit_pct=75.0, total_phys=16 * GB, avail_phys=4.8 * GB)
+    assert advisor.needs_16g_optimization(cfg_default, mem_16g_busy) is True
+
+    # 已经应用 16G 优化预设后不再建议
+    cfg_16g = normalize_config(advisor.PROFILE_16G)
+    assert advisor.needs_16g_optimization(cfg_16g, mem_16g_busy) is False
+
+    # 32G 机器不触发
+    mem_32g = _mem(phys_pct=70.0, commit_pct=75.0, total_phys=32 * GB, avail_phys=9.6 * GB)
+    assert advisor.needs_16g_optimization(cfg_default, mem_32g) is False
+
+    # 8G 机器不触发
+    mem_8g = _mem(phys_pct=70.0, commit_pct=75.0, total_phys=8 * GB, avail_phys=2.4 * GB)
+    assert advisor.needs_16g_optimization(cfg_default, mem_8g) is False
+
+    # 16G 机器在开机空闲极度充裕时（<60% 物理，>6.5GB 可用）不制造噪音
+    mem_16g_idle = _mem(phys_pct=45.0, commit_pct=50.0, total_phys=16 * GB, avail_phys=8.8 * GB)
+    assert advisor.needs_16g_optimization(cfg_default, mem_16g_idle) is False
+
+
+def test_analyze_recommends_16g_optimization_and_provides_action():
+    """16G 机器在日常压力下 analyze 会生成带一键应用的优化建议项。"""
+    cfg_default = normalize_config({})
+    mem_16g = _mem(phys_pct=72.0, commit_pct=78.0, total_phys=16 * GB, avail_phys=4.5 * GB)
+    items = advisor.analyze(cfg_default, mem_16g)
+
+    hit = [i for i in items if "16G 内存" in i["title"]]
+    assert len(hit) == 1
+    assert hit[0]["level"] == advisor.LEVEL_TIP
+    assert "75%" in hit[0]["text"]
+    assert "2048MB" in hit[0]["text"]
+    assert "768MB" in hit[0]["text"]
+
+    acts = {a["label"]: a["changes"] for a in advisor.advice_actions(items)}
+    assert "应用 16G 优化预设" in acts
+    assert acts["应用 16G 优化预设"] == advisor.PROFILE_16G

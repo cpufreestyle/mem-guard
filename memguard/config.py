@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.29.11"
+__version__ = "1.29.12"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -468,4 +468,39 @@ def log(msg: str) -> None:
 
 def gb(n: float) -> str:
     return f"{n / 1024 ** 3:.1f}GB"
+
+# ---- 16G 内存黄金配置预设（v1.29.12）----
+# Windows 10/11 在 16G 物理内存下，开机与日常多任务常驻占用多在 10~12.5GB（65%~78%）；
+# 默认 85% 阈值等可用仅剩 2.4GB 时才介入极易突发掉帧与页面文件颠簸。
+# 黄金预设：物理阈值 75% 提前温和介入、提交阈值 85%、可用内存绝对保底 2048MB、
+# 大户定向清理下限 768MB（精准覆盖 5% 以上大户）、预警余量 10%。
+PROFILE_16G = {
+    "phys_threshold": 75,
+    "commit_threshold": 85,
+    "min_avail_mb": 2048,
+    "target_clean_min_mb": 768,
+    "warn_margin": 10,
+}
+
+
+def is_16g_ram(total_phys: int | float | None = None) -> bool:
+    """判断系统物理内存是否处于 16G 规格区间（12GB <= total_phys <= 20GB）。"""
+    if total_phys is None:
+        try:
+            from .winapi import get_mem
+            total_phys = get_mem().get("total_phys", 0)
+        except Exception:
+            return False
+    try:
+        t = float(total_phys or 0)
+    except (TypeError, ValueError):
+        return False
+    return 12 * (1024 ** 3) <= t <= 20 * (1024 ** 3)
+
+
+def apply_16g_profile(cfg: dict | None = None) -> dict:
+    """返回合并了 16G 黄金预设的新配置字典（经规范化钳制后返回）。"""
+    base = dict(cfg if isinstance(cfg, dict) else load_config())
+    base.update(PROFILE_16G)
+    return normalize_config(base)
 

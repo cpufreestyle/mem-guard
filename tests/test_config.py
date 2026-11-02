@@ -677,3 +677,38 @@ def test_normalize_config_update_proxy_only_strips_whitespace():
     assert normalize_config({"update_proxy": None})["update_proxy"] == ""
     # 写错的串原样保留：用户改回来即可，程序不静默改成直连
     assert normalize_config({"update_proxy": "127.0.0.1:7897"})["update_proxy"] == "127.0.0.1:7897"
+
+# ------------------------------------------------ 16G 内存优化预设（v1.29.12）
+
+def test_profile_16g_and_detection():
+    """16G 硬件自动识别与黄金预设配置检查。"""
+    assert config.PROFILE_16G == {
+        "phys_threshold": 75,
+        "commit_threshold": 85,
+        "min_avail_mb": 2048,
+        "target_clean_min_mb": 768,
+        "warn_margin": 10,
+    }
+    gb_unit = 1024 ** 3
+    assert config.is_16g_ram(16 * gb_unit) is True
+    assert config.is_16g_ram(15.86 * gb_unit) is True
+    assert config.is_16g_ram(12 * gb_unit) is True
+    assert config.is_16g_ram(20 * gb_unit) is True
+    assert config.is_16g_ram(8 * gb_unit) is False
+    assert config.is_16g_ram(32 * gb_unit) is False
+    assert config.is_16g_ram("invalid") is False
+    # None 时读取真实或打桩环境，不崩溃且返回布尔值
+    assert isinstance(config.is_16g_ram(None), bool)
+
+
+def test_apply_16g_profile_merges_and_normalizes():
+    """apply_16g_profile 合并黄金预设并保留已有有效配置。"""
+    custom = {"cooldown": 900, "user_blacklist": ["custom.exe"]}
+    applied = config.apply_16g_profile(custom)
+    assert applied["phys_threshold"] == 75
+    assert applied["commit_threshold"] == 85
+    assert applied["min_avail_mb"] == 2048
+    assert applied["target_clean_min_mb"] == 768
+    assert applied["warn_margin"] == 10
+    assert applied["cooldown"] == 900
+    assert applied["user_blacklist"] == ["custom"]
