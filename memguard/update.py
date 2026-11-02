@@ -531,6 +531,18 @@ def parse_checksums(text: str, name: str):
     return None
 
 
+def _format_net_err(e) -> str:
+    """把原始网络异常格式化为人性化提示（去除丑陋的 urlopen 内部包装）。"""
+    msg = str(e or "")
+    if "UNEXPECTED_EOF_WHILE_READING" in msg or "EOF occurred" in msg:
+        return "网络 SSL 连接中断（代理或握手异常）"
+    if "timed out" in msg.lower() or "timeout" in msg.lower():
+        return "网络连接超时"
+    if "connection refused" in msg.lower():
+        return "网络连接被拒绝"
+    return msg
+
+
 def fetch_checksums(url: str, timeout: int = 30, cfg: dict = None) -> dict:
     """下载 Release 上的 sha256 清单（几 KB 文本）。"""
     req = urllib.request.Request(url, headers={"User-Agent": f"MemGuard/{__version__}"})
@@ -538,7 +550,15 @@ def fetch_checksums(url: str, timeout: int = 30, cfg: dict = None) -> dict:
         with _open(req, timeout, cfg) as resp:
             return {"ok": True, "text": resp.read().decode("utf-8", "replace")}
     except Exception as e:
-        return {"ok": False, "msg": f"下载 sha256 清单失败：{e}"}
+        if resolve_proxy(cfg):
+            log(f"下载 sha256 清单经代理异常（{e}），改直连重试一次")
+            try:
+                direct_req = urllib.request.Request(url, headers={"User-Agent": f"MemGuard/{__version__}"})
+                with _open(direct_req, timeout, cfg, direct=True) as resp:
+                    return {"ok": True, "text": resp.read().decode("utf-8", "replace")}
+            except Exception as e2:
+                return {"ok": False, "msg": f"下载 sha256 清单失败：{_format_net_err(e)}（直连亦失败：{_format_net_err(e2)}）"}
+        return {"ok": False, "msg": f"下载 sha256 清单失败：{_format_net_err(e)}"}
 
 
 def verify_asset(path: str, expected: str) -> dict:
@@ -616,29 +636,43 @@ def fetch_latest_release(timeout: int = 8, cfg: dict = None) -> dict:
     返回 {"ok": True, "tag", "url", "newer", "assets"} 或 {"ok": False, "msg"}。
     仅用标准库 urllib，PyInstaller 打包后无需额外依赖。
 
-    经代理被限流（403/429）时自动改直连重试一次：GitHub 匿名 API 配额按出口
-    IP 计，共享代理出口常常已被别人用光；这一步失败也不影响下载仍走代理。
+    经代理失败（被限流 403/429、或代理链路断流 SSL EOF / 超时等）时自动改直连重试一次：
+    查询接口只有几 KB，直连往往反而通畅；这一步直连成功也不影响后续大包下载仍走代理。
     """
     url = f"https://api.github.com/repos/{REPO_SLUG}/releases/latest"
+    proxy_used = resolve_proxy(cfg)
     try:
         data = _read_release_json(url, timeout, cfg)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return {"ok": False, "msg": "该仓库暂无 Release（或不可访问）"}
-        if e.code in (403, 429) and resolve_proxy(cfg):
+        if e.code in (403, 429) and proxy_used:
             log(f"检查更新经代理被限流（HTTP {e.code}），改直连重试一次")
             try:
                 data = _read_release_json(url, timeout, cfg, direct=True)
             except Exception as e2:
                 return {"ok": False,
-                        "msg": f"检查更新失败：HTTP {e.code}（代理出口被限流，直连也没通：{e2}）"}
+                        "msg": f"检查更新失败：HTTP {e.code}（代理出口被限流，直连也没通：{_format_net_err(e2)}）"}
         elif e.code in (403, 429):
             return {"ok": False,
                     "msg": f"检查更新失败：HTTP {e.code}（GitHub 匿名 API 配额可能已用尽，稍后再试）"}
+        elif proxy_used:
+            log(f"检查更新代理异常（HTTP {e.code}），改直连重试一次")
+            try:
+                data = _read_release_json(url, timeout, cfg, direct=True)
+            except Exception as e2:
+                return {"ok": False, "msg": f"检查更新失败：HTTP {e.code}（直连亦失败：{_format_net_err(e2)}）"}
         else:
             return {"ok": False, "msg": f"检查更新失败：HTTP {e.code}"}
     except Exception as e:
-        return {"ok": False, "msg": f"检查更新失败：{e}{_proxy_hint(cfg)}"}
+        if proxy_used:
+            log(f"检查更新经代理网络异常（{e}），改直连重试一次")
+            try:
+                data = _read_release_json(url, timeout, cfg, direct=True)
+            except Exception as e2:
+                return {"ok": False, "msg": f"检查更新失败：{_format_net_err(e)}（改直连亦失败：{_format_net_err(e2)}）"}
+        else:
+            return {"ok": False, "msg": f"检查更新失败：{_format_net_err(e)}{_proxy_hint(cfg)}"}
 
     tag = str(data.get("tag_name") or "").strip()
     if not tag:

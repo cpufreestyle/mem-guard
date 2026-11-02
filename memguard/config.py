@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.29.10"
+__version__ = "1.29.11"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -31,6 +31,8 @@ CONFIG_PATH = os.path.join(BASE_DIR, "mem_guard.json")
 LOG_PATH = os.path.join(BASE_DIR, "mem_guard.log")
 
 DEFAULT_CONFIG = {
+    # ---- 运行模式（极简模式 vs 高级模式）----
+    "simple_mode": False,   # 极简模式：仅保留状态、立即清理、概览、自动清理与模式切换，隐藏复杂调参
     "phys_threshold": 85,    # 物理内存使用率阈值(%)
     "commit_threshold": 90,  # 提交内存使用率阈值(%)，这是"内存不足"的真正指标
     "interval": 10,          # 检测间隔(秒)
@@ -260,6 +262,7 @@ _FIELD_SPECS = (
 # 纯布尔开关：没有区间可言，脏值（None / 字符串 / 1）一律按 bool 语义归一。
 # 自适应的开关键不在这里——它们跟着 ADAPTERS 一起走，见 normalize_config。
 _BOOL_KEYS = (
+    "simple_mode",
     "auto_clean",
     "escalate_clean",
     "target_clean",

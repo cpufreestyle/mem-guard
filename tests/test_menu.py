@@ -1119,3 +1119,161 @@ def test_update_menu_shows_which_proxy_updates_use():
 
     auto = build_menu(_FakeGuard())
     assert "自动探测" in str(_find_item_by_text(auto, "更新代理：").text)
+
+
+# ------------------------------------------------ 极简模式与高级模式切换（v1.29.11）
+
+def test_simple_mode_config_defaults_to_false():
+    """simple_mode 默认必须为 False，保证兼容性与现有高级模式体验。"""
+    assert config.DEFAULT_CONFIG["simple_mode"] is False
+    assert normalize_config({})["simple_mode"] is False
+    assert normalize_config({"simple_mode": True})["simple_mode"] is True
+    assert normalize_config({"simple_mode": "yes"})["simple_mode"] is True
+
+
+def test_simple_mode_menu_items_and_structure():
+    """极简模式下根菜单仅保留 6 个核心项，隐藏所有高阶调参和子菜单。"""
+    guard = _FakeGuard({"simple_mode": True})
+    tree = build_menu(guard)
+    roots = _root_labels(tree)
+    assert len(roots) == 6, f"极简模式应只有 6 项，实际 {len(roots)} 项: {roots}"
+
+    # 包含的 6 项
+    assert any("物理内存" in r and "提交内存" in r for r in roots)
+    assert "立即清理" in roots
+    assert "内存概览（左键）" in roots
+    assert "自动清理" in roots
+    assert "模式：极简 (点击切换高级)" in roots
+    assert "退出" in roots
+
+    # 不包含高级调参、子菜单和无关项
+    assert "高级功能" not in roots
+    assert "清理阈值" not in roots
+    assert "清理力度" not in roots
+    assert "清理冷却" not in roots
+    assert "清理区域" not in roots
+    assert "结束进程" not in roots
+    assert "内存占用 Top10" not in roots
+    assert "内存趋势" not in roots
+    assert "开机自启" not in roots
+    assert "打开日志" not in roots
+    assert not any("优化建议" in r for r in roots)
+
+
+def test_toggle_simple_mode_from_simple_to_advanced(monkeypatch):
+    """极简模式下点击切换，配置写入 simple_mode=False 并即时重建高级菜单。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    class _MockIcon:
+        def __init__(self):
+            self.menu = None
+
+    guard = _FakeGuard({"simple_mode": True})
+    icon = _MockIcon()
+    guard.icon = icon
+
+    tree = build_menu(guard)
+    icon.menu = tree
+    item = _find_item(tree, "模式：极简 (点击切换高级)")
+    item(icon)
+
+    assert merged == [{"simple_mode": False}]
+    assert guard.cfg["simple_mode"] is False
+    # icon.menu 已被替换为高级菜单
+    assert icon.menu is not None
+    new_roots = _root_labels(icon.menu)
+    assert "高级功能" in new_roots
+    assert "模式：高级 (点击切换极简)" in new_roots
+
+
+def test_toggle_simple_mode_from_advanced_to_simple(monkeypatch):
+    """高级模式下点击切换，配置写入 simple_mode=True 并即时重建极简菜单。"""
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+
+    class _MockIcon:
+        def __init__(self):
+            self.menu = None
+
+    guard = _FakeGuard({"simple_mode": False})
+    icon = _MockIcon()
+    guard.icon = icon
+
+    tree = build_menu(guard)
+    icon.menu = tree
+    item = _find_item(tree, "模式：高级 (点击切换极简)")
+    item(icon)
+
+    assert merged == [{"simple_mode": True}]
+    assert guard.cfg["simple_mode"] is True
+    # icon.menu 已被替换为极简菜单
+    assert icon.menu is not None
+    new_roots = _root_labels(icon.menu)
+    assert len(new_roots) == 6
+    assert "模式：极简 (点击切换高级)" in new_roots
+
+
+def test_simple_mode_actions(monkeypatch):
+    """极简模式下立即清理、内存概览、自动清理、退出等基础动作正常运转。"""
+    cleaned = []
+    monkeypatch.setattr(menu, "do_clean", lambda reason, growth_rows=None: cleaned.append(reason) or {
+        "ok": True, "freed": 1024, "level": "conservative", "detail": "-",
+        "before": {"avail_phys": 1024, "commit_pct": 50}, "after": {"avail_phys": 2048, "commit_pct": 45}
+    })
+    monkeypatch.setattr(menu, "top_processes_list", lambda n=15: [])
+
+    overview_opened = []
+    guard = _FakeGuard({"simple_mode": True, "auto_clean": True})
+    guard.open_overview = lambda: overview_opened.append(True)
+
+    class _ActionIcon:
+        def __init__(self):
+            self.stopped = False
+            self.notifications = []
+        def notify(self, body, title=None):
+            self.notifications.append((title, body))
+        def stop(self):
+            self.stopped = True
+
+    icon = _ActionIcon()
+    guard.icon = icon
+    tree = build_menu(guard)
+
+    # 1. 立即清理
+    _find_item(tree, "立即清理")(icon)
+    assert cleaned == ["手动"]
+    assert len(icon.notifications) == 1
+
+    # 2. 内存概览
+    _find_item(tree, "内存概览（左键）")(icon)
+    assert overview_opened == [True]
+
+    # 3. 自动清理切换
+    merged = []
+    monkeypatch.setattr(menu, "update_config",
+                        lambda changes: merged.append(dict(changes)) or dict(changes))
+    _find_item(tree, "自动清理")(icon)
+    assert merged == [{"auto_clean": False}]
+    assert guard.cfg["auto_clean"] is False
+
+    # 4. 退出
+    _find_item(tree, "退出")(icon)
+    assert guard.stop.is_set()
+    assert icon.stopped is True
+
+
+def test_guard_refresh_menu_updates_icon_menu():
+    """Guard.refresh_menu() 能够根据当前 guard 状态刷新 icon.menu。"""
+    class _MockIcon:
+        def __init__(self):
+            self.menu = None
+
+    guard = Guard()
+    guard.icon = _MockIcon()
+    assert guard.icon.menu is None
+    guard.refresh_menu()
+    assert guard.icon.menu is not None
+    assert isinstance(guard.icon.menu, pystray.Menu)

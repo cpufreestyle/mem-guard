@@ -141,6 +141,14 @@ class Guard:
     def refresh(self) -> None:
         self.state = get_mem()
 
+    def refresh_menu(self) -> None:
+        """根据当前配置重建托盘菜单（例如极简模式与高级模式切换）。"""
+        if getattr(self, "icon", None) is not None:
+            try:
+                self.icon.menu = build_menu(self)
+            except Exception as e:
+                log(f"刷新托盘菜单失败: {e!r}")
+
     # -- 概览窗口（对标 WinMemoryCleaner / Mem Reduct：左键点托盘就打开主窗口）----
 
     def _status_lines(self) -> list:
@@ -516,7 +524,10 @@ class Guard:
             if mtime != self._cfg_mtime:
                 self._cfg_mtime = mtime
                 if mtime is not None:
+                    old_simple = bool(self.cfg.get("simple_mode", False))
                     self.cfg = load_config()
+                    if bool(self.cfg.get("simple_mode", False)) != old_simple:
+                        self.refresh_menu()
                     # 手动把档位从激进切回保守 = 想重新评估自调优，重新武装（v1.10.0）；
                     # 返回 True 说明已清闩写盘，_cfg_mtime 取写盘后的新值，省掉下一 tick 一次白重载
                     if self._sync_level_seen():

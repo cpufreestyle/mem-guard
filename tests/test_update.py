@@ -841,3 +841,52 @@ def test_fetch_latest_release_reports_rate_limit_without_a_proxy(monkeypatch):
     monkeypatch.setattr(update_mod, "log", lambda m: None)
     r = update_mod.fetch_latest_release(cfg={})
     assert r["ok"] is False and "配额" in r["msg"]
+
+
+def test_fetch_latest_release_falls_back_to_direct_on_proxy_ssl_eof(monkeypatch):
+    """代理握手断流（SSL: UNEXPECTED_EOF_WHILE_READING）时自动降级直连重试。"""
+    calls = []
+    reqs = []
+    body = json.dumps({"tag_name": "v9.9.9", "html_url": "https://x",
+                       "assets": []}).encode()
+
+    def fake_open(req, timeout=None, cfg=None, direct=False):
+        calls.append(direct)
+        reqs.append(req)
+        if not direct:
+            raise urllib.error.URLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1032)")
+        return _JsonResp(body)
+
+    monkeypatch.setattr(update_mod, "_open", fake_open)
+    monkeypatch.setattr(update_mod, "resolve_proxy", lambda cfg=None: "http://127.0.0.1:7897")
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    r = update_mod.fetch_latest_release(cfg={})
+    assert r["ok"] is True and r["tag"] == "v9.9.9"
+    assert calls == [False, True], "先走代理遇 SSL 异常，自动降级直连成功"
+    assert reqs[0] is not reqs[1]
+
+
+def test_fetch_checksums_falls_back_to_direct_on_proxy_error(monkeypatch):
+    """sha256 清单下载在代理链路断开时自动降级直连重试。"""
+    calls = []
+
+    def fake_open(req, timeout=None, cfg=None, direct=False):
+        calls.append(direct)
+        if not direct:
+            raise urllib.error.URLError("connection refused")
+        return _JsonResp(b"513d4c6041cd  mem_guard.exe\n")
+
+    monkeypatch.setattr(update_mod, "_open", fake_open)
+    monkeypatch.setattr(update_mod, "resolve_proxy", lambda cfg=None: "http://127.0.0.1:7897")
+    monkeypatch.setattr(update_mod, "log", lambda m: None)
+    r = update_mod.fetch_checksums("https://example/checksums.txt", cfg={})
+    assert r["ok"] is True and "mem_guard.exe" in r["text"]
+    assert calls == [False, True]
+
+
+def test_format_net_err_human_readable():
+    """网络底层报错转换为简洁的人话。"""
+    err = urllib.error.URLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1032)")
+    assert "SSL" in update_mod._format_net_err(err)
+    assert update_mod._format_net_err("timed out") == "网络连接超时"
+    assert update_mod._format_net_err("Connection refused") == "网络连接被拒绝"

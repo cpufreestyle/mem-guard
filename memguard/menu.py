@@ -565,6 +565,23 @@ def build_menu(guard) -> pystray.Menu:
             {"process_kill_confirm": not bool(guard.cfg.get("process_kill_confirm", True))})
         log(f"结束进程前确认 -> {'开' if guard.cfg['process_kill_confirm'] else '关'}")
 
+    def on_toggle_simple_mode(icon=None, item=None) -> None:
+        """切换极简模式 / 高级模式，并即时重建托盘菜单。"""
+        new_mode = not bool(guard.cfg.get("simple_mode", False))
+        guard.cfg = update_config({"simple_mode": new_mode})
+        log(f"操作模式 -> {'极简模式' if new_mode else '高级模式'}")
+        target_icon = icon if icon is not None else getattr(guard, "icon", None)
+        if target_icon is not None:
+            try:
+                target_icon.menu = build_menu(guard)
+            except Exception as e:
+                log(f"刷新托盘菜单失败: {e!r}")
+        if hasattr(guard, "refresh_menu"):
+            try:
+                guard.refresh_menu()
+            except Exception as e:
+                log(f"刷新托盘菜单失败: {e!r}")
+
     def _set_hotkey(action, spec):
         def setter(icon, item):
             changes = {"hotkey_" + action: spec}
@@ -601,6 +618,10 @@ def build_menu(guard) -> pystray.Menu:
         return pystray.Menu(*groups)
 
     # -- 菜单结构 ------------------------------------------------
+
+    def line_simple_status(_):
+        s = guard.state
+        return f"物理内存  {s['phys_pct']:.0f}%   /   提交内存  {s['commit_pct']:.0f}%"
 
     def line_phys(_):
         s = guard.state
@@ -778,6 +799,19 @@ def build_menu(guard) -> pystray.Menu:
             pystray.MenuItem("导出诊断", on_export),
         )
 
+    if bool(guard.cfg.get("simple_mode", False)):
+        return pystray.Menu(
+            pystray.MenuItem(line_simple_status, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("立即清理", on_clean_now),
+            pystray.MenuItem("内存概览（左键）", on_overview),
+            pystray.MenuItem("自动清理", on_toggle_auto,
+                             checked=lambda i: bool(guard.cfg.get("auto_clean", True))),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("模式：极简 (点击切换高级)", on_toggle_simple_mode),
+            pystray.MenuItem("退出", on_quit),
+        )
+
     return pystray.Menu(
         pystray.MenuItem(line_phys, None, enabled=False),
         pystray.MenuItem(line_commit, None, enabled=False),
@@ -811,5 +845,6 @@ def build_menu(guard) -> pystray.Menu:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("打开日志", on_open_log),
         pystray.MenuItem(f"检查更新（v{__version__}）", on_check_update),
+        pystray.MenuItem("模式：高级 (点击切换极简)", on_toggle_simple_mode),
         pystray.MenuItem("退出", on_quit),
     )
