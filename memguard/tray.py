@@ -180,6 +180,7 @@ class Guard:
             # history 同理：v1.15.0 的覆盖面自调优建议只认 proc_history 这份采样。
             "advice": lambda: show_advice_window(lambda: self.cfg,
                                                   lambda: self.proc_history),
+            "cfg": lambda: self.cfg,
         })
 
     # -- 唤窗信号（从任务栏再点一次图标时用）-------------------------------------

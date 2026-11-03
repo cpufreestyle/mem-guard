@@ -868,3 +868,41 @@ def test_overview_refresh_remaps_rows_to_current_processes(monkeypatch):
     table.selected = [table.items[0]]
     menus[-1].commands["结束选中的进程"]()
     assert killed == [[("Code.exe", 4444)]], "fresh row only"
+
+
+def test_resolve_theme_explicit():
+    assert ui.resolve_theme({"theme": "dark"}) == ui.THEME_DARK
+    assert ui.resolve_theme({"theme": "light"}) == ui.THEME_LIGHT
+    assert ui.resolve_theme({"theme": "DARK"}) == ui.THEME_DARK
+    assert ui.resolve_theme({"theme": "  Light  "}) == ui.THEME_LIGHT
+
+
+def test_resolve_theme_auto_detect(monkeypatch):
+    import memguard.winapi as winapi
+    monkeypatch.setattr(winapi, "is_system_dark_mode", lambda: True)
+    assert ui.resolve_theme({"theme": "auto"}) == ui.THEME_DARK
+
+    monkeypatch.setattr(winapi, "is_system_dark_mode", lambda: False)
+    assert ui.resolve_theme({"theme": "auto"}) == ui.THEME_LIGHT
+
+    def raise_err():
+        raise RuntimeError("registry blocked")
+    monkeypatch.setattr(winapi, "is_system_dark_mode", raise_err)
+    assert ui.resolve_theme({"theme": "auto"}) == ui.THEME_LIGHT
+
+def test_theme_palettes_structure():
+    assert ui.THEME_DARK["is_dark"] is True
+    assert ui.THEME_LIGHT["is_dark"] is False
+    keys = ["bg", "card_bg", "fg", "sub_fg", "guard_fg", "border",
+            "table_bg", "table_fg", "table_odd", "table_even",
+            "table_head_bg", "table_head_fg", "trend_bg", "trend_title",
+            "trend_grid", "trend_sub", "advice_card"]
+    for k in keys:
+        assert k in ui.THEME_DARK
+        assert k in ui.THEME_LIGHT
+
+def test_apply_window_theme_safe_on_dummy():
+    class DummyWindow:
+        pass
+    ui.apply_window_theme(DummyWindow(), ui.THEME_DARK)
+    ui.apply_window_theme(DummyWindow(), ui.THEME_LIGHT)

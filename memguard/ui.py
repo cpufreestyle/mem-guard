@@ -284,6 +284,114 @@ _advice_window_open = False
 LEVEL_COLORS = {"warn": "#c0392b", "tip": "#b8860b", "info": "#2d6cdf"}
 LEVEL_TAGS = {"warn": "注意", "tip": "建议", "info": "提示"}
 
+THEME_LIGHT = {
+    "is_dark": False,
+    "bg": "#f5f6f8",
+    "card_bg": "#ffffff",
+    "fg": "#1a1a1a",
+    "sub_fg": "#666666",
+    "guard_fg": "#5a6472",
+    "border": "#e5e7eb",
+    "table_bg": "#ffffff",
+    "table_fg": "#1a1a1a",
+    "table_odd": "#f7f9fb",
+    "table_even": "#ffffff",
+    "table_head_bg": "#f0f2f5",
+    "table_head_fg": "#333333",
+    "trend_bg": "#ffffff",
+    "trend_title": "#333333",
+    "trend_grid": "#e6e6e6",
+    "trend_sub": "#888888",
+    "advice_card": "#fbfbfc",
+}
+
+THEME_DARK = {
+    "is_dark": True,
+    "bg": "#1e1e1e",
+    "card_bg": "#252526",
+    "fg": "#f1f1f1",
+    "sub_fg": "#a0a0a0",
+    "guard_fg": "#8ba0b5",
+    "border": "#3c3c3c",
+    "table_bg": "#252526",
+    "table_fg": "#f1f1f1",
+    "table_odd": "#2a2d2e",
+    "table_even": "#252526",
+    "table_head_bg": "#333333",
+    "table_head_fg": "#ffffff",
+    "trend_bg": "#1e1e1e",
+    "trend_title": "#f1f1f1",
+    "trend_grid": "#333333",
+    "trend_sub": "#777777",
+    "advice_card": "#252526",
+}
+
+
+def resolve_theme(cfg: dict | None = None) -> dict:
+    """按配置与系统主题解析当前界面配色。"""
+    c = cfg
+    if not c:
+        try:
+            from .config import load_config
+            c = load_config()
+        except Exception:
+            c = {}
+    t = str(c.get("theme", "auto") or "auto").strip().lower()
+    if t == "dark":
+        return THEME_DARK
+    if t == "light":
+        return THEME_LIGHT
+    try:
+        from .winapi import is_system_dark_mode
+        return THEME_DARK if is_system_dark_mode() else THEME_LIGHT
+    except Exception:
+        return THEME_LIGHT
+
+
+def apply_window_theme(root, theme: dict) -> None:
+    """将主题样式注入窗口与 ttk 样式系统，并启用 Win32 原生深色标题栏。"""
+    is_dark = theme.get("is_dark", False)
+    bg = theme.get("bg", "#f5f6f8")
+    fg = theme.get("fg", "#1a1a1a")
+
+    try:
+        root.configure(bg=bg)
+    except Exception:
+        pass
+
+    try:
+        from tkinter import ttk
+        style = ttk.Style(root)
+        if is_dark:
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+            style.configure("TFrame", background=bg)
+            style.configure("TLabel", background=bg, foreground=fg)
+            style.configure("Treeview", background=theme["table_bg"], foreground=theme["table_fg"],
+                            fieldbackground=theme["table_bg"], borderwidth=0)
+            style.configure("Treeview.Heading", background=theme["table_head_bg"],
+                            foreground=theme["table_head_fg"], relief="flat")
+            style.map("Treeview", background=[("selected", "#094771")],
+                      foreground=[("selected", "#ffffff")])
+        else:
+            if "vista" in style.theme_names():
+                style.theme_use("vista")
+            elif "winnative" in style.theme_names():
+                style.theme_use("winnative")
+            style.configure("TFrame", background=bg)
+            style.configure("TLabel", background=bg, foreground=fg)
+    except Exception:
+        pass
+
+    try:
+        root.update_idletasks()
+        from .winapi import set_window_dark_titlebar, toplevel_hwnd
+        hwnd = toplevel_hwnd(root)
+        if hwnd:
+            set_window_dark_titlebar(hwnd, is_dark)
+    except Exception:
+        pass
+
 
 def _mem_lines(s: dict) -> tuple:
     """把内存状态拆成 (两条进度条标签, 明细行, 可用行)，窗口与回退文案共用。"""
@@ -421,6 +529,10 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
     except Exception:
         pass
 
+    cfg = (hooks.get("cfg")() if callable(hooks.get("cfg")) else hooks.get("cfg")) if hooks else None
+    theme = resolve_theme(cfg)
+    apply_window_theme(root, theme)
+
     stats = {"rows": []}
     summary = ttk.Frame(root, padding=12)
     summary.pack(fill="x")
@@ -437,9 +549,9 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
         num.pack(side="left")
         bars[key] = (bar, num)
 
-    detail_lbl = ttk.Label(summary, text="", foreground="#666")
+    detail_lbl = ttk.Label(summary, text="", foreground=theme["sub_fg"])
     detail_lbl.pack(fill="x", pady=(2, 0))
-    free = ttk.Label(summary, text="", foreground="#666")
+    free = ttk.Label(summary, text="", foreground=theme["sub_fg"])
     free.pack(fill="x")
 
     ttk.Separator(root).pack(fill="x", padx=10)
@@ -454,7 +566,8 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
     table.pack(fill="both", expand=True, padx=12)
     for i in range(12):                       # 预建斑马纹 tag，避免每次刷新建新 style
         table.tag_configure("odd" if i % 2 else "even",
-                            background="#f7f9fb" if i % 2 else "#ffffff")
+                            background=theme["table_odd"] if i % 2 else theme["table_even"],
+                            foreground=theme["table_fg"])
 
     # 右键「结束选中的进程」菜单（概览窗 Top5 操作入口，v1.25.0 补丁）
     item_procs: dict = {}
@@ -521,7 +634,7 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
     if _guard_lines(hooks):
         try:
             guard_label = ttk.Label(root, text="  ".join(_guard_lines(hooks)),
-                                    foreground="#5a6472", padding=(12, 0))
+                                    foreground=theme["guard_fg"], padding=(12, 0))
             guard_label.pack(fill="x")
         except Exception:
             guard_label = None
@@ -641,6 +754,8 @@ def _build_top(tk, ttk) -> None:
     root.title("MemGuard - 内存占用 Top10")
     root.geometry("620x470")
     apply_window_icon(root)
+    theme = resolve_theme()
+    apply_window_theme(root, theme)
     try:
         root.attributes("-topmost", True)
     except Exception:
@@ -674,7 +789,8 @@ def _build_top(tk, ttk) -> None:
     table.bind("<Button-3>", lambda e: popup.tk_popup(e.x_root, e.y_root))
     for i in range(10):
         table.tag_configure("odd" if i % 2 else "even",
-                            background="#f7f9fb" if i % 2 else "#ffffff")
+                            background=theme["table_odd"] if i % 2 else theme["table_even"],
+                            foreground=theme["table_fg"])
 
     item_procs: dict = {}
 
@@ -737,8 +853,10 @@ def _build_trend(tk, history_getter) -> None:
         root.attributes("-topmost", True)
     except Exception:
         pass
+    theme = resolve_theme()
+    apply_window_theme(root, theme)
 
-    canvas = tk.Canvas(root, bg="white", highlightthickness=0)
+    canvas = tk.Canvas(root, bg=theme["trend_bg"], highlightthickness=0)
     canvas.pack(fill="both", expand=True)
 
     PHYS, COMMIT = "#2d6cdf", "#cf3b36"
@@ -751,23 +869,23 @@ def _build_trend(tk, history_getter) -> None:
             return
         left, right, top, bottom = 46, 20, 24, 38
         cw, ch = w - left - right, h - top - bottom
-        canvas.create_text(left, 8, anchor="nw", text="内存使用率趋势 (%)", fill="#333",
+        canvas.create_text(left, 8, anchor="nw", text="内存使用率趋势 (%)", fill=theme["trend_title"],
                            font=("", 10, "bold"))
         # 横向网格与纵轴刻度
         for lvl in (0, 25, 50, 75, 100):
             y = top + ch - ch * lvl / 100
-            canvas.create_line(left, y, w - right, y, fill="#e6e6e6")
-            canvas.create_text(left - 6, y, anchor="e", text=f"{lvl}", fill="#888")
+            canvas.create_line(left, y, w - right, y, fill=theme["trend_grid"])
+            canvas.create_text(left - 6, y, anchor="e", text=f"{lvl}", fill=theme["trend_sub"])
         if len(data) < 2:
             canvas.create_text(left + cw / 2, top + ch / 2, anchor="center",
-                               text="采样中...（每个检测周期一个点）", fill="#999")
+                               text="采样中...（每个检测周期一个点）", fill=theme["trend_sub"])
         else:
             n = len(data)
             for i in range(0, n, max(1, n // 6)):   # 时间轴刻度
                 x = left + cw * i / (n - 1)
-                canvas.create_line(x, top, x, top + ch, fill="#f2f2f2")
+                canvas.create_line(x, top, x, top + ch, fill=theme["trend_grid"])
                 canvas.create_text(x, top + ch + 4, anchor="n",
-                                   text=f"{(data[-1][0] - data[i][0]):.0f}s", fill="#999")
+                                   text=f"{(data[-1][0] - data[i][0]):.0f}s", fill=theme["trend_sub"])
             for key, color in ((lambda p, c: p, PHYS), (lambda p, c: c, COMMIT)):
                 coords = []
                 for i, (_, ph, cm) in enumerate(data):
@@ -857,13 +975,15 @@ def show_advice_window(cfg, history=None) -> None:
             root.title("MemGuard - 优化建议")
             root.geometry("640x470")
             apply_window_icon(root)
+            theme = resolve_theme(current_cfg())
+            apply_window_theme(root, theme)
             try:
                 root.attributes("-topmost", True)
             except Exception:
                 pass
 
             body = tk.Text(root, font=("Microsoft YaHei UI", 10), wrap="word",
-                           relief="flat", background="#fbfbfc", padx=12, pady=10)
+                           relief="flat", background=theme["advice_card"], foreground=theme["fg"], padx=12, pady=10)
             body.pack(fill="both", expand=True)
             for lvl, color in LEVEL_COLORS.items():
                 body.tag_config(lvl, foreground=color,

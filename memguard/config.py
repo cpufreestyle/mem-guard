@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.29.13"
+__version__ = "1.29.14"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -138,6 +138,8 @@ DEFAULT_CONFIG = {
     # 菜单里二十来个开关只写了一句「什么时候会动」，划过时浮出「凭什么判、最多动几次、
     # 关掉会怎样」。实现见 menutips.py；关掉它划过菜单什么都不弹，与未实现该特性一致。
     "menu_tips": True,
+    # ---- 界面外观主题（v1.29.14）：auto(跟随系统) / dark(深色模式) / light(浅色模式) ----
+    "theme": "auto",
 
     # ---- 累计统计（由 do_clean 维护并持久化）----
     "stats": {"count": 0, "freed": 0},
@@ -314,6 +316,9 @@ def normalize_config(raw) -> dict:
     lvl = str(cfg.get("clean_level", "conservative")).strip().lower()
     cfg["clean_level"] = lvl if lvl in CLEAN_LEVELS else "conservative"
     cfg["user_blacklist"] = sorted(_blacklist_stems(cfg.get("user_blacklist")))
+    # 界面外观主题（v1.29.14）：auto / dark / light
+    _th = str(cfg.get("theme", "auto") or "auto").strip().lower()
+    cfg["theme"] = _th if _th in ("auto", "dark", "light") else "auto"
     # 清理区域开关：只接受已知键的布尔值，缺失的沿用默认
     raw_areas = cfg.get("clean_areas")
     raw_areas = raw_areas if isinstance(raw_areas, dict) else {}

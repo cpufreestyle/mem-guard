@@ -109,6 +109,36 @@ def ensure_notifications_enabled(aumid: str = APP_USER_MODEL_ID) -> bool:
     return False
 
 
+def is_system_dark_mode() -> bool:
+    """检测当前 Windows 应用程序主题是否为深色模式（AppsUseLightTheme == 0）。"""
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as k:
+            val, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
+            return val == 0
+    except Exception:
+        return False
+
+
+def set_window_dark_titlebar(hwnd: int, dark: bool) -> bool:
+    """为指定窗口句柄启用或禁用 Windows 10/11 原生深色沉浸式标题栏。"""
+    if not hwnd:
+        return False
+    try:
+        dwmapi = ctypes.WinDLL("dwmapi")
+        val = ctypes.c_int(1 if dark else 0)
+        # Windows 10 build 19041+ 和 Windows 11: DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        # 早期 Windows 10 (1809): DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
+        for attr in (20, 19):
+            hr = dwmapi.DwmSetWindowAttribute(wintypes.HWND(hwnd), attr, ctypes.byref(val), ctypes.sizeof(val))
+            if hr == 0:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def set_app_user_model_id(aumid: str = APP_USER_MODEL_ID) -> bool:
     """给当前进程指定任务栏 AppUserModelID；失败只是分组不正常，托盘照常工作。"""
     try:

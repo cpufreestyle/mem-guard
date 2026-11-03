@@ -369,6 +369,14 @@ def test_normalize_config_stats_bg_trimmed_roundtrip():
     assert plain["stats"] == {"count": 3, "freed": 100}
 
 
+def test_theme_default_and_normalization():
+    assert DEFAULT_CONFIG["theme"] == "auto"
+    assert normalize_config({})["theme"] == "auto"
+    assert normalize_config({"theme": "DARK"})["theme"] == "dark"
+    assert normalize_config({"theme": "  light  "})["theme"] == "light"
+    assert normalize_config({"theme": "invalid"})["theme"] == "auto"
+
+
 def test_low_mem_leap_default_and_toggle():
     assert normalize_config({})["low_mem_leap"] is True
     assert DEFAULT_CONFIG["low_mem_leap"] is True

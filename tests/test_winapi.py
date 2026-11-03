@@ -773,3 +773,14 @@ def test_visible_window_pids_returns_none_when_capped(monkeypatch):
         [(hwnd, True, hwnd) for hwnd in range(1, winapi._WINDOW_ENUM_MAX + 64)])
     monkeypatch.setattr(winapi, "user32", fake)
     assert winapi.visible_window_pids() is None
+
+
+def test_is_system_dark_mode_handles_registry():
+    """测试深色模式检测返回布尔值且不抛异常。"""
+    res = winapi.is_system_dark_mode()
+    assert isinstance(res, bool)
+
+
+def test_set_window_dark_titlebar_handles_zero_hwnd():
+    """hwnd 为 0 或非法时不崩溃并返回 False。"""
+    assert winapi.set_window_dark_titlebar(0, True) is False

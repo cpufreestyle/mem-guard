@@ -419,6 +419,12 @@ def build_menu(guard) -> pystray.Menu:
             {"menu_tips": not bool(guard.cfg.get("menu_tips", True))})
         log(f"鼠标悬停显示说明 -> {'开' if guard.cfg['menu_tips'] else '关'}")
 
+    def on_toggle_theme(icon=None, item=None) -> None:
+        cur = str(guard.cfg.get("theme", "auto") or "auto").strip().lower()
+        nxt = {"auto": "dark", "dark": "light", "light": "auto"}.get(cur, "auto")
+        guard.cfg = update_config({"theme": nxt})
+        log(f"界面外观主题 -> {nxt}")
+
     def line_stats(_):
         st = guard.cfg.get("stats") or {}
         esc = int(st.get('escalated', 0))
@@ -748,6 +754,10 @@ def build_menu(guard) -> pystray.Menu:
                              checked=lambda i: bool(guard.cfg.get("fs_protect", True))),
             pystray.MenuItem("鼠标悬停显示说明", on_toggle_menu_tips,
                              checked=lambda i: bool(guard.cfg.get("menu_tips", True))),
+            pystray.MenuItem(
+                lambda i: "外观主题（" + {"dark": "深色", "light": "浅色"}.get(
+                    str(guard.cfg.get("theme", "auto") or "").strip().lower(), "跟随系统") + "）",
+                on_toggle_theme),
         )
 
     def kill_menu():
