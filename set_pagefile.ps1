@@ -7,8 +7,8 @@
 $ErrorActionPreference = 'Stop'
 
 $TargetDrive = 'D:'
-$InitialMB   = 16384
-$MaximumMB   = 32768
+$InitialMB   = 32768
+$MaximumMB   = 49152
 
 function Write-Info($m) { Write-Host ('[*] ' + $m) -ForegroundColor Cyan }
 function Write-Warn($m) { Write-Host ('[!] ' + $m) -ForegroundColor Yellow }
