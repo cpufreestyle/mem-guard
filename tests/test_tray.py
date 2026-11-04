@@ -2292,3 +2292,59 @@ def test_post_clean_learn_records_escalation_attribution(monkeypatch):
     assert g._last_clean_escalated is True, "早退轮也要记，不能漏掉升过档又看住的那一轮"
     g._post_clean_learn({"escalated": False, "still": True})
     assert g._last_clean_escalated is False
+
+
+def test_startup_debounce_gate_blocks_clean_on_boot_and_wake(monkeypatch):
+    """防抖延迟保护：系统刚开机、唤醒或程序刚启动时处于防抖期，关闭后放行。"""
+    g = _guard(_state())
+    g.cfg["startup_delay"] = True
+    g.cfg["startup_delay_sec"] = 120
+
+    # 1. 开机时间 < 120s
+    monkeypatch.setattr(tray.winapi, "get_system_uptime", lambda: 30.0)
+    in_deb, reason = g._in_startup_or_resume_debounce(now_mono=1000.0)
+    assert in_deb is True
+    assert "开机启动防抖中" in reason
+    assert g._startup_debounce_gate(now_mono=1000.0) is True
+
+    # 2. 开机时间充裕，但系统刚唤醒 (wake_resume_time within 120s)
+    monkeypatch.setattr(tray.winapi, "get_system_uptime", lambda: 5000.0)
+    g._start_mono = 1000.0 - 200.0
+    g._wake_resume_time = 1000.0 - 10.0
+    in_deb, reason = g._in_startup_or_resume_debounce(now_mono=1000.0)
+    assert in_deb is True
+    assert "系统唤醒防抖中" in reason
+
+    # 3. 唤醒超过 120s 且进程启动超过 120s -> 放行
+    g._wake_resume_time = 1000.0 - 150.0
+    in_deb, reason = g._in_startup_or_resume_debounce(now_mono=1000.0)
+    assert in_deb is False
+    assert g._startup_debounce_gate(now_mono=1000.0) is False
+
+    # 4. 配置关掉 startup_delay -> 一律放行
+    g.cfg["startup_delay"] = False
+    monkeypatch.setattr(tray.winapi, "get_system_uptime", lambda: 5.0)
+    in_deb, reason = g._in_startup_or_resume_debounce(now_mono=1000.0)
+    assert in_deb is False
+    assert g._startup_debounce_gate(now_mono=1000.0) is False
+
+
+def test_startup_debounce_gate_throttles_log(monkeypatch):
+    """防抖保护日志按 30 秒节流输出，不刷屏。"""
+    logs = []
+    monkeypatch.setattr(tray, "log", lambda m: logs.append(m))
+    monkeypatch.setattr(tray.winapi, "get_system_uptime", lambda: 10.0)
+
+    g = _guard(_state())
+    g.cfg["startup_delay"] = True
+    g.cfg["startup_delay_sec"] = 120
+
+    assert g._startup_debounce_gate(now_mono=100.0) is True
+    assert len(logs) == 1
+    assert "防抖延迟保护" in logs[0]
+
+    assert g._startup_debounce_gate(now_mono=105.0) is True
+    assert len(logs) == 1
+
+    assert g._startup_debounce_gate(now_mono=136.0) is True
+    assert len(logs) == 2

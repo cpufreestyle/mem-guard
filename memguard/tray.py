@@ -19,6 +19,7 @@ from . import adapters
 from . import foreground as fg
 from . import menutips
 from . import update
+from . import winapi
 from .advisor import (advice_actions, analyze, deepen_round_saturated,
                       frequent_escalation, frequent_short_relief,
                       narrow_top_coverage, predict_window_saturated,
@@ -134,9 +135,57 @@ class Guard:
         # v1.26.0 托盘菜单悬停说明：挂在 _menu_hwnd 上的子类化 + 自绘悬浮窗线程。
         # 开关（menu_tips）每次划过菜单现读，改完即生效，不用重启托盘。
         self.menu_tips = menutips.MenuTips(lambda: self.cfg)
+        # v1.29.15 开机/唤醒防抖延迟保护
+        self._start_mono = time.monotonic()
+        self._last_tick_mono = time.monotonic()
+        self._wake_resume_time = None
+        self._last_debounce_log = 0.0
 
 
     # -- 循环 ----------------------------------------------------
+
+
+    def _in_startup_or_resume_debounce(self, now_mono: float = None) -> tuple[bool, str]:
+        """判定当前是否处于开机或唤醒防抖保护窗口。"""
+        if not bool(self.cfg.get("startup_delay", True)):
+            return False, ""
+        if now_mono is None:
+            now_mono = time.monotonic()
+        delay_sec = int(self.cfg.get("startup_delay_sec", 120))
+
+        # 1. 唤醒时间检测（睡眠/休眠刚恢复）
+        if self._wake_resume_time and (now_mono - self._wake_resume_time < delay_sec):
+            rem = int(delay_sec - (now_mono - self._wake_resume_time))
+            return True, f"系统唤醒防抖中（还剩 {rem} 秒）"
+
+        # 2. 开机时间检测 (GetTickCount64)
+        try:
+            uptime = winapi.get_system_uptime()
+            if uptime < delay_sec:
+                rem = int(delay_sec - uptime)
+                return True, f"开机启动防抖中（还剩 {rem} 秒）"
+        except Exception:
+            pass
+
+        # 3. 进程自身启动时间检测
+        proc_age = now_mono - self._start_mono
+        if proc_age < delay_sec:
+            rem = int(delay_sec - proc_age)
+            return True, f"程序启动防抖中（还剩 {rem} 秒）"
+
+        return False, ""
+
+    def _startup_debounce_gate(self, now_mono: float = None) -> bool:
+        """开机与唤醒防抖保护门：若在防抖期内则返回 True，并节流输出日志。"""
+        in_deb, reason = self._in_startup_or_resume_debounce(now_mono)
+        if not in_deb:
+            return False
+        if now_mono is None:
+            now_mono = time.monotonic()
+        if now_mono - self._last_debounce_log >= 30:
+            self._last_debounce_log = now_mono
+            log(f"防抖延迟保护：{reason}，暂缓自动清理与大户工作集清空")
+        return True
 
     def refresh(self) -> None:
         self.state = get_mem()
@@ -1074,6 +1123,12 @@ class Guard:
         while not self.stop.is_set():
             try:
                 self.maybe_reload_config()
+                now_mono = time.monotonic()
+                tick_delta = now_mono - self._last_tick_mono
+                if tick_delta > (self.cfg.get("interval", 10) + 15):
+                    self._wake_resume_time = now_mono
+                    log(f"检测到系统从睡眠/休眠唤醒（跨度 {tick_delta:.1f} 秒），已启动唤醒防抖延迟保护")
+                self._last_tick_mono = now_mono
                 # v1.24.0 全屏应用让路：这一轮整轮跳过四类自动清理触发源；
                 # 手动清理、菜单操作、热键都不受影响
                 if self._fullscreen_gate():
@@ -1094,7 +1149,7 @@ class Guard:
                 over = (s["phys_pct"] >= self.cfg["phys_threshold"]
                         or s["commit_pct"] >= self.cfg["commit_threshold"])
                 # 触发源 4（提前量）：趋势预防式清理，未越线但按斜率即将触阈
-                if not over and self._maybe_predictive_clean(now, s):
+                if not over and not self._startup_debounce_gate(now_mono) and self._maybe_predictive_clean(now, s):
                     self._warned = True
                 # -- 接近阈值预警：只提醒不清理，让人有提前手动干预的机会 --
                 margin = self.cfg.get("warn_margin", 0)
@@ -1119,6 +1174,7 @@ class Guard:
                         self.over_since = now
                     debounced = (now - self.over_since) >= self.cfg.get("debounce_sec", 0)
                     due = (self.cfg["auto_clean"] and debounced
+                           and not self._startup_debounce_gate(now_mono)
                            and now - self.last_clean > self._cooldown_gap())
                     if due:
                         self._auto_clean(now, "自动", s)
@@ -1128,10 +1184,11 @@ class Guard:
                 min_avail = self.cfg.get("min_avail_mb", 0)
                 if (min_avail and s["avail_phys"] < min_avail * 1024 * 1024
                         and self.cfg["auto_clean"]
+                        and not self._startup_debounce_gate(now_mono)
                         and now - self.last_clean > self._cooldown_gap()):
                     self._auto_clean(now, "低内存", s)
                 # 触发源 3：定时清理（不看内存占用，按设定间隔触发）
-                if self._scheduled_due(now):
+                if self._scheduled_due(now) and not self._startup_debounce_gate(now_mono):
                     self.last_scheduled = now
                     self._auto_clean(now, "定时", s)
             except Exception as e:

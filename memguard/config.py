@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.29.14"
+__version__ = "1.29.15"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -115,6 +115,9 @@ DEFAULT_CONFIG = {
     "auto_update": True,        # 后台静默检查 GitHub Release
     "update_check_hours": 12,    # 检查间隔(小时)，钳制 1..168
     "auto_install": False,      # 发现新版自动下载并静默安装（完成后自动重启）
+    # ---- 开机与唤醒防抖保护（v1.29.15）：开机或从睡眠/休眠唤醒后暂缓自动清理与大户清空 ----
+    "startup_delay": True,
+    "startup_delay_sec": 120,
     "last_update_check": 0,     # 上次检查时间戳(epoch 秒)，程序维护
     "update_notified_tag": "",  # 已气泡提醒过的版本 tag，去重
     "verify_update_sha256": True,  # 下载更新包后先比对 Release 的 sha256 清单；默认开，关掉就不再校验
@@ -260,6 +263,7 @@ _FIELD_SPECS = (
     ("scheduled_minutes", 0, 24 * 60),
     ("update_check_hours", 1, 168),
     ("process_kill_min_mb", 1, 32768),
+    ("startup_delay_sec", 10, 600),
 )
 
 
@@ -288,6 +292,7 @@ _BOOL_KEYS = (
     "process_kill_enabled",
     "process_kill_confirm",
     "menu_tips",
+    "startup_delay",
 )
 
 

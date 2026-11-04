@@ -404,6 +404,11 @@ def build_menu(guard) -> pystray.Menu:
             {"low_mem_leap": not bool(guard.cfg.get("low_mem_leap", True))})
         log(f"低内存智能两级跃迁 -> {'开' if guard.cfg['low_mem_leap'] else '关'}")
 
+    def on_toggle_startup_delay(icon=None, item=None) -> None:
+        guard.cfg = update_config(
+            {"startup_delay": not bool(guard.cfg.get("startup_delay", True))})
+        log(f"开机/唤醒防抖延迟保护 -> {'开' if guard.cfg['startup_delay'] else '关'}")
+
     def on_toggle_predict_clean(icon, item) -> None:
         guard.cfg = update_config(
             {"predict_clean": not bool(guard.cfg.get("predict_clean", True))})
@@ -714,6 +719,8 @@ def build_menu(guard) -> pystray.Menu:
                              checked=lambda i: bool(guard.cfg.get("bg_trim", True))),
             pystray.MenuItem("低内存智能两级跃迁", on_toggle_low_mem_leap,
                              checked=lambda i: bool(guard.cfg.get("low_mem_leap", True))),
+            pystray.MenuItem("开机/唤醒防抖保护", on_toggle_startup_delay,
+                             checked=lambda i: bool(guard.cfg.get("startup_delay", True))),
         )
 
     def adapters_menu():

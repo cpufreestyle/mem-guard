@@ -890,3 +890,17 @@ def test_format_net_err_human_readable():
     assert "SSL" in update_mod._format_net_err(err)
     assert update_mod._format_net_err("timed out") == "网络连接超时"
     assert update_mod._format_net_err("Connection refused") == "网络连接被拒绝"
+
+
+def test_check_and_notify_auto_install_postponed_on_fullscreen(monkeypatch):
+    """自动安装闭环遇到前台全屏时自动暂缓，不突发中断游戏或视频。"""
+    monkeypatch.setattr(update_mod, "record_check", lambda now=None: None)
+    monkeypatch.setattr(update_mod, "fetch_latest_release",
+                        lambda cfg=None: {"ok": True, "tag": "v9.9.9", "newer": True})
+    import memguard.foreground as fg
+    monkeypatch.setattr(fg, "is_fullscreen", lambda: True)
+
+    cfg = {"auto_install": True, "fs_pause": True}
+    res = update_mod.check_and_notify(cfg)
+    assert res["action"] == "postponed"
+    assert "全屏" in res["msg"]

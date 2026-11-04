@@ -784,3 +784,10 @@ def test_is_system_dark_mode_handles_registry():
 def test_set_window_dark_titlebar_handles_zero_hwnd():
     """hwnd 为 0 或非法时不崩溃并返回 False。"""
     assert winapi.set_window_dark_titlebar(0, True) is False
+
+
+def test_get_system_uptime_returns_positive_float():
+    """测试 get_system_uptime 返回非负浮点数且不抛异常。"""
+    res = winapi.get_system_uptime()
+    assert isinstance(res, (int, float))
+    assert res >= 0

@@ -730,6 +730,16 @@ def check_and_notify(cfg: dict, notify=None, on_ready=None, now=None,
     tag = r["tag"]
     log(f"发现新版本 {tag}（当前 v{__version__}）")
     if (cfg or {}).get("auto_install"):
+        # 全屏让路护栏：若前台为全屏游戏/视频，暂缓自动安装避免突发打扰
+        if bool((cfg or {}).get("fs_pause", True)):
+            try:
+                from .foreground import is_fullscreen
+                if is_fullscreen():
+                    log(f"检测到前台全屏运行中，暂缓自动安装更新 {tag}")
+                    return {"ok": True, "tag": tag, "newer": True, "action": "postponed",
+                            "msg": "全屏暂停自动安装更新"}
+            except Exception:
+                pass
         if notify:
             try:
                 notify(f"正在下载并安装 {tag}，完成后自动重启", "MemGuard 更新")

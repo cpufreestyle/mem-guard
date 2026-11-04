@@ -1218,3 +1218,13 @@ def pin_tray_to_corner(exe_path: str | None = None, restart: bool = True,
     if not restart:
         return "updated"
     return "pinned" if restart_explorer() else "restart_failed"
+
+
+def get_system_uptime() -> float:
+    """获取系统开机运行时间（秒，浮点数，毫秒精度），基于 Windows GetTickCount64。"""
+    try:
+        kernel32.GetTickCount64.restype = ctypes.c_uint64
+        return kernel32.GetTickCount64() / 1000.0
+    except Exception:
+        import time
+        return time.monotonic()

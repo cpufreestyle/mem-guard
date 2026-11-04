@@ -734,3 +734,14 @@ def test_apply_16g_profile_merges_and_normalizes():
     assert applied["warn_margin"] == 10
     assert applied["cooldown"] == 900
     assert applied["user_blacklist"] == ["custom"]
+
+
+def test_startup_delay_defaults_and_normalization():
+    """开机/唤醒防抖延迟保护（v1.29.15）：默认开，120秒，钳制 [10, 600]。"""
+    cfg = normalize_config({})
+    assert cfg["startup_delay"] is True
+    assert cfg["startup_delay_sec"] == 120
+    assert normalize_config({"startup_delay": False})["startup_delay"] is False
+    assert normalize_config({"startup_delay_sec": 9999})["startup_delay_sec"] == 600
+    assert normalize_config({"startup_delay_sec": 1})["startup_delay_sec"] == 10
+    assert normalize_config({"startup_delay_sec": "abc"})["startup_delay_sec"] == 120
