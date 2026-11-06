@@ -234,6 +234,19 @@ def test_set_window_class_icons_writes_both_indexes(monkeypatch):
         (4242, winapi.GCLP_HICON, 111), (4242, winapi.GCLP_HICONSM, 222)]
 
 
+def test_enable_high_dpi_awareness_returns_bool():
+    """高 DPI 感知设置必须安全返回 bool，不抛异常。"""
+    res = winapi.enable_high_dpi_awareness()
+    assert isinstance(res, bool)
+
+
+def test_enable_high_dpi_awareness_graceful_fallback(monkeypatch):
+    """若 SetProcessDpiAwarenessContext 失败，退回 SetProcessDpiAwareness 或 False。"""
+    monkeypatch.setattr(winapi.user32, "SetProcessDpiAwarenessContext", lambda x: False)
+    res = winapi.enable_high_dpi_awareness()
+    assert isinstance(res, bool)
+
+
 def test_set_window_class_icons_skips_zero_handles(monkeypatch):
     calls = []
     monkeypatch.setattr(winapi.user32, "SetClassLongPtrW",

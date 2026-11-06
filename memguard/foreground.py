@@ -23,6 +23,12 @@ _FULLSCREEN_SLACK = 2
 # 非 0 才落盘（见 config.normalize_config）
 FG_STAT_KEY = "fg_protected"
 
+# 桌面与系统外壳基础类名：这些窗口即使覆盖全屏（如点击桌面空白或任务栏），
+# 也绝不能被判定为「全屏应用」，避免自动清理被误挂起（尤其在 Windows 11 24H2 下）。
+SHELL_DESKTOP_CLASSES = frozenset({
+    "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"
+})
+
 
 def covers_rect(win, mon) -> bool:
     """窗口矩形是否铺满显示器矩形（含 _FULLSCREEN_SLACK 容差）。
@@ -62,7 +68,12 @@ def fullscreen_hwnd() -> int | None:
         mi.cbSize = ctypes.sizeof(winapi.MONITORINFO)
         if not winapi.user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
             return None
-        return hwnd if _covers(wr, mi.rcMonitor) else None
+        if not _covers(wr, mi.rcMonitor):
+            return None
+        cls = winapi.window_class_name(hwnd)
+        if cls in SHELL_DESKTOP_CLASSES:
+            return None
+        return hwnd
     except Exception:
         return None
 

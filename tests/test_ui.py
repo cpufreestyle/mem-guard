@@ -13,9 +13,9 @@ import pytest
 from PIL import ImageTk
 
 from memguard import ui
-from memguard.ui import (_fmt_bytes, _group_rows, _icon_color, _overview_text,
-                          _table_rows, _top_grouped, apply_advice_actions,
-                          make_icon,
+from memguard.ui import (_commit_limit_text, _fmt_bytes, _group_rows, _icon_color,
+                          _overview_text, _table_rows, _top_grouped,
+                          apply_advice_actions, make_icon,
                           show_advice_window, show_overview_window, show_top_window,
                           show_trend_window)
 
@@ -256,6 +256,40 @@ def test_overview_text_appends_guard_lines(monkeypatch):
     assert text.startswith(plain)
     assert "全屏让路：开（未暂停）" in text
     assert _overview_text(hooks={}) == plain
+
+
+def test_commit_limit_text_normal_case():
+    """距 commit 上限还有余量：只显示数值，不出警告。"""
+    s = {"total_commit": 32 << 30, "used_commit": 20 << 30, "avail_commit": 12 << 30}
+    text = _commit_limit_text(s)
+    assert "提交上限" in text and "12.0GB" in text
+    assert "警告" not in text
+
+
+def test_commit_limit_text_warns_below_threshold():
+    """余量低于 2GB：红色示警，告诉用户新程序可能无法分配内存。"""
+    s = {"total_commit": 32 << 30, "used_commit": 31 << 30, "avail_commit": 1 << 30}
+    text = _commit_limit_text(s)
+    assert "警告" in text and "无法分配内存" in text
+
+
+def test_commit_limit_text_over_limit_is_clamped():
+    """脏数据（used > total）不出现负数：夹到 0 再展示。"""
+    s = {"total_commit": 8 << 30, "used_commit": 12 << 30, "avail_commit": 0}
+    text = _commit_limit_text(s)
+    assert "0.0GB" in text and "警告" in text
+
+
+def test_commit_limit_text_empty_when_total_is_zero():
+    """取不到总提交（ctypes 失败占位）返回空串，不写误导文案。"""
+    assert _commit_limit_text({"total_commit": 0, "used_commit": 0,
+                               "avail_commit": 0}) == ""
+
+
+def test_overview_text_carries_commit_limit_line(monkeypatch):
+    """回退文案与窗口同一口径：提交上限那行不能只长在窗口里。"""
+    _stub_sys(monkeypatch)
+    assert "提交上限" in _overview_text()
 
 
 def test_overview_falls_back_to_messagebox_without_tkinter(monkeypatch):

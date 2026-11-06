@@ -84,7 +84,7 @@ _MINAVAIL_MAX = 8192         # 低内存下限上限(MB)：再高就与机器实
 # 位次数 / 实际总位次数（按各采样真实取到的名字数求和，别拿 top*份数 凑数）。
 _FOCUS_MIN_SAMPLES = 5      # 至少这么多份采样才谈「长期在榜」，刚启动的噪声不作数
 _FOCUS_MIN_SPAN = 300.0     # 采样至少要覆盖这么长时间(秒)，五分钟内的抖动不算长期
-_CRITICAL_LOW_MEM_MB = 1536  # 低内存智能两级跃迁危机红线 (1.5GB)
+_CRITICAL_LOW_MEM_MB = 1536  # 低内存智能两级跃迁默认危机红线 (1.5GB)，小内存机型按总内存 1/4 收窄
 _FOCUS_RATIO = 0.8          # 集中度达到这么多就认为覆盖面偏窄，该把单次大户数 +1
 
 # 定向大户下限自调优（v1.19.0）：榜上有人却够不着下限——target_clean_min_mb 定得偏高时，
@@ -878,14 +878,19 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
     # 顶层窗口」的后台进程工作集——比直接全量升档的打扰小（前台正在访问的页不动），
     # 覆盖面又比定向大户全；枚举不到窗口时宁可不做，绝不能当成「都没有窗口」
     bg_trimmed = 0
-    # 低内存两级跃迁（v1.29.13）：若可用物理跌破 1.5GB 紧迫红线且仍受压，强制执行
-    # 后台无窗口进程减压（绕过 stage_learn 跳过标记），优先通过零感知后台减压挽救危机、
-    # 全力避免被迫全量升档引起前台掉帧卡顿。
+    # 低内存两级跃迁（v1.29.13 / v1.29.17）：可用物理跌破紧迫红线且仍受压时，强制执行
+    # 后台无窗口进程减压（绕过 stage_learn 跳过标记）。大内存沿用 1.5GB 红线，小内存
+    # 按总内存的 1/4 收窄、最低 256MB，避免 4G 机器把 1.5GB（37.5%）常态当危机。
+    total_phys = int(after.get("total_phys", 0) or 0)
+    leap_line_mb = _CRITICAL_LOW_MEM_MB
+    if total_phys > 0:
+        leap_line_mb = min(_CRITICAL_LOW_MEM_MB,
+                           max(256, total_phys // 4 // (1024 * 1024)))
     critical_leap = (
         not aggressive
         and bool(cfg.get("low_mem_leap", True))
         and bool(cfg.get("bg_trim", True))
-        and int(after.get("avail_phys", 0) or 0) < _CRITICAL_LOW_MEM_MB * 1024 * 1024
+        and int(after.get("avail_phys", 0) or 0) < leap_line_mb * 1024 * 1024
         and _still_pressured(after, cfg)
     )
     if (not aggressive and ("bg" not in skip or critical_leap)
@@ -912,7 +917,7 @@ def do_clean(reason: str = "手动", level: str | None = None, user_blacklist=No
                 detail.append(f"{tag}:{bg_trimmed} 个"
                               + (f"（跳过 {skipped}）" if skipped else ""))
                 if critical_leap and "bg" in skip:
-                    log(f"{reason}低内存两级跃迁 | 可用物理紧迫({gb(after['avail_phys'])} < {_CRITICAL_LOW_MEM_MB}MB)，"
+                    log(f"{reason}低内存两级跃迁 | 可用物理紧迫({gb(after['avail_phys'])} < {leap_line_mb}MB)，"
                         f"强制唤醒后台减压 | 成功清理 {bg_trimmed} 个后台进程")
             else:
                 detail.append("后台进程工作集:未成功")

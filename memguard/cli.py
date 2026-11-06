@@ -40,6 +40,7 @@ from .update import (_parse_version, check_and_notify, find_checksums_asset,
                     purge_stale_backup, sha256_of, verify_asset)
 from .winapi import (
     acquire_single_instance,
+    enable_high_dpi_awareness,
     get_mem,
     is_admin,
     kernel32,
@@ -347,6 +348,7 @@ def _unknown_args(argv):
 
 
 def main() -> None:
+    enable_high_dpi_awareness()
     # 控制台 / CI 的默认编码可能无法表示中文（如英文 Windows 的 cp1252），
     # 统一把标准流切到 UTF-8 并容忍不可编码字符，避免打印时抛 UnicodeEncodeError。
     for _stream in (sys.stdout, sys.stderr):

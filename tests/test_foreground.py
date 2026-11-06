@@ -127,3 +127,16 @@ def test_pause_reason_respects_the_switch(monkeypatch):
     monkeypatch.setattr(foreground, "fullscreen_hwnd", lambda: None)
     assert foreground.pause_reason(normalize_config({"fs_pause": True})) is None
 
+
+def test_fullscreen_excludes_shell_desktop_classes(monkeypatch):
+    """Windows 11 24H2 等环境下，激活桌面或任务栏时不能误判为全屏应用。"""
+    _install(monkeypatch, rect=(0, 0, 1920, 1080))
+    # 正常全屏应用 -> 命中
+    monkeypatch.setattr(winapi, "window_class_name", lambda h: "UnityWndClass")
+    assert foreground.fullscreen_hwnd() == 1001
+
+    # 桌面 / 任务栏类名 -> 必须排除
+    for cls in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+        monkeypatch.setattr(winapi, "window_class_name", lambda h, c=cls: c)
+        assert foreground.fullscreen_hwnd() is None, f"{cls} 不应被视作全屏应用"
+

@@ -15,7 +15,7 @@ from datetime import datetime
 
 from .adapters import ADAPTERS, COUNTER, clamp_bounds
 
-__version__ = "1.29.15"
+__version__ = "1.29.17"
 
 # GitHub 仓库（owner/repo），供托盘「检查更新」查询最新 Release
 REPO_SLUG = "cpufreestyle/mem-guard"
@@ -500,8 +500,27 @@ PROFILE_16G = {
 }
 
 
-def is_16g_ram(total_phys: int | float | None = None) -> bool:
-    """判断系统物理内存是否处于 16G 规格区间（12GB <= total_phys <= 20GB）。"""
+# ---- 4G / 8G 小内存优化预设（v1.29.17）----
+# 4G 机器日常常驻约 2.5~3.2GB，提交内存耗尽比物理内存见底更早，80% 提交阈值提前介入；
+# 8G 机器日常常驻约 5~6.5GB，按 16G 黄金预设的 12.5% 比例保留 1GB 可用内存底线。
+PROFILE_8G = {
+    "phys_threshold": 75,
+    "commit_threshold": 85,
+    "min_avail_mb": 1024,
+    "target_clean_min_mb": 512,
+    "warn_margin": 10,
+}
+PROFILE_4G = {
+    "phys_threshold": 75,
+    "commit_threshold": 80,
+    "min_avail_mb": 512,
+    "target_clean_min_mb": 256,
+    "warn_margin": 10,
+}
+
+
+def _ram_in_band(total_phys: int | float | None, lo_gb: int, hi_gb: int) -> bool:
+    """物理内存规格区间判定；None 时现场取样，脏值一律 False。"""
     if total_phys is None:
         try:
             from .winapi import get_mem
@@ -512,12 +531,42 @@ def is_16g_ram(total_phys: int | float | None = None) -> bool:
         t = float(total_phys or 0)
     except (TypeError, ValueError):
         return False
-    return 12 * (1024 ** 3) <= t <= 20 * (1024 ** 3)
+    return lo_gb * (1024 ** 3) <= t <= hi_gb * (1024 ** 3)
+
+
+def is_4g_ram(total_phys: int | float | None = None) -> bool:
+    """判断系统物理内存是否处于 4G 规格区间（3GB <= total_phys <= 5GB）。"""
+    return _ram_in_band(total_phys, 3, 5)
+
+
+def is_8g_ram(total_phys: int | float | None = None) -> bool:
+    """判断系统物理内存是否处于 8G 规格区间（6GB <= total_phys <= 10GB）。"""
+    return _ram_in_band(total_phys, 6, 10)
+
+
+def is_16g_ram(total_phys: int | float | None = None) -> bool:
+    """判断系统物理内存是否处于 16G 规格区间（12GB <= total_phys <= 20GB）。"""
+    return _ram_in_band(total_phys, 12, 20)
+
+
+def _apply_profile(cfg: dict | None, profile: dict) -> dict:
+    """合并预设并规范化钳制；cfg 不是字典时回退读取当前配置。"""
+    base = dict(cfg if isinstance(cfg, dict) else load_config())
+    base.update(profile)
+    return normalize_config(base)
 
 
 def apply_16g_profile(cfg: dict | None = None) -> dict:
     """返回合并了 16G 黄金预设的新配置字典（经规范化钳制后返回）。"""
-    base = dict(cfg if isinstance(cfg, dict) else load_config())
-    base.update(PROFILE_16G)
-    return normalize_config(base)
+    return _apply_profile(cfg, PROFILE_16G)
+
+
+def apply_8g_profile(cfg: dict | None = None) -> dict:
+    """返回合并了 8G 流畅预设的新配置字典（经规范化钳制后返回）。"""
+    return _apply_profile(cfg, PROFILE_8G)
+
+
+def apply_4g_profile(cfg: dict | None = None) -> dict:
+    """返回合并了 4G 轻量预设的新配置字典（经规范化钳制后返回）。"""
+    return _apply_profile(cfg, PROFILE_4G)
 

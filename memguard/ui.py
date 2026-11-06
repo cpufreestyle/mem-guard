@@ -402,6 +402,25 @@ def _mem_lines(s: dict) -> tuple:
     return bars, detail, free
 
 
+# commit 余量低于该值时在概览窗红色示警：commit 上限耗尽 = 整机「内存不足」。
+_COMMIT_HEADROOM_WARN_GB = 2.0
+
+
+def _commit_limit_text(s: dict) -> str:
+    """commit 上限说明：把「还能再提交多少」摆出来，低于阈值时给出示警。
+
+    纯函数，窗口与无 tkinter 回退文案共用。总提交为 0（取不到）时返回空串。
+    """
+    total = s.get("total_commit", 0)
+    if not total:
+        return ""
+    headroom = total - s.get("used_commit", 0)
+    base = f"提交上限 = 物理 + 页面文件    距上限还有 {gb(max(headroom, 0))}"
+    if headroom < _COMMIT_HEADROOM_WARN_GB * (1 << 30):
+        return base + "    ⚠ 警告：已接近上限，新程序可能无法分配内存"
+    return base
+
+
 def _guard_lines(hooks: dict) -> list:
     """「守护状态」行：全局热键 / 全屏让路 / 前台保护的当前状态（v1.24.0）。
 
@@ -424,7 +443,11 @@ def _overview_text(rows=None, hooks: dict | None = None) -> str:
     """概览纯文本版：无 tkinter 时的回退，也供测试断言内容。"""
     s = get_mem()
     bars, detail, free = _mem_lines(s)
-    lines = [f"物理内存  {bars[0]}    提交内存  {bars[1]}", detail, free, "-" * 46]
+    lines = [f"物理内存  {bars[0]}    提交内存  {bars[1]}", detail, free]
+    commit_line = _commit_limit_text(s)
+    if commit_line:
+        lines.append(commit_line)
+    lines.append("-" * 46)
     for i, (name, rss, pid) in enumerate(rows if rows is not None
                                          else top_processes_list(5), start=1):
         share = rss / s["total_phys"] * 100 if s["total_phys"] else 0
@@ -553,6 +576,8 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
     detail_lbl.pack(fill="x", pady=(2, 0))
     free = ttk.Label(summary, text="", foreground=theme["sub_fg"])
     free.pack(fill="x")
+    commit_limit = ttk.Label(summary, text="", foreground=theme["sub_fg"])
+    commit_limit.pack(fill="x")
 
     ttk.Separator(root).pack(fill="x", padx=10)
     ttk.Label(root, text="内存占用 Top5", font=("", 10, "bold")).pack(anchor="w", padx=12, pady=(6, 2))
@@ -595,6 +620,9 @@ def _build_overview(tk, ttk, hooks: dict) -> None:
                        foreground=_bar_color(pct))
         detail_lbl.config(text=detail_text)
         free.config(text=free_text)
+        commit_text = _commit_limit_text(s)
+        commit_limit.config(text=commit_text)
+        commit_limit.config(foreground="red" if "警告" in commit_text else theme["sub_fg"])
 
         if guard_label is not None:
             try:

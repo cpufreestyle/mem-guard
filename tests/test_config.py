@@ -736,6 +736,53 @@ def test_apply_16g_profile_merges_and_normalizes():
     assert applied["user_blacklist"] == ["custom"]
 
 
+def test_profile_4g_8g_and_detection():
+    """小内存档预设、互斥区间与脏值兜底（v1.29.17）。"""
+    assert config.PROFILE_8G == {
+        "phys_threshold": 75,
+        "commit_threshold": 85,
+        "min_avail_mb": 1024,
+        "target_clean_min_mb": 512,
+        "warn_margin": 10,
+    }
+    assert config.PROFILE_4G == {
+        "phys_threshold": 75,
+        "commit_threshold": 80,
+        "min_avail_mb": 512,
+        "target_clean_min_mb": 256,
+        "warn_margin": 10,
+    }
+    unit = 1024 ** 3
+    assert config.is_4g_ram(3 * unit) is True
+    assert config.is_4g_ram(4 * unit) is True
+    assert config.is_4g_ram(5 * unit) is True
+    assert config.is_4g_ram(2.5 * unit) is False
+    assert config.is_4g_ram(6 * unit) is False
+    assert config.is_8g_ram(6 * unit) is True
+    assert config.is_8g_ram(8 * unit) is True
+    assert config.is_8g_ram(10 * unit) is True
+    assert config.is_8g_ram(5.5 * unit) is False
+    assert config.is_8g_ram(12 * unit) is False
+    assert config.is_4g_ram("invalid") is False
+    assert config.is_8g_ram("invalid") is False
+    assert isinstance(config.is_4g_ram(None), bool)
+    assert isinstance(config.is_8g_ram(None), bool)
+
+
+def test_apply_4g_8g_profiles_merge_and_normalize():
+    """应用小内存预设时覆盖五个旋钮，保留用户已有键。"""
+    custom = {"cooldown": 900, "user_blacklist": ["custom.exe"]}
+    applied_8g = config.apply_8g_profile(custom)
+    assert {k: applied_8g[k] for k in config.PROFILE_8G} == config.PROFILE_8G
+    assert applied_8g["cooldown"] == 900
+    assert applied_8g["user_blacklist"] == ["custom"]
+
+    applied_4g = config.apply_4g_profile(custom)
+    assert {k: applied_4g[k] for k in config.PROFILE_4G} == config.PROFILE_4G
+    assert applied_4g["cooldown"] == 900
+    assert applied_4g["user_blacklist"] == ["custom"]
+
+
 def test_startup_delay_defaults_and_normalization():
     """开机/唤醒防抖延迟保护（v1.29.15）：默认开，120秒，钳制 [10, 600]。"""
     cfg = normalize_config({})

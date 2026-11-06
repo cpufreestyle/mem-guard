@@ -873,6 +873,55 @@ def test_analyze_recommends_16g_optimization_and_provides_action():
     assert acts["应用 16G 优化预设"] == advisor.PROFILE_16G
 
 
+def test_needs_4g_8g_optimization_criteria():
+    """小内存建议只在该档、日常有压力且预设未应用时触发。"""
+    cfg_default = normalize_config({})
+    mem_8g = _mem(phys_pct=70.0, commit_pct=75.0, total_phys=8 * GB,
+                  avail_phys=2.4 * GB)
+    mem_4g = _mem(phys_pct=70.0, commit_pct=75.0, total_phys=4 * GB,
+                  avail_phys=1.2 * GB)
+    assert advisor.needs_8g_optimization(cfg_default, mem_8g) is True
+    assert advisor.needs_4g_optimization(cfg_default, mem_4g) is True
+    assert advisor.needs_4g_optimization(cfg_default, mem_8g) is False
+    assert advisor.needs_8g_optimization(cfg_default, mem_4g) is False
+    assert advisor.needs_16g_optimization(cfg_default, mem_8g) is False
+
+    assert advisor.needs_8g_optimization(normalize_config(advisor.PROFILE_8G),
+                                        mem_8g) is False
+    assert advisor.needs_4g_optimization(normalize_config(advisor.PROFILE_4G),
+                                        mem_4g) is False
+    idle_8g = _mem(phys_pct=45.0, commit_pct=50.0, total_phys=8 * GB,
+                   avail_phys=4.4 * GB)
+    idle_4g = _mem(phys_pct=45.0, commit_pct=50.0, total_phys=4 * GB,
+                   avail_phys=2.2 * GB)
+    assert advisor.needs_8g_optimization(cfg_default, idle_8g) is False
+    assert advisor.needs_4g_optimization(cfg_default, idle_4g) is False
+
+
+def test_analyze_recommends_4g_8g_optimization_with_single_source_actions():
+    """8G / 4G 各自只出一条建议，一键应用 changes 与预设常量逐键一致。"""
+    cfg_default = normalize_config({})
+    for total, label, profile, marker in (
+        (8 * GB, "8G 内存", advisor.PROFILE_8G, "1024MB"),
+        (4 * GB, "4G 内存", advisor.PROFILE_4G, "512MB"),
+    ):
+        mem = _mem(phys_pct=72.0, commit_pct=78.0, total_phys=total,
+                   avail_phys=total * 0.25)
+        items = advisor.analyze(cfg_default, mem)
+        hit = [i for i in items if label in i["title"]]
+        assert len(hit) == 1
+        assert hit[0]["level"] == advisor.LEVEL_TIP
+        assert marker in hit[0]["text"]
+        acts = {a["label"]: a["changes"] for a in advisor.advice_actions(items)}
+        apply_label = f"应用 {label.split()[0]} 优化预设"
+        assert acts[apply_label] == profile
+
+    mem_16g = _mem(phys_pct=70.0, commit_pct=75.0, total_phys=16 * GB,
+                   avail_phys=4.8 * GB)
+    titles = [i["title"] for i in advisor.analyze(cfg_default, mem=mem_16g)]
+    assert not any("8G 内存" in t or "4G 内存" in t for t in titles)
+
+
 def test_analyze_low_mem_leap_advice_when_disabled():
     """低内存两级跃迁关闭时，advisor 给出提示并提供一键开启动作。"""
     cfg_off = normalize_config({"low_mem_leap": False})

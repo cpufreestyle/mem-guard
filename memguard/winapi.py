@@ -1228,3 +1228,24 @@ def get_system_uptime() -> float:
     except Exception:
         import time
         return time.monotonic()
+
+
+def enable_high_dpi_awareness() -> bool:
+    """为当前进程开启高 DPI 感知（支持 Windows 10 1703+ / Windows 11 24H2）。
+
+    优先使用 Per-Monitor V2 模式，避免多屏混合缩放下界面模糊，并保证全屏判定坐标一致。
+    退回策略健全，失败静默吞掉，绝不影响主流程。
+    """
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return True
+    except Exception:
+        pass
+    try:
+        shcore = getattr(ctypes.windll, "shcore", None)
+        if shcore and shcore.SetProcessDpiAwareness(2) == 0:
+            return True
+    except Exception:
+        pass
+    return False

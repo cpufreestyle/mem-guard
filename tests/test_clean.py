@@ -8,6 +8,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from memguard import actions, clean, config
 from memguard.config import normalize_config
 from memguard.winapi import (
@@ -1765,6 +1767,47 @@ def test_do_clean_critical_low_mem_leap_disabled_respects_skip(monkeypatch):
     assert r["bg_trim"] == 0
     assert r["low_mem_leap"] is False
     assert r["escalated"] is True
+
+
+def _critical_leap_wait(total_phys, avail_mb, relieved=True):
+    """小内存红线测试共用采样：让 after 带 total_phys 供动态红线计算。"""
+    low = avail_mb * 1024 * 1024
+    second = ({"avail_phys": 4 * 1024 ** 3, "phys_pct": 55.0, "commit_pct": 30.0}
+              if relieved else {"avail_phys": low + 100 * 1024 * 1024,
+                                "phys_pct": 90.0, "commit_pct": 40.0})
+    return [
+        {"avail_phys": low, "phys_pct": 92.0, "commit_pct": 40.0,
+         "total_phys": total_phys},
+        {"avail_phys": low + 100 * 1024 * 1024, "phys_pct": 91.0,
+         "commit_pct": 40.0, "total_phys": total_phys},
+        {**second, "total_phys": total_phys},
+        {"avail_phys": 4 * 1024 ** 3, "phys_pct": 50.0, "commit_pct": 40.0,
+         "total_phys": total_phys},
+    ]
+
+
+@pytest.mark.parametrize("avail_mb,should_leap", [(1200, False), (900, True)])
+def test_do_clean_4g_critical_line_is_a_quarter_of_ram(monkeypatch, avail_mb,
+                                                      should_leap):
+    """4G 机器红线收窄到 1GB：1200MB 不跃迁，900MB 绕过 bg skip 跃迁。"""
+    calls = []
+    _admin_env(monkeypatch, wait_after=_critical_leap_wait(4 * 1024 ** 3, avail_mb),
+               calls=calls, top_rows=_big_rows(), bg_trim=True, bg_result=(2, 0))
+    r = clean.do_clean("自动", skip={"bg"})
+    assert ("ebw" in calls) is should_leap
+    assert r["low_mem_leap"] is should_leap
+
+
+@pytest.mark.parametrize("total_gb", [8, 16])
+def test_do_clean_large_ram_keeps_1536mb_critical_line(monkeypatch, total_gb):
+    """8G / 16G 仍按 1536MB 旧线，1400MB 保持原有跃迁行为。"""
+    calls = []
+    _admin_env(monkeypatch,
+               wait_after=_critical_leap_wait(total_gb * 1024 ** 3, 1400),
+               calls=calls, top_rows=_big_rows(), bg_trim=True, bg_result=(2, 0))
+    r = clean.do_clean("自动", skip={"bg"})
+    assert "ebw" in calls
+    assert r["low_mem_leap"] is True
 
 
 def test_do_clean_reports_per_stage_release(monkeypatch):

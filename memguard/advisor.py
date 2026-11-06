@@ -16,7 +16,8 @@ from .clean import (_DEEPEN_MAX_ROUNDS, _FOCUS_RATIO, _HEADROOM_MAX,
                     _THRESHOLD_MAX_DROPS, _THRESHOLD_PHYS_FLOOR,
                     _THRESHOLD_STEP, focused_top_rss,
                     top_focus_ratio, top_processes_list)
-from .config import PROFILE_16G, TARGET_CLEAN_TOP_MAX, _norm_proc_name, gb, is_16g_ram
+from .config import (PROFILE_16G, PROFILE_8G, PROFILE_4G, TARGET_CLEAN_TOP_MAX,
+                     _norm_proc_name, gb, is_16g_ram, is_8g_ram, is_4g_ram)
 from .winapi import get_mem, is_admin
 
 # 激进档下常被清空工作集、导致卡顿的常见程序（建议加入 user_blacklist）
@@ -45,18 +46,9 @@ _PREDICT_MISS_MIN = 3
 _THRESHOLD_MIN_SHORT = 2
 
 
-def needs_16g_optimization(cfg: dict, mem: dict | None = None) -> bool:
-    """16G 物理内存机型是否建议应用黄金配置预设（v1.29.12）。
-
-    判据：
-    1. 本机物理内存属于 16G 规格（12GB <= total_phys <= 20GB）；
-    2. 当前正在常驻运行或处于日常工作状态（phys_pct >= 60.0 或 avail_phys <= 6.5GB 或 commit_pct >= 70.0）；
-    3. 关键配置仍未达到 16G 优化标准：
-       - phys_threshold > 75（仍按默认 85% 等太晚）
-       - 或 commit_threshold > 85（仍按默认 90%）
-       - 或 min_avail_mb < 2048（未开启或低于 2GB 强力保底）
-       - 或 target_clean_min_mb > 768（大户门槛仍按 1024MB，漏掉 768MB~1GB 的大户）
-    """
+def _needs_ram_profile(cfg: dict, mem: dict | None, in_band, profile: dict,
+                       busy_avail_gb: float) -> bool:
+    """命名预设的共用三重判据：机型档位、日常压力、尚未应用预设。"""
     try:
         m = mem if mem is not None else get_mem()
     except Exception:
@@ -64,13 +56,14 @@ def needs_16g_optimization(cfg: dict, mem: dict | None = None) -> bool:
     if not isinstance(m, dict) or "total_phys" not in m:
         return False
     total_phys = m.get("total_phys", 0)
-    if not is_16g_ram(total_phys):
+    if not in_band(total_phys):
         return False
 
     phys_pct = float(m.get("phys_pct", 0) or 0)
     avail_phys = float(m.get("avail_phys", 0) or 0)
     commit_pct = float(m.get("commit_pct", 0) or 0)
-    if not (phys_pct >= 60.0 or avail_phys <= 6.5 * (1024 ** 3) or commit_pct >= 70.0):
+    if not (phys_pct >= 60.0 or avail_phys <= busy_avail_gb * (1024 ** 3)
+            or commit_pct >= 70.0):
         return False
 
     try:
@@ -81,10 +74,25 @@ def needs_16g_optimization(cfg: dict, mem: dict | None = None) -> bool:
     except (TypeError, ValueError):
         return False
 
-    return (phys > PROFILE_16G["phys_threshold"]
-            or commit > PROFILE_16G["commit_threshold"]
-            or min_avail < PROFILE_16G["min_avail_mb"]
-            or target_min_mb > PROFILE_16G["target_clean_min_mb"])
+    return (phys > profile["phys_threshold"]
+            or commit > profile["commit_threshold"]
+            or min_avail < profile["min_avail_mb"]
+            or target_min_mb > profile["target_clean_min_mb"])
+
+
+def needs_16g_optimization(cfg: dict, mem: dict | None = None) -> bool:
+    """16G 物理内存机型是否建议应用黄金配置预设（v1.29.12）。"""
+    return _needs_ram_profile(cfg, mem, is_16g_ram, PROFILE_16G, 6.5)
+
+
+def needs_8g_optimization(cfg: dict, mem: dict | None = None) -> bool:
+    """8G 物理内存机型是否建议应用流畅预设（v1.29.17）。"""
+    return _needs_ram_profile(cfg, mem, is_8g_ram, PROFILE_8G, 3.0)
+
+
+def needs_4g_optimization(cfg: dict, mem: dict | None = None) -> bool:
+    """4G 物理内存机型是否建议应用轻量预设（v1.29.17）。"""
+    return _needs_ram_profile(cfg, mem, is_4g_ram, PROFILE_4G, 1.5)
 
 
 def frequent_escalation(cfg: dict) -> bool:
@@ -531,16 +539,29 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
                      f"极易突发掉帧与页面文件颠簸。建议应用 16G 黄金预设：物理阈值 75%（提前温和介入）、"
                      f"提交阈值 85%、可用内存保底 2048MB（低于 2GB 强力兜底防卡死）、"
                      f"大户清理下限 768MB（精准覆盖整机 5% 以上大户）。"),
-            "action": {
-                "label": "应用 16G 优化预设",
-                "changes": {
-                    "phys_threshold": 75,
-                    "commit_threshold": 85,
-                    "min_avail_mb": 2048,
-                    "target_clean_min_mb": 768,
-                    "warn_margin": 10,
-                },
-            },
+            "action": {"label": "应用 16G 优化预设", "changes": dict(PROFILE_16G)},
+        })
+    # ---- 3a2. 8G / 4G 小内存机型专属优化预设（v1.29.17，区间互斥）----
+    if needs_8g_optimization(cfg, s):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "检测到 8G 内存：推荐应用 8G 流畅优化预设",
+            "text": (f"本机物理内存为 8G 规格（实测约 {gb(total_phys)}）。Windows 10/11 在浏览器、"
+                     f"IDE 与办公软件同时运行后常驻占用约 5~6.5GB；沿用默认 85% 阈值会等可用"
+                     f"仅剩 1.2GB 时才介入，页面文件抖动会先造成卡顿。建议应用 8G 流畅预设："
+                     f"物理阈值 75%、提交阈值 85%、可用内存保底 1024MB、"
+                     f"大户清理下限 512MB，并保留 10% 预警余量。"),
+            "action": {"label": "应用 8G 优化预设", "changes": dict(PROFILE_8G)},
+        })
+    if needs_4g_optimization(cfg, s):
+        items.append({
+            "level": LEVEL_TIP,
+            "title": "检测到 4G 内存：推荐应用 4G 轻量优化预设",
+            "text": (f"本机物理内存为 4G 规格（实测约 {gb(total_phys)}）。小内存机器上提交内存"
+                     f"耗尽往往早于物理内存见底，也是「内存不足」与系统卡死的根因。建议应用"
+                     f" 4G 轻量预设：物理阈值 75%、提交阈值 80% 提前介入、可用内存保底 512MB、"
+                     f"大户清理下限 256MB，并保留 10% 预警余量。"),
+            "action": {"label": "应用 4G 优化预设", "changes": dict(PROFILE_4G)},
         })
     # ---- 3c. 前台 / 全屏让路与全局热键（v1.24.0）：默认开的开关被关掉时说明代价 ----
     if not cfg.get("fs_pause", True):
@@ -565,8 +586,8 @@ def analyze(cfg: dict, mem: dict | None = None, top: list | None = None,
         items.append({
             "level": LEVEL_TIP,
             "title": "低内存智能两级跃迁已关闭",
-            "text": "可用物理跌入 1.5GB 紧迫区时，两级跃迁可优先针对后台无窗口进程减压，"
-                    "避免直接全量激进清理导致前台窗口掉帧或读盘卡顿。建议开启。",
+            "text": "可用物理跌入 1.5GB 紧迫区时（小内存机器按总内存 1/4 收窄），两级跃迁可优先针对"
+                    "后台无窗口进程减压，避免直接全量激进清理导致前台窗口掉帧或读盘卡顿。建议开启。",
             "action": {"label": "开启低内存跃迁", "changes": {"low_mem_leap": True}},
         })
     if not cfg.get("notify_idle_sec", 300):

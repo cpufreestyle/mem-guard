@@ -114,6 +114,17 @@ def test_admin_status_line_switches_with_privilege(monkeypatch):
         assert menutips.reachable(want, leaf)
 
 
+def test_reachable_rejects_dead_keys_and_matches_dynamic_prefixes():
+    """对账不能把不存在的静态键、或没落点的前缀键算成「划得到」。"""
+    labels = ["立即清理", "外观主题（跟随系统）", "优化建议（3 条）"]
+    assert menutips.reachable("立即清理", labels)
+    assert menutips.reachable("外观主题（", labels)
+    assert menutips.reachable("优化建议（", labels)
+    assert not menutips.reachable("外观主题（跟随系统/深色/浅色）", labels)
+    assert not menutips.reachable("定时清理（每 30 分钟）", labels)
+    assert not menutips.reachable("没有这个前缀（", labels)
+
+
 def test_prefix_tips_match_a_real_dynamic_label():
     """带计数的动态项（「优化建议（3 条）」）靠前缀命中，前缀本身也必须有落点。"""
     leaf, _popup = _menu_labels()
@@ -176,6 +187,13 @@ def test_tip_for_exact_prefix_and_miss():
     assert menutips.tip_for("") is None
     assert menutips.tip_for(None) is None
     assert menutips.tip_for("  立即清理  ") == menutips.TIPS["立即清理"], "带空白也要命中"
+
+
+def test_theme_tip_covers_every_dynamic_theme_label():
+    """外观主题有三种动态文案，划过其中任意一种都要拿到同一句说明。"""
+    expected = menutips._PREFIX_TIPS["外观主题（"]
+    for label in ("外观主题（跟随系统）", "外观主题（深色）", "外观主题（浅色）"):
+        assert menutips.tip_for(label) == expected
 
 
 def test_tip_text_shape():
