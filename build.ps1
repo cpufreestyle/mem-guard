@@ -39,6 +39,20 @@ if ($NoTk)        { $pyiArgs += @('--exclude-module', 'tkinter') }
 
 # 排除开发机上可能被连带打包、但本程序完全用不到的大模块
 # （例如本机装了 numpy 时 PyInstaller 会顺带打进 numpy.libs，体积多出约 10MB）
+
+# PIL 死重编解码器：PIL.features 静态列出这些扩展，PyInstaller 按 EXTENSION 打进
+# _internal\PIL（_avif 7.9MB / _webp 0.4MB / _imagingcms 0.27MB，合计约 8.6MB）。
+# 本程序只用 Image.new/Draw、ImageFont.truetype、resize+LANCZOS、ImageTk、ICO/PNG，
+# 从不触碰 AVIF/WebP/色彩管理。三者的导入均有保护：编解码插件用
+#   try: from . import _avif ... except ImportError: SUPPORTED=False
+# 降级；_imagingcms 只经 PIL.Image 函数内惰性 from . import ImageCms 触及。
+# 排除后 features.check('avif'/'webp') 返回 False、Image.init() 静默跳过对应插件。
+$pyiArgs += @(
+    '--exclude-module', 'PIL._avif',
+    '--exclude-module', 'PIL._webp',
+    '--exclude-module', 'PIL._imagingcms'
+)
+
 $pyiArgs += @(
     '--exclude-module', 'numpy',
     '--exclude-module', 'pandas',
