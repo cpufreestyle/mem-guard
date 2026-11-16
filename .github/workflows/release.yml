@@ -52,6 +52,8 @@ jobs:
           --icon mem_guard.ico --hidden-import pystray._win32 --clean
           --exclude-module numpy --exclude-module pandas --exclude-module matplotlib
           --exclude-module scipy --exclude-module pytest --exclude-module setuptools
+          --exclude-module PIL._avif --exclude-module PIL._webp
+          --exclude-module PIL._imagingcms
           mem_guard.py
 
       - name: 冒烟测试产物

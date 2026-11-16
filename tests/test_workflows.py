@@ -13,23 +13,33 @@ release.yml 是唯一真正会发布的路径，而 YAML 语法错误只有推 t
 """
 import io
 import os
+import re
+import sys
 
 import pytest
 
-ruamel = pytest.importorskip("ruamel.yaml")
+try:
+    import ruamel.yaml
+except ImportError:
+    ruamel = None
+else:
+    ruamel = sys.modules["ruamel.yaml"]
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW_DIR = os.path.join(ROOT, ".github", "workflows")
 
 
 def _load(name):
-    # importorskip 返回的就是 ruamel.yaml 模块本身
+    if ruamel is None:
+        pytest.skip("ruamel.yaml 未安装")
     yaml = ruamel.YAML(typ="safe")
     with io.open(os.path.join(WORKFLOW_DIR, name), encoding="utf-8") as f:
         return yaml.load(f)
 
 
 def _steps(name):
+    if ruamel is None:
+        pytest.skip("ruamel.yaml 未安装")
     doc = _load(name)
     job = next(iter((doc.get("jobs") or {}).values()))
     return job.get("steps") or []
@@ -37,6 +47,35 @@ def _steps(name):
 
 def _runs(name):
     return [str(s.get("run", "")) for s in _steps(name)]
+
+
+def _excluded_modules(text):
+    direct = re.findall(r"--exclude-module\s+([^\s'\"]+)", text)
+    quoted = re.findall(
+        r"['\"]--exclude-module['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+        text,
+    )
+    return set(direct + quoted)
+
+
+def test_release_uses_the_same_pillow_exclusions_as_build_script():
+    """发布产物和本地 build.ps1 必须排除同一组 Pillow 惰性扩展。
+
+    v1.29.18 首次发布时只改了 build.ps1，CI 仍单独调用 PyInstaller，
+    结果 Release 里的 exe 比本地构建大约 4.6MB。这里的集合比对能让
+    两端排除项再次漂移时立刻变红，且不受 ruamel.yaml 是否安装影响。
+    """
+    with io.open(os.path.join(ROOT, "build.ps1"), encoding="utf-8-sig") as f:
+        build_script = f.read()
+    with io.open(os.path.join(WORKFLOW_DIR, "release.yml"), encoding="utf-8") as f:
+        release_workflow = f.read()
+    expected = {
+        "PIL._avif",
+        "PIL._webp",
+        "PIL._imagingcms",
+    }
+    assert expected <= _excluded_modules(build_script)
+    assert expected <= _excluded_modules(release_workflow)
 
 
 @pytest.mark.parametrize("name", ["ci.yml", "release.yml"])
