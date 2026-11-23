@@ -240,6 +240,8 @@ def _raise_window(root) -> None:
         root.update_idletasks()
         root.lift()
         root.focus_force()
+        if not root.winfo_viewable():
+            root.after(200, lambda: _present_window(root))
     except Exception:
         pass
 

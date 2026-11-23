@@ -413,4 +413,29 @@ def main() -> None:
         # 上一版自替换成功后 .bak 已无用；引导批处理没跑完就被杀时也会留下残留。
         # 在安装目录里放一个大型可执行文件只会让用户困惑、也容易被安全软件单独报毒。
         purge_stale_backup()
+        # 启动时做一次只读 SHA256 自校验（只对打包后的单文件 exe 生效）：
+        # 如果安装目录的 exe 与 Release checksums.txt 不一致，只记日志并轻提示，
+        # 绝不自动替换或删除，避免把误报当篡改处理。
+        if getattr(sys, "frozen", False):
+            _frozen_path = sys.executable
+            _expected = None
+            _cksum = os.path.join(os.path.dirname(_frozen_path), "checksums.txt")
+            if os.path.isfile(_cksum):
+                try:
+                    with open(_cksum, "r", encoding="utf-8") as _cf:
+                        _expected = parse_checksums(_cf.read(), os.path.basename(_frozen_path))
+                except OSError:
+                    _expected = None
+            if _expected:
+                _actual = sha256_of(_frozen_path)
+                if _actual and _actual.lower() != _expected.lower():
+                    log(f"启动自校验失败：exe sha256 {_actual} 与清单 {_expected} 不一致，可能被篡改或被安全软件修改")
+                    try:
+                        message_box("MemGuard 启动自校验", "当前 exe 与发布校验和不一致，建议重新下载安装包并覆盖安装。")
+                    except Exception:
+                        pass
+                else:
+                    log("启动自校验通过：exe sha256 与 Release 校验和一致")
+            else:
+                log("启动自校验跳过：未找到同目录 checksums.txt 或其中不含当前 exe 条目")
         Guard().run(show_on_start=show_on_start)

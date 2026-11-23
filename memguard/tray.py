@@ -62,6 +62,10 @@ _MINAVAIL_STRIKES = 2    # 连续这么多次「低内存触发且效果偏短�
 # ---- 预防窗口自调优（v1.21.0）：预防式清理没防住压力时，把预测窗口放宽一档 ----
 _PREDICT_MISS_STRIKES = 2  # 连续这么多次「预防式清理后仍很快复发」，就把 predict_window_min 加宽
 
+# ---- 清理收益抑制（v1.29.20）：短效且释放量低于阈值时，把下次最小间隔倍增，避免无效清理反复打扰 ----
+_COOLDOWN_RELIEF_BOOST = 2.0  # 无效清理连发时冷却倍数
+_COOLDOWN_RELIEF_MAX = 3600   # 倍增后的冷却上限(秒)
+
 # ---- 触发阈值自适应（v1.22.0）：温和阶梯用尽仍效果偏短时，把两条触发线各降一档 ----
 _THRESHOLD_STRIKES = 3    # 连续这么多次「超阈值触发且效果偏短」，就把 phys/commit 阈值各降一档
 
@@ -93,6 +97,7 @@ class Guard:
         self.update_progress = None    # v1.29.7 更新下载进度（None=没有在下载）
         # 自适应冷却（v1.10.0）：纯内存态，不落盘；短效复发压间隔，连续达标恢复
         self._relief_short_streak = 0  # 连续「距上次清理不足 effect_min_relief_sec」次数
+        self._relief_low_mb_streak = 0  # 连续「短效且释放量低于 min_clean_relief_mb」次数
         self._relief_ok_streak = 0     # 连续「效果达标」次数
         self._level_seen = self.cfg.get("clean_level")  # 上次观察到的档位（识别用户手动切回保守）
         # v1.12.0 持续压力粘滞激进：纯内存态，不落盘。上一轮走完整条阶梯仍没压住
@@ -310,6 +315,15 @@ class Guard:
         skip = self._skip_stages()
         r = do_clean(reason, growth_rows=self.leaks, sticky=sticky_on,
                      skip=skip, **kw)
+        # v1.29.20 清理收益抑制：短效且本次释放量低于 min_clean_relief_mb，
+        # 连续无效时把下次最小间隔倍增，避免反复清到几十 MB 又立即复发
+        _relief_mb = int(self.cfg.get("min_clean_relief_mb", 0) or 0)
+        if low_relief and _relief_mb > 0 and r.get("freed", 0) < _relief_mb:
+            self._relief_low_mb_streak += 1
+            log(f"{reason}清理 | 短效且仅释放 {gb(max(r.get('freed', 0), 0))}，"
+                f"连续无效 {self._relief_low_mb_streak} 次，下次冷却已拉长")
+        else:
+            self._relief_low_mb_streak = 0
         sticky_note = ""
         if r["ok"]:
             # 统计已在 do_clean 里落盘：顺手同步回内存，否则菜单顶部那行累计统计要等
@@ -369,6 +383,7 @@ class Guard:
 
     def _cooldown_gap(self) -> int:
         """本次自动清理后的最小间隔（秒）：v1.10.0 自适应冷却。
+        v1.29.20 清理收益抑制：短效且释放量低，冷却倍增，不再压缩。
 
         静态 cooldown 是最大缺口：短效复发时不会更快复查，连续 hold 住后也不放松。
         这里与 _auto_clean 共用同一份判定输入：距上次清理不足 effect_min_relief_sec
@@ -381,6 +396,9 @@ class Guard:
         gap = int(cfg.get("cooldown", 300) or 0)
         if not cfg.get("adaptive_cooldown", True) or self._relief_short_streak <= 0:
             return gap
+        # v1.29.20 清理收益抑制：短效且释放量低，冷却倍增，不再压缩
+        if self._relief_low_mb_streak > 0:
+            return min(int(gap * (_COOLDOWN_RELIEF_BOOST ** self._relief_low_mb_streak)), _COOLDOWN_RELIEF_MAX)
         floor = int(cfg.get("adaptive_cooldown_floor", 30) or 0)
         return max(0, min(gap, max(int(gap * _COOLDOWN_SHRINK), floor)))
 

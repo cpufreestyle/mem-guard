@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     # ---- 清理效果闭环（v1.9.0）：度量「距上次自动清理多久」，短效=没 hold 住 ----
     "effect_track": True,     # 开：自动清理时度量与上次自动清理的间隔，偏短则累计 short_relief 并提示
     "effect_min_relief_sec": 600,  # 与上次自动清理间隔小于该秒数视为「效果偏短」（清理压力很快复发）
+    "min_clean_relief_mb": 0,     # 短效清理且本次释放低于该值(MB)时，本次冷却倍增；0=关闭
     # ---- 自适应冷却（v1.10.0）：短效复发时允许更快复查，连续 hold 住后恢复用户值 ----
     "adaptive_cooldown": True,   # 开：短效复发后把下次最小间隔压到 max(cooldown*factor, floor)，连续达标恢复 cooldown
     "adaptive_cooldown_floor": 30,  # 压缩后的最小间隔下限(秒)，clamp 5..3600；压缩只减不增，永不高于用户 cooldown
@@ -254,6 +255,7 @@ _FIELD_SPECS = (
     ("target_clean_top", 1, TARGET_CLEAN_TOP_MAX),
     ("predict_window_min", 1, 60),
     ("effect_min_relief_sec", 60, 86400),
+    ("min_clean_relief_mb", 0, 1024),
     ("adaptive_cooldown_floor", 5, 3600),
     ("stage_learn_strikes", 2, 10),
     ("stage_deepen_rounds", 1, 3),
